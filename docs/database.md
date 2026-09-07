@@ -1,102 +1,86 @@
 # Database
 
-> Status: **Phase 0** — planned collections only. No Mongoose models are written yet.
+> Status: **Phase 1** — Better Auth collections are live in MongoDB Atlas under the `face_attendance` database. Business collections (profiles, classrooms, attendance) are not yet implemented.
 
-The web app talks to **MongoDB Atlas** through **Mongoose**. Below is the planned logical schema. Actual model files will land in Phase 1+.
+The web app talks to **MongoDB Atlas**. Authentication data is owned entirely by Better Auth; future business data will be modeled with **Mongoose** in later phases.
 
-## Collections
+## Authentication collections (Phase 1)
 
-### `users`
+Better Auth manages the following collections in the `face_attendance` database:
+
+### `user`
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `_id` | ObjectId | |
-| `googleId` | string | Unique. From Google `sub`. |
-| `email` | string | Unique. |
-| `name` | string | Display name. |
-| `avatar` | string \| null | URL from Google. |
-| `role` | enum(`student`, `teacher`) | Application role, **not** from Google. |
-| `profile.fullName` | string \| null | Collected in onboarding. |
-| `profile.identificationCode` | string \| null | Student / employee code. |
-| `profile.phone` | string \| null | |
-| `faceProfile.enrolled` | boolean | |
-| `faceProfile.embeddings` | number[][] | Normalized vectors, **not** raw images. |
-| `faceProfile.model` | string \| null | e.g. `buffalo_l`. |
-| `faceProfile.modelVersion` | string \| null | |
-| `faceProfile.enrolledAt` | Date \| null | |
+| `_id` | string | Better Auth ID. |
+| `email` | string | Unique, from Google. |
+| `emailVerified` | boolean | |
+| `name` | string | From Google. |
+| `image` | string \| null | From Google profile picture. |
 | `createdAt`, `updatedAt` | Date | |
 
-Index: `{ googleId: 1 }` unique, `{ email: 1 }` unique.
-
-### `classrooms`
+### `session`
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `_id` | ObjectId | |
-| `name` | string | |
-| `classCode` | string | Short, friendly, unique. Indexed unique. |
-| `passwordHash` | string | bcrypt/argon2 — never plaintext. |
-| `teacherId` | ObjectId → users | |
+| `_id` | string | |
+| `userId` | string → `user._id` | |
+| `token` | string | Hashed session token. |
+| `expiresAt` | Date | |
+| `ipAddress`, `userAgent` | string \| null | |
 | `createdAt`, `updatedAt` | Date | |
 
-Index: `{ classCode: 1 }` unique.
-
-### `class_memberships`
+### `account`
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `_id` | ObjectId | |
-| `classId` | ObjectId → classrooms | |
-| `userId` | ObjectId → users | |
-| `role` | enum(`student`, `teacher`) | Mirror of `users.role` for query convenience. |
-| `joinedAt` | Date | |
+| `_id` | string | |
+| `userId` | string → `user._id` | |
+| `providerId` | string | `"google"` for Phase 1. |
+| `accountId` | string | Google `sub`. |
+| `accessToken`, `refreshToken`, ... | string \| null | OAuth token storage (server-only). |
 
-Index: `{ classId: 1, userId: 1 }` **unique compound**.
-
-### `attendance_sessions`
+### `verification`
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `_id` | ObjectId | |
-| `classId` | ObjectId → classrooms | |
-| `teacherId` | ObjectId → users | |
-| `status` | enum(`active`, `ended`) | |
-| `startedAt`, `endedAt` | Date \| null | |
-| `recognitionSettings.threshold` | number | Similarity cutoff. |
-| `recognitionSettings.minConfirmFrames` | number | Default 3. |
-| `recognitionSettings.cooldownSeconds` | number | Per-user re-trigger cooldown. |
-| `recognitionSettings.processingIntervalMs` | number | Frame sampling interval. |
+| `_id` | string | |
+| `identifier` | string | |
+| `value` | string | |
+| `expiresAt` | Date | |
 
-Constraint: at most **one** `status=active` per `classId`. Enforced in service code in Phase 6.
+> Better Auth owns the schema and indexes for these collections. The application must not modify them from outside Better Auth.
 
-### `attendance_records`
+## Application business collections (future phases)
 
-| Field | Type | Notes |
+These collections are **planned but not yet created**. They will be added with Mongoose models in their respective phases:
+
+| Collection | Phase | Purpose |
 | --- | --- | --- |
-| `_id` | ObjectId | |
-| `sessionId` | ObjectId → attendance_sessions | |
-| `classId` | ObjectId → classrooms | |
-| `userId` | ObjectId → users | |
-| `recognizedAt` | Date | |
-| `confidence` | number | Last similarity that confirmed the user. |
-| `method` | enum(`face`, `manual`) | Manual override reserved for future phases. |
+| `profiles` | 2 | Onboarded user profile data (full name, identification code, phone). |
+| `classrooms` | 5 | Teacher-created classrooms. |
+| `class_memberships` | 5 | Student ↔ classroom join table. |
+| `attendance_sessions` | 6 | Per-class attendance runs. |
+| `attendance_records` | 6/7 | Per-user attendance confirmations. |
+| `face_profiles` | 4 | Embeddings (not raw frames) per user. |
 
-Index: `{ sessionId: 1, userId: 1 }` **unique compound** — final protection against duplicate attendance even if application code races.
+## Separation of concerns
 
-## Relationships
+- **Better Auth** is the *only* writer for `user`, `session`, `account`, `verification`.
+- **Mongoose** (future) will own every business collection above.
+- The Face Service never writes to the database directly. It only receives the candidate index it needs from the web app.
+
+## Database separation (visual)
 
 ```mermaid
-erDiagram
-    USERS ||--o{ CLASS_MEMBERSHIPS : "joins"
-    CLASSROOMS ||--o{ CLASS_MEMBERSHIPS : "has"
-    USERS ||--o{ CLASSROOMS : "teaches"
-    CLASSROOMS ||--o{ ATTENDANCE_SESSIONS : "runs"
-    ATTENDANCE_SESSIONS ||--o{ ATTENDANCE_RECORDS : "produces"
-    USERS ||--o{ ATTENDANCE_RECORDS : "is recognized as"
+flowchart LR
+    Auth["Better Auth\n(user, session, account, verification)"] --> Mongo["MongoDB Atlas\nface_attendance"]
+    Business["Future Mongoose models\n(profiles, classrooms, attendance, face_profiles)"] --> Mongo
+    Mongo -.read only.-> Web["apps/web server"]
 ```
 
 ## Privacy posture
 
-- Embeddings are stored, **not** raw images.
-- `users.faceProfile.embeddings` must never be returned by any API path that the browser can see.
+- Embeddings (Phase 4+) are stored, **not** raw images.
 - Server logs must never include embeddings, OAuth tokens, class passwords, or raw frames.
+- Better Auth access / refresh tokens are server-only; they never appear in any UI payload.

@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: **Phase 0** — repo skeleton. No business logic implemented yet. This document describes the target architecture that subsequent phases will build toward.
+> Status: **Phase 1** — Better Auth + Google OAuth + MongoDB session. Authentication is live. Business data and face recognition are not yet implemented.
 
 ## Goals
 
@@ -15,17 +15,17 @@
 ```mermaid
 flowchart LR
     Browser["Browser\n(classroom device / phone)"] -->|"HTTPS"| Web["apps/web\nNext.js 16 + Better Auth"]
-    Web -->|"Mongoose"| Mongo["MongoDB Atlas"]
+    Web -->|"MongoDB driver"| Mongo["MongoDB Atlas\n(face_attendance database)"]
     Web -->|"internal HTTPS\nX-Service-Token"| Face["services/face-service\nFastAPI + InsightFace"]
     Face -->|"ONNX Runtime\nCPU or CUDA"| Engine["FaceEngine\n(detect / embed / match)"]
     Web -->|"Google OAuth"| Google["Google\nOpenID Connect"]
 ```
 
 - **Browser** opens the camera locally for the teacher; only sampled JPEG frames are sent to the Face Service.
-- **`apps/web`** owns authentication, RBAC, classes, attendance sessions, history, Excel export.
+- **`apps/web`** owns authentication (Better Auth + Google OAuth), and will later own RBAC, classes, attendance sessions, history, Excel export.
 - **`services/face-service`** owns *all* face-related computation. It is the only component that imports InsightFace / ONNX Runtime.
-- **MongoDB Atlas** stores users, classes, memberships, sessions, attendance records.
-- **Google** is identity-only — no profile data is taken from Google beyond `sub`, `email`, `name`, `picture`.
+- **MongoDB Atlas** stores Better Auth collections (`user`, `session`, `account`, `verification`) in the `face_attendance` database. Future business collections (`profiles`, `classrooms`, `class_memberships`, `attendance_sessions`, `attendance_records`, `face_profiles`) will be added in later phases via Mongoose.
+- **Google** is identity-only — only `sub`, `email`, `name`, `picture` are requested via the `openid email profile` scopes.
 
 ## FaceEngine abstraction
 
@@ -39,9 +39,44 @@ The web app and the rest of the Face Service depend on this `Protocol`, not on I
 
 ## Authentication and authorization
 
-- **End users** sign in with Google via Better Auth. The web app stores `googleId`, `email`, `name`, `avatar`, and an application-level `role` (`student` | `teacher`).
-- **Server-to-server** auth between web and Face Service uses a shared secret in `FACE_SERVICE_SECRET`, sent as `X-Service-Token`. This is the MVP mechanism and is intended to be replaced later by a stronger identity (mTLS / signed JWT / workload identity).
+### End users (Google OAuth via Better Auth)
+
+- Users sign in at `/login` by clicking **Continue with Google**.
+- Better Auth handles the OAuth dance via the official `@better-auth/mongo-adapter` package using the MongoDB Node driver. Sessions and account links are stored in MongoDB Atlas under the `face_attendance` database.
+- The web server exposes Better Auth through `/api/auth/[...all]` using the standard Next.js App Router integration (`toNextJsHandler`).
+- The browser uses `authClient` from `better-auth/react` to trigger sign-in and sign-out.
+- The server-side `auth.api.getSession()` call is the source of truth for every protected resource. Client-provided user IDs and emails are never trusted.
+
+### Server-to-server (web ↔ Face Service)
+
+- The web app and the Face Service share `FACE_SERVICE_SECRET`, sent as `X-Service-Token`. This is the MVP mechanism and is intended to be replaced later by a stronger identity (mTLS / signed JWT / workload identity).
 - All authorization decisions (role checks, ownership checks, membership checks) are made server-side. UI-only hiding is **not** a security boundary.
+
+## Authentication flow (Phase 1)
+
+```mermaid
+sequenceDiagram
+    participant U as User (browser)
+    participant W as apps/web
+    participant G as Google
+    participant DB as MongoDB Atlas
+
+    U->>W: GET /login
+    W-->>U: Render "Continue with Google"
+    U->>W: Click sign-in (authClient.signIn.social)
+    W->>G: Redirect to Google OAuth consent screen
+    G-->>U: User grants consent
+    G->>W: Callback to /api/auth/callback/google
+    W->>DB: Better Auth persists user + account + session
+    DB-->>W: Confirmation
+    W->>W: Issue session cookie
+    W-->>U: Redirect to /dashboard
+
+    U->>W: GET /dashboard
+    W->>W: getSession() validates session cookie
+    W->>DB: Look up user via Better Auth
+    W-->>U: Render dashboard with Google profile
+```
 
 ## Data flow: an attendance session (target behaviour)
 
@@ -73,6 +108,23 @@ sequenceDiagram
 face-attendance/
 ├── apps/
 │   └── web/                 # Next.js 16 App Router
+│       └── src/
+│           ├── lib/
+│           │   ├── auth.ts               # Better Auth server config (Phase 1)
+│           │   ├── auth-client.ts        # Better Auth browser client (Phase 1)
+│           │   ├── env.ts / env-schema.ts
+│           │   ├── mongodb.ts            # Cached MongoClient for the adapter
+│           │   ├── session.ts            # Server-side session helpers
+│           │   └── route-guards.ts       # Pure redirect decision logic
+│           ├── components/
+│           │   ├── AppShell.tsx
+│           │   ├── GoogleSignInButton.tsx
+│           │   └── SignOutButton.tsx
+│           ├── app/
+│           │   ├── api/auth/[...all]/    # Better Auth catch-all route
+│           │   ├── login/page.tsx        # /login
+│           │   └── dashboard/page.tsx    # /dashboard (protected)
+│           └── proxy.ts                  # Next.js proxy / middleware (UX layer only)
 ├── services/
 │   └── face-service/        # FastAPI
 ├── docs/                    # This folder
@@ -80,12 +132,14 @@ face-attendance/
 └── pnpm-workspace.yaml
 ```
 
-## Phase plan (locked)
+## Phase plan
 
 | Phase | Goal |
 | --- | --- |
-| **0** | Repo skeleton, docs, buildable foundations. **We are here.** |
-| 1 | Google OAuth + Better Auth wiring, session management. |
+| 0 | Repo skeleton, docs, buildable foundations. |
+| 0.5 | Dependency modernization. |
+| 0.6 | Vercel deployment readiness. |
+| **1** | **Better Auth + Google OAuth + MongoDB session (we are here).** |
 | 2 | Profile onboarding (`/onboarding`). |
 | 3 | FastAPI + InsightFace Face Service, model init, `/v1/recognize`. |
 | 4 | Face enrollment (`/face-enrollment`). |
@@ -101,3 +155,4 @@ face-attendance/
 - Employee / organization module. The recognition core uses generic user IDs so a future employee module can be added without touching `FaceEngine`.
 - Mobile native apps. The web app must work in modern mobile browsers, but there is no React Native target in this MVP.
 - Paid SaaS dependencies.
+- Liveness / anti-spoofing. Phase 1 does not perform any face recognition.

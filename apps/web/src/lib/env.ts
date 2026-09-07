@@ -3,16 +3,16 @@ import { buildEnvSchema } from "@/lib/env-schema";
 /**
  * Boot-time environment configuration.
  *
- * PHASE 0.6: Vercel deployment readiness.
- * All optional server-side secrets (MongoDB, Better Auth, Google OAuth, Face
- * Service) stay optional because the corresponding integrations are not
- * implemented yet. Phase 1+ will enforce required values at boot.
+ * PHASE 1: Better Auth + Google OAuth + MongoDB session.
+ * All authentication-related variables are now required.
+ * Phase 0.6 allowed optional server-side secrets because no auth was implemented.
  *
  * The schema and preprocessing helper live in `./env-schema` so that they
  * can be unit-tested without mutating `process.env`. This module consumes
  * `process.env` and exports a frozen `env` object.
  *
  * NOTE: client-side code must only read `NEXT_PUBLIC_*` variables.
+ * All other variables are server-only.
  */
 const parsed = buildEnvSchema().safeParse({
   NODE_ENV: process.env.NODE_ENV,

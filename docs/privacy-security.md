@@ -1,11 +1,11 @@
 # Privacy & Security
 
-> Status: **Phase 0** — principles and intended controls. Concrete enforcement lands with the feature it protects.
+> Status: **Phase 1** — Better Auth + Google OAuth + MongoDB session. Authentication is enforced server-side. Liveness and face recognition are not yet implemented.
 
 ## Biometric handling principles
 
 1. **Store embeddings, not images.** The web database stores normalized numeric vectors returned by the Face Service. Raw camera frames are decoded, processed, and discarded in the same request lifecycle.
-2. **No permanent image retention.** Phase 0/1/2 never write raw frames to disk. Subsequent phases may temporarily buffer a frame for enrollment quality checks but must discard it immediately after embedding.
+2. **No permanent image retention.** Phase 0/1 never write raw frames to disk. Subsequent phases may temporarily buffer a frame for enrollment quality checks but must discard it immediately after embedding.
 3. **No logging of biometric data.** Server logs must never include embeddings, raw image bytes, or base64 image data.
 4. **No embedding exposure to the browser.** Normal user-facing APIs never return another user's `faceProfile.embeddings`. Only the Face Service and the server-side enrollment path see embeddings.
 5. **Owner-only modification.** A user may only modify their own `faceProfile`. Teacher endpoints cannot write student embeddings.
@@ -15,8 +15,28 @@
 - All secrets live in environment variables. `.env.example` exists at the repo root and inside each app; the real `.env*` files are gitignored.
 - **Better Auth** uses the official standardized variable names: `BETTER_AUTH_URL`, `BETTER_AUTH_SECRET`.
 - **Google OAuth** uses: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`.
-- **MongoDB**: `MONGODB_URI` (server-side only).
+- **MongoDB**: `MONGODB_URI` (server-side only). The application database is `face_attendance`.
 - **Internal Face Service**: `FACE_SERVICE_SECRET` is shared between the web app and the Face Service, sent as `X-Service-Token`. It is never bundled to the browser.
+
+### Phase 1 environment requirements
+
+| Variable | Required | Scope |
+| --- | --- | --- |
+| `MONGODB_URI` | yes | server |
+| `BETTER_AUTH_URL` | yes | server |
+| `BETTER_AUTH_SECRET` | yes | server |
+| `GOOGLE_CLIENT_ID` | yes | server |
+| `GOOGLE_CLIENT_SECRET` | yes | server |
+| `NEXT_PUBLIC_APP_URL` | yes | public |
+| `FACE_SERVICE_SECRET` | optional (Phase 3+ required) | server |
+| `FACE_SERVICE_URL` | optional (Phase 3+ required) | server |
+
+## Phase 1 authentication guarantees
+
+- `/login` is public.
+- `/dashboard` requires a valid Better Auth session. Server Components call `auth.api.getSession()` and redirect to `/login` if the session is missing. The browser `proxy.ts` adds a UX-level cookie check but is never the sole security boundary.
+- Authenticated users visiting `/login` are redirected to `/dashboard`.
+- Sign-out calls Better Auth's official `signOut()`, invalidates the server-side session row, and clears the session cookie.
 
 ## Authorization rules (server-enforced)
 
@@ -48,7 +68,7 @@ The frontend may hide buttons for clarity, but it is **not** a security boundary
 
 Log structured fields, not bodies:
 
-- `route`, `method`, `status`, `duration_ms`, `user_id` (Mongo ObjectId string), `class_id`, `session_id`, `face_count`, `engine`, `provider`.
+- `route`, `method`, `status`, `duration_ms`, `user_id` (Better Auth user ID string), `class_id`, `session_id`, `face_count`, `engine`, `provider`.
 
 Never log:
 

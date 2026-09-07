@@ -1,6 +1,6 @@
 # API
 
-> Status: **Phase 0** — surface description only. No routes are implemented yet.
+> Status: **Phase 1** — Better Auth catch-all route + protected `/dashboard` page. Face Service endpoints and business API endpoints land in later phases.
 
 All endpoints are JSON unless stated otherwise. The web app and the Face Service have separate base URLs and separate authentication mechanisms.
 
@@ -23,8 +23,9 @@ Base URL: `${NEXT_PUBLIC_APP_URL}`
 
 | Prefix | Purpose | Phase |
 | --- | --- | --- |
-| `/api/auth/[...all]` | Better Auth catch-all (Google OAuth handlers). | 1 |
-| `/api/me` | Current session user. | 1 |
+| `/api/auth/[...all]` | Better Auth catch-all (Google OAuth handlers). | **1** |
+| `/api/me` | Current session user. | **1** |
+| `/api/health` | Health probe (returns `{ status: "ok", service: "web" }`). | 0 |
 | `/api/profile` | Update `profile.*`. | 2 |
 | `/api/face/enroll` | Submit a single enrollment frame (multipart JPEG). | 4 |
 | `/api/classes` | List / create / get classes. | 5 |
@@ -35,6 +36,27 @@ Base URL: `${NEXT_PUBLIC_APP_URL}`
 | `/api/attendance/sessions/:id/end` | Stop a session. | 6 |
 | `/api/attendance/sessions/:id/export` | Stream `.xlsx` (ExcelJS). | 8 |
 | `/api/attendance/sessions/:id/history` | Session detail / history view. | 8 |
+
+### Better Auth endpoints (Phase 1, exposed under `/api/auth/*`)
+
+Better Auth exposes the following routes through the catch-all handler:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/auth/session` | Returns the current session or 401. |
+| POST | `/api/auth/sign-in/social` | Initiate Google OAuth flow. |
+| GET | `/api/auth/callback/google` | Google OAuth callback (handled by Better Auth). |
+| POST | `/api/auth/sign-out` | Invalidate current session and clear cookie. |
+
+Browser code uses `authClient.signIn.social({ provider: "google" })` from `better-auth/react` rather than calling these routes directly.
+
+## Page routes (Phase 1)
+
+| Path | Auth requirement | Behaviour |
+| --- | --- | --- |
+| `/` | Public | Landing page with link to `/login`. |
+| `/login` | Public | Continue with Google button. Authenticated users are redirected to `/dashboard`. |
+| `/dashboard` | Required (server-side `getSession()`) | Displays Google profile data and a sign-out button. Unauthenticated users are redirected to `/login`. |
 
 ## `services/face-service` (FastAPI)
 
@@ -74,7 +96,7 @@ Authentication: `X-Service-Token: ${FACE_SERVICE_SECRET}` on every request excep
 
 `status` is one of `candidate` (above threshold), `low_quality` (frame rejected), or `unknown` (below threshold). The threshold is per-session and lives in `attendance_sessions.recognitionSettings.threshold`.
 
-## Camera transport
+## Camera transport (future)
 
 - The browser samples the local `MediaStream` at a configurable rate (target 2–5 fps).
 - Each sampled frame is resized, JPEG-encoded, sent as `multipart/form-data` `file=@frame.jpg`.

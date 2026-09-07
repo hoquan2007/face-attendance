@@ -8,7 +8,7 @@ export const metadata: Metadata = {
   description: "Web-based facial-recognition attendance for classrooms.",
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
   // Touching env here ensures the app fails fast at boot if misconfigured.

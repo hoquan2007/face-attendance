@@ -12,9 +12,9 @@ The web app never performs facial recognition locally — it sends sampled JPEG 
 
 ## Status
 
-This is **Phase 0.6**: Vercel deployment readiness. The repository skeleton is buildable, dependencies are modernized, and the web app can be imported into Vercel for the first skeleton deployment. No OAuth, no MongoDB models, no InsightFace yet. See `docs/architecture.md` for the full phase plan.
+This is **Phase 1**: Better Auth + Google OAuth + MongoDB session. End users authenticate via Google, Better Auth persists authentication in MongoDB Atlas (`face_attendance` database), and a protected `/dashboard` displays real Google profile data. No profile onboarding, no roles, no classrooms, no face enrollment yet. See `docs/architecture.md` for the full phase plan.
 
-See `docs/deployment-vercel.md` for the Vercel import procedure and post-deployment steps.
+See `docs/deployment-vercel.md` for the Vercel deployment procedure.
 
 ## Prerequisites
 
@@ -30,18 +30,42 @@ See `docs/deployment-vercel.md` for the Vercel import procedure and post-deploym
 pnpm install
 ```
 
-### 2. Run the web app
+### 2. Configure environment variables
+
+Copy the example file and fill in real values:
+
+```bash
+cp apps/web/.env.example apps/web/.env.local
+```
+
+Required variables for Phase 1 (all server-side, **never** committed):
+
+| Variable | Purpose |
+| --- | --- |
+| `MONGODB_URI` | MongoDB Atlas connection string (database `face_attendance`). |
+| `BETTER_AUTH_URL` | Origin URL. `http://localhost:3000` in dev, the Vercel domain in prod. |
+| `BETTER_AUTH_SECRET` | Session signing secret (generate with `openssl rand -base64 32`). |
+| `GOOGLE_CLIENT_ID` | Google OAuth client ID. |
+| `GOOGLE_CLIENT_SECRET` | Google OAuth client secret. |
+| `NEXT_PUBLIC_APP_URL` | Browser-exposed public origin. Must match `BETTER_AUTH_URL` in dev. |
+| `FACE_SERVICE_SECRET` | Server-to-server token (optional in Phase 1, required in Phase 3+). |
+| `FACE_SERVICE_URL` | Face Service endpoint (optional in Phase 1, required in Phase 3+). |
+
+### 3. Run the web app
 
 ```bash
 cd apps/web
 pnpm dev          # http://localhost:3000
 pnpm lint
 pnpm typecheck
+pnpm test
 ```
 
-Copy `apps/web/.env.example` to `apps/web/.env.local` and fill in values. The web app expects the standardized Better Auth variable names (`BETTER_AUTH_URL`, `BETTER_AUTH_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`) along with `MONGODB_URI`, `NEXT_PUBLIC_APP_URL`, `FACE_SERVICE_URL`, and `FACE_SERVICE_SECRET`. See `docs/privacy-security.md`.
+### 4. Sign in
 
-### 3. Run the Face Service
+Visit `http://localhost:3000/login` and click **Continue with Google**.
+
+### 5. Run the Face Service (Phase 3+)
 
 Windows PowerShell:
 
@@ -66,9 +90,9 @@ pytest -q
 | File | Purpose |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | High-level architecture, component responsibilities, phase plan |
-| [docs/deployment-vercel.md](docs/deployment-vercel.md) | Vercel import procedure and post-deployment steps |
-| [docs/database.md](docs/database.md) | Planned MongoDB collections and relationships |
-| [docs/api.md](docs/api.md) | Planned HTTP API surface (web + face service) |
+| [docs/deployment-vercel.md](docs/deployment-vercel.md) | Vercel deployment procedure |
+| [docs/database.md](docs/database.md) | MongoDB collections — Better Auth owns auth; business data lands in later phases |
+| [docs/api.md](docs/api.md) | HTTP API surface (web + face service) |
 | [docs/privacy-security.md](docs/privacy-security.md) | Biometric handling, secrets, logging hygiene |
 | [docs/model-license.md](docs/model-license.md) | InsightFace / buffalo_l licensing warning |
 
