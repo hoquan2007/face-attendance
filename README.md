@@ -12,11 +12,13 @@ The web app never performs facial recognition locally — it sends sampled JPEG 
 
 ## Status
 
-This is **Phase 0**: monorepo skeleton, buildable foundations, documentation. No OAuth, no MongoDB models, no InsightFace yet. See `docs/architecture.md` for the full phase plan.
+This is **Phase 0.6**: Vercel deployment readiness. The repository skeleton is buildable, dependencies are modernized, and the web app can be imported into Vercel for the first skeleton deployment. No OAuth, no MongoDB models, no InsightFace yet. See `docs/architecture.md` for the full phase plan.
+
+See `docs/deployment-vercel.md` for the Vercel import procedure and post-deployment steps.
 
 ## Prerequisites
 
-- Node.js **>= 20.11** (tested with 24.x)
+- Node.js **>= 24** (tested with 24.x)
 - pnpm **>= 9** (`npm i -g pnpm`)
 - Python **>= 3.11** (tested with 3.13)
 
@@ -64,6 +66,7 @@ pytest -q
 | File | Purpose |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | High-level architecture, component responsibilities, phase plan |
+| [docs/deployment-vercel.md](docs/deployment-vercel.md) | Vercel import procedure and post-deployment steps |
 | [docs/database.md](docs/database.md) | Planned MongoDB collections and relationships |
 | [docs/api.md](docs/api.md) | Planned HTTP API surface (web + face service) |
 | [docs/privacy-security.md](docs/privacy-security.md) | Biometric handling, secrets, logging hygiene |

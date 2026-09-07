@@ -5,20 +5,21 @@ export default function HomePage() {
     <main className="mx-auto flex max-w-3xl flex-col gap-8 px-6 py-16">
       <header className="flex flex-col gap-2">
         <p className="text-sm font-medium uppercase tracking-widest text-slate-500">
-          Phase 0 — skeleton
+          Phase 0.6 — deployment foundation
         </p>
         <h1 className="text-4xl font-semibold tracking-tight">Face Attendance System</h1>
         <p className="text-base text-slate-600 dark:text-slate-300">
-          Web-based facial-recognition attendance for classrooms. This page is a placeholder
-          for the Phase 0 bootstrap; authentication, classes, and face recognition arrive
-          in later phases.
+          Web application is online.
+          No Google login yet. No face recognition yet. No database yet.
         </p>
       </header>
 
       <section className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900">
         <h2 className="text-lg font-semibold">Phase plan</h2>
         <ol className="mt-3 list-decimal space-y-1 pl-5 text-sm text-slate-700 dark:text-slate-300">
-          <li>Phase 0 — repository skeleton (current)</li>
+          <li>Phase 0 — repository skeleton</li>
+          <li>Phase 0.5 — dependency modernization</li>
+          <li>Phase 0.6 — Vercel deployment readiness (current)</li>
           <li>Phase 1 — Google OAuth + Better Auth</li>
           <li>Phase 2 — profile onboarding</li>
           <li>Phase 3 — FastAPI + InsightFace Face Service</li>
