@@ -12,7 +12,7 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "echo \"no tests yet (Phase 0)\" && exit 0"
+    "test": "vitest run"
   },
   "dependencies": {
     "next": "16.3.4",

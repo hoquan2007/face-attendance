@@ -1,41 +1,23 @@
-import { z } from "zod";
+import { buildEnvSchema } from "@/lib/env-schema";
 
 /**
  * Boot-time environment configuration.
  *
- * PHASE 0.5: variable names are standardized around Better Auth's official
- * naming. Phase 1+ wires the actual values; missing required values will
- * throw at boot from Phase 1 onward.
+ * PHASE 0.6: Vercel deployment readiness.
+ * All optional server-side secrets (MongoDB, Better Auth, Google OAuth, Face
+ * Service) stay optional because the corresponding integrations are not
+ * implemented yet. Phase 1+ will enforce required values at boot.
+ *
+ * The schema and preprocessing helper live in `./env-schema` so that they
+ * can be unit-tested without mutating `process.env`. This module consumes
+ * `process.env` and exports a frozen `env` object.
  *
  * NOTE: client-side code must only read `NEXT_PUBLIC_*` variables.
  */
-const schema = z.object({
-  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
-
-  // Public
-  NEXT_PUBLIC_APP_URL: z.string().url().default("http://localhost:3000"),
-  APP_NAME: z.string().default("Face Attendance System"),
-
-  // Server-only (will be enforced as required in later phases)
-  MONGODB_URI: z.string().optional(),
-
-  // Better Auth (official env var names)
-  BETTER_AUTH_URL: z.string().url().optional(),
-  BETTER_AUTH_SECRET: z.string().optional(),
-
-  // Google OAuth
-  GOOGLE_CLIENT_ID: z.string().optional(),
-  GOOGLE_CLIENT_SECRET: z.string().optional(),
-
-  // Internal Face Service
-  FACE_SERVICE_URL: z.string().url().optional(),
-  FACE_SERVICE_SECRET: z.string().optional(),
-});
-
-const parsed = schema.safeParse({
+const parsed = buildEnvSchema().safeParse({
   NODE_ENV: process.env.NODE_ENV,
   NEXT_PUBLIC_APP_URL: process.env.NEXT_PUBLIC_APP_URL,
-  APP_NAME: process.env.APP_NAME ?? "Face Attendance System",
+  APP_NAME: process.env.APP_NAME,
   MONGODB_URI: process.env.MONGODB_URI,
   BETTER_AUTH_URL: process.env.BETTER_AUTH_URL,
   BETTER_AUTH_SECRET: process.env.BETTER_AUTH_SECRET,
@@ -53,4 +35,4 @@ if (!parsed.success) {
 }
 
 export const env = parsed.data;
-export type Env = z.infer<typeof schema>;
+export type Env = typeof env;

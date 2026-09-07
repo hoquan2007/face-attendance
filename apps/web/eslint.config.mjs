@@ -11,6 +11,27 @@ export default [
   ...coreWebVitals,
   ...typescript,
   {
-    ignores: [".next/**", "node_modules/**", "next-env.d.ts"],
+    ignores: [".next/**", "node_modules/**", "next-env.d.ts", "vitest.config.ts"],
+  },
+  {
+    // Test files use Vitest globals; relax the no-undef rule so ESLint does
+    // not complain about `describe`, `it`, `expect`, etc.
+    files: ["src/**/*.{test,spec}.ts"],
+    languageOptions: {
+      globals: {
+        describe: "readonly",
+        it: "readonly",
+        test: "readonly",
+        expect: "readonly",
+        beforeAll: "readonly",
+        afterAll: "readonly",
+        beforeEach: "readonly",
+        afterEach: "readonly",
+        vi: "readonly",
+      },
+    },
+    rules: {
+      "@typescript-eslint/no-unused-vars": "off",
+    },
   },
 ];
