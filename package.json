@@ -1,0 +1,20 @@
+{
+  "name": "face-attendance",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Face Attendance System monorepo (web app + face recognition service).",
+  "packageManager": "pnpm@9.12.0",
+  "scripts": {
+    "dev": "pnpm run dev:web",
+    "dev:web": "pnpm --filter @face-attendance/web dev",
+    "dev:face": "echo \"See services/face-service/README.md to run the Face Service (Python + uvicorn)\"",
+    "build:web": "pnpm --filter @face-attendance/web build",
+    "lint": "pnpm --filter @face-attendance/web lint",
+    "typecheck": "pnpm --filter @face-attendance/web typecheck",
+    "test:web": "pnpm --filter @face-attendance/web test"
+  },
+  "engines": {
+    "node": ">=20.11.0",
+    "pnpm": ">=9"
+  }
+}
