@@ -1,8 +1,8 @@
 # Database
 
-> Status: **Phase 1** — Better Auth collections are live in MongoDB Atlas under the `face_attendance` database. Business collections (profiles, classrooms, attendance) are not yet implemented.
+> Status: **Phase 2** — Better Auth collections are live in MongoDB Atlas under the `face_attendance` database. The application `profiles` collection is now managed by Mongoose. Other business collections (`classrooms`, `attendance`, `face_profiles`) are not yet implemented.
 
-The web app talks to **MongoDB Atlas**. Authentication data is owned entirely by Better Auth; future business data will be modeled with **Mongoose** in later phases.
+The web app talks to **MongoDB Atlas**. Authentication data is owned entirely by Better Auth; business data is modeled with **Mongoose** starting in Phase 2. The two subsystems share the same MongoDB cluster but never share documents.
 
 ## Authentication collections (Phase 1)
 
@@ -51,13 +51,38 @@ Better Auth manages the following collections in the `face_attendance` database:
 
 > Better Auth owns the schema and indexes for these collections. The application must not modify them from outside Better Auth.
 
-## Application business collections (future phases)
+## Application business collections
 
-These collections are **planned but not yet created**. They will be added with Mongoose models in their respective phases:
+### `profiles` (Phase 2)
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `_id` | ObjectId | Mongoose-managed. |
+| `userId` | string | Better Auth `user._id`. **Unique, indexed.** |
+| `emailSnapshot` | string | Captured from the authenticated Better Auth session at onboarding time. |
+| `role` | enum | `"student"` or `"teacher"`. Set during onboarding; not editable through the profile-edit flow. |
+| `fullName` | string | 2–100 chars after trim. |
+| `identificationCode` | string | 2–50 chars after trim. **Unique, indexed.** |
+| `phone` | string \| undefined | Optional, max 32 chars. |
+| `onboardingCompleted` | boolean | `true` only after the onboarding Server Action has persisted a valid record. |
+| `createdAt`, `updatedAt` | Date | Mongoose `timestamps: true`. |
+| `__v` | number | Mongoose internal. |
+
+**Indexes**
+
+- `userId` unique
+- `identificationCode` unique
+
+**Privacy posture**
+
+- The `profiles` collection stores only what Phase 2 needs: full name, identification code, optional phone, role, and the email snapshot.
+- **No** raw face photos, embeddings, or biometric data are stored in `profiles`. Face data belongs to a future `face_profiles` collection in Phase 4+.
+- `identificationCode` is treated as a generic business identifier (student / teacher / future employee). It is not named `studentId` because the project will eventually support teachers and employees sharing the same collection shape.
+
+### Future business collections
 
 | Collection | Phase | Purpose |
 | --- | --- | --- |
-| `profiles` | 2 | Onboarded user profile data (full name, identification code, phone). |
 | `classrooms` | 5 | Teacher-created classrooms. |
 | `class_memberships` | 5 | Student ↔ classroom join table. |
 | `attendance_sessions` | 6 | Per-class attendance runs. |
@@ -66,8 +91,8 @@ These collections are **planned but not yet created**. They will be added with M
 
 ## Separation of concerns
 
-- **Better Auth** is the *only* writer for `user`, `session`, `account`, `verification`.
-- **Mongoose** (future) will own every business collection above.
+- **Better Auth** is the *only* writer for `user`, `session`, `account`, `verification`. The application reads from these collections only through Better Auth's session helper.
+- **Mongoose** (Phase 2+) owns every business collection. The application never modifies Better Auth's collections directly.
 - The Face Service never writes to the database directly. It only receives the candidate index it needs from the web app.
 
 ## Database separation (visual)
@@ -75,7 +100,7 @@ These collections are **planned but not yet created**. They will be added with M
 ```mermaid
 flowchart LR
     Auth["Better Auth\n(user, session, account, verification)"] --> Mongo["MongoDB Atlas\nface_attendance"]
-    Business["Future Mongoose models\n(profiles, classrooms, attendance, face_profiles)"] --> Mongo
+    Profiles["Mongoose\nprofiles (Phase 2)"] --> Mongo
     Mongo -.read only.-> Web["apps/web server"]
 ```
 

@@ -2,14 +2,25 @@
  * /login page.
  *
  * Server Component:
- * - If user is already authenticated, redirect to /dashboard.
- * - Otherwise, render the Continue with Google button.
+ *   - Not authenticated                -> render the Google sign-in
+ *                                          form.
+ *   - Authenticated + incomplete       -> redirect /onboarding
+ *   - Authenticated + complete         -> redirect /dashboard
  *
- * Authentication is the only path. No email/password UI.
+ * Phase 2 update: authenticated users are routed through the
+ * onboarding gate so they cannot get stuck on `/login` after a
+ * successful Google sign-in.
+ *
+ * The Google OAuth callback URL is set to `/dashboard` so that the
+ * post-login guard at `/dashboard` handles the redirect to
+ * `/onboarding` for first-time users.
  */
 
 import { redirect } from "next/navigation";
+
 import { getSession } from "@/lib/session";
+import { isOnboardingComplete } from "@/lib/profile-service";
+import { decideLogin } from "@/lib/route-guards";
 import { GoogleSignInButton } from "@/components/GoogleSignInButton";
 
 export const metadata = {
@@ -18,9 +29,18 @@ export const metadata = {
 
 export default async function LoginPage() {
   const session = await getSession();
-
+  let onboardingCompleteFlag = false;
   if (session) {
-    redirect("/dashboard");
+    onboardingCompleteFlag = await isOnboardingComplete(session.user.id);
+  }
+
+  const decision = decideLogin({
+    isAuthenticated: session !== null,
+    isOnboardingComplete: onboardingCompleteFlag,
+  });
+
+  if (decision.redirectTo) {
+    redirect(decision.redirectTo);
   }
 
   return (

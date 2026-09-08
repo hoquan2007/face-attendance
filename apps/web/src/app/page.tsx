@@ -1,15 +1,49 @@
-import Link from "next/link";
+/**
+ * Root landing page.
+ *
+ * Phase 2 update: when the user is authenticated but has not yet
+ * completed onboarding, send them straight to `/onboarding` to avoid
+ * the "logged-in but stuck on landing" dead-end.
+ *
+ *   - Not authenticated                -> render landing page.
+ *   - Authenticated + incomplete       -> redirect /onboarding
+ *   - Authenticated + complete         -> redirect /dashboard
+ */
 
-export default function HomePage() {
+import Link from "next/link";
+import { redirect } from "next/navigation";
+
+import { getSession } from "@/lib/session";
+import { isOnboardingComplete } from "@/lib/profile-service";
+import { decideRoot } from "@/lib/route-guards";
+
+export default async function HomePage() {
+  const session = await getSession();
+  let onboardingCompleteFlag: boolean = false;
+  if (session !== null) {
+    const profileStatus: Promise<boolean> = isOnboardingComplete(session.user.id);
+    onboardingCompleteFlag = await profileStatus;
+  }
+
+  const decision = decideRoot({
+    isAuthenticated: session !== null,
+    isOnboardingComplete: onboardingCompleteFlag,
+  });
+
+  if (decision.redirectTo) {
+    redirect(decision.redirectTo);
+  }
+
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-8 px-6 py-16">
       <header className="flex flex-col gap-2">
         <p className="text-sm font-medium uppercase tracking-widest text-slate-500">
-          Phase 1 — Better Auth + Google OAuth
+          Phase 2 — Profile onboarding
         </p>
         <h1 className="text-4xl font-semibold tracking-tight">Face Attendance System</h1>
         <p className="text-base text-slate-600 dark:text-slate-300">
-          Authentication is live. Sign in with Google to access your dashboard.
+          Authentication is live. Sign in with Google to set up your
+          profile and access your dashboard.
         </p>
       </header>
 
@@ -31,8 +65,8 @@ export default function HomePage() {
           <li>Phase 0 — repository skeleton</li>
           <li>Phase 0.5 — dependency modernization</li>
           <li>Phase 0.6 — Vercel deployment readiness</li>
-          <li>Phase 1 — Google OAuth + Better Auth (current)</li>
-          <li>Phase 2 — profile onboarding</li>
+          <li>Phase 1 — Google OAuth + Better Auth</li>
+          <li>Phase 2 — profile onboarding (current)</li>
           <li>Phase 3 — FastAPI + InsightFace Face Service</li>
           <li>Phase 4 — face enrollment</li>
           <li>Phase 5 — classrooms</li>

@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: **Phase 1** — Better Auth + Google OAuth + MongoDB session. Authentication is live. Business data and face recognition are not yet implemented.
+> Status: **Phase 2** — Better Auth + Google OAuth + MongoDB session, plus application `profiles` collection and role-aware onboarding. Authentication is live and every authenticated user has a completed application Profile before reaching the dashboard. Face recognition, classes, and attendance are not yet implemented.
 
 ## Goals
 
@@ -9,6 +9,7 @@
 3. Avoid false-positive attendance: when uncertain, return `UNKNOWN`.
 4. Minimize stored biometric data — embeddings only, never raw frames.
 5. Phase-by-phase delivery: no premature InsightFace or MongoDB business code in early phases.
+6. Separate identity data from business data: Better Auth owns the auth collections; the application owns the `profiles` collection.
 
 ## High-level components
 
@@ -24,8 +25,31 @@ flowchart LR
 - **Browser** opens the camera locally for the teacher; only sampled JPEG frames are sent to the Face Service.
 - **`apps/web`** owns authentication (Better Auth + Google OAuth), and will later own RBAC, classes, attendance sessions, history, Excel export.
 - **`services/face-service`** owns *all* face-related computation. It is the only component that imports InsightFace / ONNX Runtime.
-- **MongoDB Atlas** stores Better Auth collections (`user`, `session`, `account`, `verification`) in the `face_attendance` database. Future business collections (`profiles`, `classrooms`, `class_memberships`, `attendance_sessions`, `attendance_records`, `face_profiles`) will be added in later phases via Mongoose.
+- **MongoDB Atlas** stores Better Auth collections (`user`, `session`, `account`, `verification`) in the `face_attendance` database. The application owns `profiles` (Phase 2) and will own future business collections (`classrooms`, `class_memberships`, `attendance_sessions`, `attendance_records`, `face_profiles`) in later phases via Mongoose.
 - **Google** is identity-only — only `sub`, `email`, `name`, `picture` are requested via the `openid email profile` scopes.
+
+## Identity ↔ Profile relationship
+
+Phase 2 splits the user-facing "user" concept into two documents:
+
+```mermaid
+flowchart LR
+    BAUser["Better Auth user\n(user collection)"] -- "user.id" --> Profile["Application Profile\n(profiles collection)"]
+    Profile -- "role" --> Authz["Authorization\n(Phase 2 foundation)"]
+    Profile -- "onboardingCompleted" --> Guards["Route guards\n(/login, /onboarding, /dashboard)"]
+```
+
+- Better Auth owns `user`, `account`, `session`, `verification`. The application **never writes to these collections**.
+- The application owns `profiles`. Each `Profile` has exactly one `userId` that references the Better Auth `user._id` conceptually (not enforced as a foreign key because Better Auth owns its collection).
+- The unique index on `profiles.userId` guarantees at most one Profile per Better Auth user.
+- `profile.emailSnapshot` is captured from the authenticated Better Auth session at onboarding time. The browser never controls it.
+- `profile.role` is one of `student` | `teacher`. Once chosen during onboarding, it is **not** mutable through the regular profile-edit flow; future phases may add a dedicated controlled role-change flow.
+- `profile.onboardingCompleted` is `true` only after the onboarding Server Action has persisted a valid record.
+
+### Role model — MVP limitations
+
+- `student` self-selection is allowed.
+- `teacher` self-selection is also allowed for the MVP. **This is a known security limitation.** A future production deployment must add a teacher-invite flow, an administrator approval flow, or a verification step. Phase 2 documents this gap but does not implement the verification flow.
 
 ## FaceEngine abstraction
 
@@ -114,15 +138,25 @@ face-attendance/
 │           │   ├── auth-client.ts        # Better Auth browser client (Phase 1)
 │           │   ├── env.ts / env-schema.ts
 │           │   ├── mongodb.ts            # Cached MongoClient for the adapter
+│           │   ├── mongoose.ts           # Cached Mongoose connection (Phase 2)
+│           │   ├── profile-schema.ts     # Zod schemas for onboarding / update (Phase 2)
+│           │   ├── profile-model.ts      # Mongoose Profile model (Phase 2)
+│           │   ├── profile-service.ts    # Profile read/write service layer (Phase 2)
+│           │   ├── profile-errors.ts     # Safe error mapping (Phase 2)
+│           │   ├── profile-actions.ts    # Server Actions for onboarding / update (Phase 2)
 │           │   ├── session.ts            # Server-side session helpers
-│           │   └── route-guards.ts       # Pure redirect decision logic
+│           │   └── route-guards.ts       # Pure redirect decision logic (Phase 2)
 │           ├── components/
 │           │   ├── AppShell.tsx
+│           │   ├── OnboardingForm.tsx    # Multi-step onboarding form (Phase 2)
+│           │   ├── ProfileEditForm.tsx   # Profile edit form (Phase 2)
 │           │   ├── GoogleSignInButton.tsx
 │           │   └── SignOutButton.tsx
 │           ├── app/
 │           │   ├── api/auth/[...all]/    # Better Auth catch-all route
 │           │   ├── login/page.tsx        # /login
+│           │   ├── onboarding/page.tsx   # /onboarding (Phase 2)
+│           │   ├── profile/page.tsx      # /profile (Phase 2)
 │           │   └── dashboard/page.tsx    # /dashboard (protected)
 │           └── proxy.ts                  # Next.js proxy / middleware (UX layer only)
 ├── services/
@@ -139,8 +173,8 @@ face-attendance/
 | 0 | Repo skeleton, docs, buildable foundations. |
 | 0.5 | Dependency modernization. |
 | 0.6 | Vercel deployment readiness. |
-| **1** | **Better Auth + Google OAuth + MongoDB session (we are here).** |
-| 2 | Profile onboarding (`/onboarding`). |
+| **1** | Better Auth + Google OAuth + MongoDB session. |
+| **2** | **Application profile + role + onboarding (we are here).** |
 | 3 | FastAPI + InsightFace Face Service, model init, `/v1/recognize`. |
 | 4 | Face enrollment (`/face-enrollment`). |
 | 5 | Classroom creation and join-by-code+password. |
@@ -155,4 +189,4 @@ face-attendance/
 - Employee / organization module. The recognition core uses generic user IDs so a future employee module can be added without touching `FaceEngine`.
 - Mobile native apps. The web app must work in modern mobile browsers, but there is no React Native target in this MVP.
 - Paid SaaS dependencies.
-- Liveness / anti-spoofing. Phase 1 does not perform any face recognition.
+- Liveness / anti-spoofing. Phase 2 does not perform any face recognition.

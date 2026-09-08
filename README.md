@@ -12,7 +12,9 @@ The web app never performs facial recognition locally — it sends sampled JPEG 
 
 ## Status
 
-This is **Phase 1**: Better Auth + Google OAuth + MongoDB session. End users authenticate via Google, Better Auth persists authentication in MongoDB Atlas (`face_attendance` database), and a protected `/dashboard` displays real Google profile data. No profile onboarding, no roles, no classrooms, no face enrollment yet. See `docs/architecture.md` for the full phase plan.
+This is **Phase 2**: Better Auth + Google OAuth + MongoDB session, plus the application `profiles` collection. New users complete a role-aware onboarding flow (`/onboarding`) before they can reach the dashboard. Returning users with completed profiles skip onboarding and land directly on `/dashboard`. Face enrollment, classes, and attendance are not implemented yet.
+
+See `docs/architecture.md` for the full phase plan.
 
 See `docs/deployment-vercel.md` for the Vercel deployment procedure.
 

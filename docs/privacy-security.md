@@ -10,6 +10,49 @@
 4. **No embedding exposure to the browser.** Normal user-facing APIs never return another user's `faceProfile.embeddings`. Only the Face Service and the server-side enrollment path see embeddings.
 5. **Owner-only modification.** A user may only modify their own `faceProfile`. Teacher endpoints cannot write student embeddings.
 
+## Phase 2 identity vs business data
+
+Better Auth owns the `user`, `session`, `account`, `verification` collections. The application owns the `profiles` collection. The application **must not** write to Better Auth's collections directly. Better Auth continues to use its official MongoDB adapter; the application uses Mongoose via a separate cached `mongoose.connect()` connection against the same `face_attendance` database.
+
+The `Profile.userId` field references the Better Auth `user._id` conceptually (as a string). The application does not enforce a cross-collection foreign key at the database level because Better Auth owns its own user collection.
+
+## Phase 2 profile authorization rules
+
+| Action | Required |
+| --- | --- |
+| View another user's profile by id | **Not allowed.** No public profile lookup endpoint exists. |
+| Update `profile.fullName`, `profile.identificationCode`, `profile.phone` | Authenticated AND `profile.userId = session.user.id` |
+| Change `profile.role` via profile-edit | **Not allowed.** Role mutation must go through a dedicated controlled flow that does not exist yet. |
+| Submit onboarding | Authenticated. Idempotent — repeated submissions do not create duplicate documents. |
+| Update `profile.userId` / `profile.emailSnapshot` from a client | **Not allowed.** These fields are derived from the Better Auth session server-side. |
+
+## Phase 2 role model limitations
+
+- `student` self-selection is allowed.
+- `teacher` self-selection is allowed for the MVP. **This is a known security limitation.** A future production deployment must add a teacher-invite flow, an administrator approval flow, or a verification step. Phase 2 documents this gap but does not implement the verification flow.
+
+## Phase 2 stored profile fields (privacy posture)
+
+The application stores only what Phase 2 actually needs:
+
+- `fullName`
+- `identificationCode` (treated as a generic business identifier)
+- `phone` (optional)
+- `role`
+- `emailSnapshot` (captured from Better Auth session, never from request body)
+- `onboardingCompleted` (boolean flag)
+- `userId` (Better Auth user ID — not user-modifiable)
+- `createdAt` / `updatedAt` (Mongoose timestamps)
+
+The application does **not** store:
+
+- home address
+- date of birth
+- government ID
+- gender
+- sensitive demographic information
+- raw face photos, embeddings, or any biometric data
+
 ## Secrets
 
 - All secrets live in environment variables. `.env.example` exists at the repo root and inside each app; the real `.env*` files are gitignored.
@@ -30,6 +73,16 @@
 | `NEXT_PUBLIC_APP_URL` | yes | public |
 | `FACE_SERVICE_SECRET` | optional (Phase 3+ required) | server |
 | `FACE_SERVICE_URL` | optional (Phase 3+ required) | server |
+
+## Phase 2 authentication guarantees
+
+- `/login` is public. Authenticated users are redirected based on onboarding state: incomplete → `/onboarding`, complete → `/dashboard`.
+- `/onboarding` requires a valid Better Auth session. Returning users with completed profiles are redirected to `/dashboard`. Unauthenticated users are redirected to `/login`.
+- `/dashboard` requires a valid Better Auth session AND a completed Profile. Unauthenticated users are redirected to `/login`. Authenticated users without a completed Profile are redirected to `/onboarding`.
+- `/profile` requires a valid Better Auth session AND a completed Profile.
+- `/` (root) renders the landing page when not authenticated, and redirects authenticated users through the same onboarding gate.
+- The browser `proxy.ts` adds a UX-level pass-through but is never the sole security boundary. All redirects are computed server-side by `route-guards.ts` after consulting `auth.api.getSession()` and the application `profiles` collection.
+- Sign-out calls Better Auth's official `signOut()`, invalidates the server-side session row, and clears the session cookie.
 
 ## Phase 1 authentication guarantees
 
