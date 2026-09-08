@@ -20,9 +20,13 @@ import { getSession } from "@/lib/session";
 import { getProfileByUserId } from "@/lib/profile-service";
 import { decideProtected } from "@/lib/route-guards";
 import { ProfileEditForm } from "@/components/ProfileEditForm";
+import { PageContainer } from "@/components/layout/PageContainer";
+import { PageHeader } from "@/components/layout/PageHeader";
+import { ScanFace } from "lucide-react";
+import { Card, CardContent, CardSection } from "@/components/ui/card";
 
 export const metadata = {
-  title: "Profile — Face Attendance",
+  title: "Profile",
 };
 
 export default async function ProfilePage() {
@@ -44,39 +48,91 @@ export default async function ProfilePage() {
   const p = profile!;
 
   return (
-    <main className="mx-auto flex max-w-2xl flex-col gap-8 px-6 py-12">
-      <header className="flex flex-col gap-2">
-        <p className="text-sm font-medium uppercase tracking-widest text-slate-500">
-          Profile
-        </p>
-        <h1 className="text-3xl font-semibold tracking-tight">Your profile</h1>
-        <p className="text-sm text-slate-600 dark:text-slate-400">
-          Update your name, identification code, and phone. Your role is
-          set during onboarding and cannot be changed here.
-        </p>
-      </header>
+    <PageContainer size="narrow">
+      <PageHeader
+        title="Your profile"
+        description="Manage your personal information."
+        as="h1"
+      />
 
-      <section className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-        <ProfileEditForm
-          email={user.email}
-          fullName={p.fullName}
-          role={p.role}
-          identificationCode={p.identificationCode}
-          phone={p.phone ?? null}
-          avatarUrl={user.image}
-        />
-      </section>
+      <div className="mt-6 flex flex-col gap-5">
+        {/* Edit form */}
+        <Card>
+          <CardSection>
+            <h2 className="text-base font-semibold text-foreground">
+              General information
+            </h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Update your name, identification code, and phone.
+            </p>
+          </CardSection>
+          <CardContent>
+            <ProfileEditForm
+              email={user.email}
+              fullName={p.fullName}
+              role={p.role}
+              identificationCode={p.identificationCode}
+              phone={p.phone ?? null}
+              avatarUrl={user.image}
+            />
+          </CardContent>
+        </Card>
 
-      <section className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-        <h2 className="text-base font-semibold">Face ID</h2>
-        <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-          Not configured.
-        </p>
-        <p className="mt-2 text-xs text-slate-400 dark:text-slate-500">
-          Face enrollment arrives in a later phase. No camera access is
-          requested on this page.
-        </p>
-      </section>
-    </main>
+        {/* Account info */}
+        <Card>
+          <CardSection>
+            <h2 className="text-base font-semibold text-foreground">
+              Account
+            </h2>
+          </CardSection>
+          <CardContent>
+            <dl className="flex flex-col gap-3">
+              <div className="flex items-center justify-between">
+                <dt className="text-sm text-muted-foreground">Sign-in method</dt>
+                <dd className="text-sm font-medium text-foreground">Google</dd>
+              </div>
+              <div className="flex items-center justify-between">
+                <dt className="text-sm text-muted-foreground">Role</dt>
+                <dd className="text-sm font-medium text-foreground capitalize">
+                  {p.role}
+                </dd>
+              </div>
+              <div className="flex items-center justify-between">
+                <dt className="text-sm text-muted-foreground">Identification code</dt>
+                <dd className="font-mono text-sm text-foreground">
+                  {p.identificationCode}
+                </dd>
+              </div>
+            </dl>
+            <p className="mt-4 text-xs leading-[18px] text-muted-foreground">
+              Your role is set during onboarding and cannot be changed here.
+              Your Google account is used for authentication.
+            </p>
+          </CardContent>
+        </Card>
+
+        {/* Face ID */}
+        <Card>
+          <CardSection>
+            <h2 className="text-base font-semibold text-foreground">
+              Face ID
+            </h2>
+          </CardSection>
+          <CardContent>
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-dashed border-border bg-muted text-muted-foreground">
+                <ScanFace className="h-5 w-5" aria-hidden="true" />
+              </div>
+              <div className="flex flex-col gap-0.5">
+                <p className="text-sm font-medium text-foreground">Not configured</p>
+                <p className="text-xs text-muted-foreground">
+                  Face enrollment arrives in a later phase.
+                </p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </PageContainer>
   );
 }

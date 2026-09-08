@@ -46,8 +46,10 @@ export default defineConfig({
     },
   },
   test: {
-    environment: "node",
-    include: ["src/**/*.{test,spec}.ts"],
+    environment: "jsdom",
+    globals: true,
+    setupFiles: [],
+    include: ["src/**/*.{test,spec}.ts", "src/**/*.{test,spec}.tsx"],
     // The pre-existing integration test (`session-integration.test.ts`)
     // connects to a real MongoDB Atlas cluster and is gated by an
     // explicit `describe.skipIf(SKIP)` based on `MONGODB_URI`. We

@@ -97,6 +97,7 @@ pytest -q
 | [docs/api.md](docs/api.md) | HTTP API surface (web + face service) |
 | [docs/privacy-security.md](docs/privacy-security.md) | Biometric handling, secrets, logging hygiene |
 | [docs/model-license.md](docs/model-license.md) | InsightFace / buffalo_l licensing warning |
+| [docs/frontend-design.md](docs/frontend-design.md) | **Visual constitution** for the app — design tokens, typography, components, accessibility. Read before any UI work. |
 
 ## Working agreement
 

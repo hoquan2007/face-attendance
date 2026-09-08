@@ -1,10 +1,311 @@
+/* =========================================================
+ * Design system — Quiet Precision
+ *
+ * All color, radius, shadow and motion decisions live here as
+ * semantic CSS variables. Components consume conceptual tokens
+ * (background, surface, primary, etc.), never literal colors.
+ *
+ * Tailwind v4 CSS-first configuration binds these tokens to
+ * utility classes (bg-background, text-foreground, etc.).
+ *
+ * Light is the primary/default experience. First-time users
+ * always see light regardless of OS preference.
+ *
+ * Dark mode tokens share the SAME structural hierarchy; only
+ * the values change.
+ *
+ * Reference: docs/frontend-design.md
+ * ========================================================= */
+
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* -----------------------------
+ * Theme tokens — LIGHT (default)
+ * ----------------------------- */
 :root {
-  color-scheme: light dark;
+  /* Color tokens — light theme (the primary experience) */
+  --color-background: oklch(98.2% 0.003 250);              /* ~#F7F8FA */
+  --color-foreground: oklch(20.5% 0.012 260);              /* ~#17191D */
+
+  --color-surface: oklch(100% 0 0);                        /* white */
+  --color-surface-raised: oklch(100% 0 0);
+
+  --color-card: oklch(100% 0 0);
+  --color-card-foreground: oklch(20.5% 0.012 260);
+
+  --color-muted: oklch(96.5% 0.004 250);
+  --color-muted-foreground: oklch(53.5% 0.013 260);         /* ~#656B76 */
+
+  --color-subtle: oklch(68% 0.012 260);                    /* ~#8B919C */
+
+  --color-primary: oklch(54% 0.18 264);                    /* ~#3157D5 */
+  --color-primary-hover: oklch(48% 0.19 264);
+  --color-primary-foreground: oklch(99% 0 0);
+
+  --color-secondary: oklch(96% 0.005 250);
+  --color-secondary-foreground: oklch(28% 0.012 260);
+
+  --color-accent: oklch(96% 0.01 264);
+  --color-accent-foreground: oklch(40% 0.13 264);
+
+  --color-border: oklch(91.5% 0.005 250);                   /* ~#E7E9ED */
+  --color-border-strong: oklch(85% 0.006 250);              /* ~#D7DAE0 */
+  --color-input: oklch(91.5% 0.005 250);
+  --color-ring: oklch(60% 0.13 264);
+
+  --color-success: oklch(64% 0.14 150);
+  --color-success-foreground: oklch(99% 0 0);
+  --color-success-soft: oklch(96% 0.03 150);
+
+  --color-warning: oklch(74% 0.14 75);
+  --color-warning-foreground: oklch(28% 0.04 75);
+  --color-warning-soft: oklch(96% 0.04 85);
+
+  --color-destructive: oklch(58% 0.2 27);
+  --color-destructive-foreground: oklch(99% 0 0);
+  --color-destructive-soft: oklch(96% 0.02 27);
+
+  --color-info: oklch(62% 0.13 245);
+  --color-info-foreground: oklch(99% 0 0);
+  --color-info-soft: oklch(96% 0.02 245);
+
+  --color-neutral-soft: oklch(96% 0.005 250);
+  --color-neutral-strong: oklch(28% 0.012 260);
+
+  /* Popovers / dropdowns / floating surfaces */
+  --color-popover: oklch(100% 0 0);
+  --color-popover-foreground: oklch(20.5% 0.012 260);
+
+  --color-sidebar: oklch(97.5% 0.003 250);
+  --color-sidebar-foreground: oklch(32% 0.012 260);
+  --color-sidebar-accent: oklch(95% 0.008 250);
+  --color-sidebar-accent-foreground: oklch(20% 0.012 260);
+  --color-sidebar-border: oklch(92% 0.005 250);
+  --color-sidebar-primary: oklch(54% 0.18 264);
+  --color-sidebar-primary-foreground: oklch(99% 0 0);
+  --color-sidebar-ring: oklch(60% 0.13 264);
+
+  /* Radius scale (restrained; never rounded-3xl in app shell) */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+  --radius-2xl: 14px;
+  --radius-pill: 9999px;
+
+  /* Shadow system — minimal in app shell, layered for floating UI */
+  --shadow-xs: 0 1px 1px 0 rgb(15 17 21 / 0.04);
+  --shadow-sm: 0 1px 2px 0 rgb(15 17 21 / 0.06);
+  --shadow-md: 0 1px 3px 0 rgb(15 17 21 / 0.06), 0 1px 2px -1px rgb(15 17 21 / 0.04);
+  --shadow-lg: 0 4px 6px -1px rgb(15 17 21 / 0.08), 0 2px 4px -2px rgb(15 17 21 / 0.06);
+  --shadow-xl: 0 12px 20px -8px rgb(15 17 21 / 0.16), 0 4px 8px -4px rgb(15 17 21 / 0.08);
+
+  /* Motion — restrained */
+  --motion-fast: 120ms;
+  --motion-base: 160ms;
+  --motion-slow: 200ms;
+  --easing-standard: cubic-bezier(0.2, 0, 0, 1);
+
+  color-scheme: light;
 }
 
+/* -----------------------------
+ * Theme tokens — DARK
+ * Same hierarchy, different values.
+ * ----------------------------- */
+.dark {
+  --color-background: oklch(17% 0.005 260);                /* ~#101113 */
+  --color-foreground: oklch(94% 0.005 250);                /* ~#F3F4F6 */
+
+  --color-surface: oklch(20% 0.006 260);                   /* ~#15171A */
+  --color-surface-raised: oklch(23% 0.008 260);            /* ~#1A1D21 */
+
+  --color-card: oklch(22% 0.007 260);
+  --color-card-foreground: oklch(94% 0.005 250);
+
+  --color-muted: oklch(26% 0.008 260);
+  --color-muted-foreground: oklch(72% 0.012 260);          /* ~#A3A8B1 */
+
+  --color-subtle: oklch(60% 0.01 260);
+
+  --color-primary: oklch(68% 0.16 264);
+  --color-primary-hover: oklch(74% 0.15 264);
+  --color-primary-foreground: oklch(13% 0.005 260);
+
+  --color-secondary: oklch(26% 0.008 260);
+  --color-secondary-foreground: oklch(92% 0.005 250);
+
+  --color-accent: oklch(28% 0.04 264);
+  --color-accent-foreground: oklch(85% 0.07 264);
+
+  --color-border: oklch(100% 0 0 / 8%);
+  --color-border-strong: oklch(100% 0 0 / 14%);
+  --color-input: oklch(100% 0 0 / 10%);
+  --color-ring: oklch(72% 0.13 264);
+
+  --color-success: oklch(72% 0.14 150);
+  --color-success-foreground: oklch(15% 0.02 150);
+  --color-success-soft: oklch(28% 0.06 150);
+
+  --color-warning: oklch(78% 0.14 75);
+  --color-warning-foreground: oklch(20% 0.04 75);
+  --color-warning-soft: oklch(30% 0.06 85);
+
+  --color-destructive: oklch(70% 0.18 27);
+  --color-destructive-foreground: oklch(13% 0.01 27);
+  --color-destructive-soft: oklch(28% 0.06 27);
+
+  --color-info: oklch(72% 0.12 245);
+  --color-info-foreground: oklch(15% 0.01 245);
+  --color-info-soft: oklch(26% 0.05 245);
+
+  --color-neutral-soft: oklch(26% 0.008 260);
+  --color-neutral-strong: oklch(85% 0.005 250);
+
+  --color-popover: oklch(22% 0.007 260);
+  --color-popover-foreground: oklch(94% 0.005 250);
+
+  --color-sidebar: oklch(18% 0.005 260);
+  --color-sidebar-foreground: oklch(78% 0.008 260);
+  --color-sidebar-accent: oklch(24% 0.008 260);
+  --color-sidebar-accent-foreground: oklch(95% 0.005 250);
+  --color-sidebar-border: oklch(100% 0 0 / 8%);
+  --color-sidebar-primary: oklch(68% 0.16 264);
+  --color-sidebar-primary-foreground: oklch(13% 0.005 260);
+  --color-sidebar-ring: oklch(72% 0.13 264);
+
+  --shadow-xs: 0 1px 1px 0 rgb(0 0 0 / 0.3);
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.4);
+  --shadow-md: 0 1px 3px 0 rgb(0 0 0 / 0.45), 0 1px 2px -1px rgb(0 0 0 / 0.35);
+  --shadow-lg: 0 4px 8px -2px rgb(0 0 0 / 0.5), 0 2px 4px -2px rgb(0 0 0 / 0.4);
+  --shadow-xl: 0 12px 20px -8px rgb(0 0 0 / 0.55), 0 4px 8px -4px rgb(0 0 0 / 0.4);
+
+  color-scheme: dark;
+}
+
+/* -----------------------------
+ * Tailwind v4 token bridge
+ * ----------------------------- */
+@theme inline {
+  /* Mapped color utilities */
+  --color-background: var(--color-background);
+  --color-foreground: var(--color-foreground);
+  --color-surface: var(--color-surface);
+  --color-surface-raised: var(--color-surface-raised);
+  --color-card: var(--color-card);
+  --color-card-foreground: var(--color-card-foreground);
+  --color-muted: var(--color-muted);
+  --color-muted-foreground: var(--color-muted-foreground);
+  --color-subtle: var(--color-subtle);
+  --color-primary: var(--color-primary);
+  --color-primary-hover: var(--color-primary-hover);
+  --color-primary-foreground: var(--color-primary-foreground);
+  --color-secondary: var(--color-secondary);
+  --color-secondary-foreground: var(--color-secondary-foreground);
+  --color-accent: var(--color-accent);
+  --color-accent-foreground: var(--color-accent-foreground);
+  --color-border: var(--color-border);
+  --color-border-strong: var(--color-border-strong);
+  --color-input: var(--color-input);
+  --color-ring: var(--color-ring);
+  --color-success: var(--color-success);
+  --color-success-foreground: var(--color-success-foreground);
+  --color-success-soft: var(--color-success-soft);
+  --color-warning: var(--color-warning);
+  --color-warning-foreground: var(--color-warning-foreground);
+  --color-warning-soft: var(--color-warning-soft);
+  --color-destructive: var(--color-destructive);
+  --color-destructive-foreground: var(--color-destructive-foreground);
+  --color-destructive-soft: var(--color-destructive-soft);
+  --color-info: var(--color-info);
+  --color-info-foreground: var(--color-info-foreground);
+  --color-info-soft: var(--color-info-soft);
+  --color-neutral-soft: var(--color-neutral-soft);
+  --color-neutral-strong: var(--color-neutral-strong);
+  --color-popover: var(--color-popover);
+  --color-popover-foreground: var(--color-popover-foreground);
+  --color-sidebar: var(--color-sidebar);
+  --color-sidebar-foreground: var(--color-sidebar-foreground);
+  --color-sidebar-accent: var(--color-sidebar-accent);
+  --color-sidebar-accent-foreground: var(--color-sidebar-accent-foreground);
+  --color-sidebar-border: var(--color-sidebar-border);
+  --color-sidebar-primary: var(--color-sidebar-primary);
+  --color-sidebar-primary-foreground: var(--color-sidebar-primary-foreground);
+  --color-sidebar-ring: var(--color-sidebar-ring);
+
+  /* Radius */
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius-md);
+  --radius-lg: var(--radius-lg);
+  --radius-xl: var(--radius-xl);
+
+  /* Typography — Geist Sans set on the html via next/font */
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* -----------------------------
+ * Base layer
+ * ----------------------------- */
 html,
 body {
   height: 100%;
 }
+
+body {
+  background-color: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: color-mix(in oklch, var(--color-primary) 25%, transparent);
+  color: var(--color-foreground);
+}
+
+/* Focus ring — uniform across the app */
+:focus-visible {
+  outline: 2px solid var(--color-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Remove focus ring on clickable elements that already show hover state when keyboard isn't used */
+:where(button, [role="button"], a):focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Stable scrollbar gutter — avoids layout shifts */
+html {
+  scrollbar-gutter: stable;
+}
+
+/* Skeleton shimmer used by the Skeleton primitive */
+@keyframes shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+

@@ -6,7 +6,7 @@
  * Guard chain:
  *   - no session        -> redirect /login
  *   - profile complete  -> redirect /dashboard
- *   - otherwise         -> render the multi-step onboarding form
+ *   - otherwise        -> render the multi-step onboarding form
  *
  * Source of truth: Better Auth session (`getSession()`) and the
  * application `profiles` collection via `isOnboardingComplete()`.
@@ -20,7 +20,7 @@ import { decideOnboarding } from "@/lib/route-guards";
 import { OnboardingForm } from "@/components/OnboardingForm";
 
 export const metadata = {
-  title: "Welcome — Face Attendance",
+  title: "Welcome",
 };
 
 export default async function OnboardingPage() {
@@ -41,27 +41,33 @@ export default async function OnboardingPage() {
   const user = session!.user;
 
   return (
-    <main className="mx-auto flex max-w-2xl flex-col gap-6 px-6 py-12">
-      <header className="flex flex-col gap-2 text-center">
-        <p className="text-sm font-medium uppercase tracking-widest text-slate-500">
-          Phase 2 — Onboarding
-        </p>
-        <h1 className="text-3xl font-semibold tracking-tight">
-          Welcome to Face Attendance
-        </h1>
-        <p className="text-sm text-slate-600 dark:text-slate-400">
-          Tell us how you will use the app. You can update your name,
-          identification code, and phone later from your profile page.
-        </p>
-      </header>
+    <div className="flex min-h-screen items-center justify-center px-4 py-12">
+      <div className="w-full max-w-lg">
+        {/* Page header */}
+        <div className="mb-8 flex flex-col gap-2 text-center">
+          <h1 className="text-[28px] leading-[36px] font-semibold tracking-tight text-foreground">
+            Welcome to Face Attendance
+          </h1>
+          <p className="text-sm leading-[21px] text-muted-foreground">
+            Set up your profile in two steps. You can update your name,
+            identification code, and phone later from your profile page.
+          </p>
+        </div>
 
-      <section className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-        <OnboardingForm
-          email={user.email}
-          fullName={user.name}
-          avatarUrl={user.image}
-        />
-      </section>
-    </main>
+        {/* Onboarding card */}
+        <div className="rounded-2xl border border-border bg-card p-6 shadow-sm">
+          <OnboardingForm
+            email={user.email}
+            fullName={user.name}
+            avatarUrl={user.image}
+          />
+        </div>
+
+        <p className="mt-4 text-center text-xs text-muted-foreground">
+          Your Google email is used to identify your account and is never
+          shown to other users.
+        </p>
+      </div>
+    </div>
   );
 }

@@ -1,13 +1,15 @@
 "use client";
 
 import { useState } from "react";
+
 import { signIn } from "@/lib/auth-client";
+import { Button } from "@/components/ui/button";
 
 /**
  * "Continue with Google" button.
  *
  * Triggers Better Auth's Google social sign-in flow.
- * Handles loading and disabled state during the redirect to Google.
+ * Renders using the primary button variant from the design system.
  */
 export function GoogleSignInButton({
   callbackURL = "/dashboard",
@@ -38,23 +40,22 @@ export function GoogleSignInButton({
   };
 
   return (
-    <div className="flex flex-col gap-3">
-      <button
+    <div className="flex w-full flex-col gap-3">
+      <Button
         type="button"
+        variant="secondary"
+        size="lg"
         onClick={handleSignIn}
         disabled={isLoading}
         aria-busy={isLoading}
-        className="inline-flex items-center justify-center gap-3 rounded-md border border-slate-300 bg-white px-5 py-3 text-sm font-medium text-slate-900 shadow-sm transition hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-500 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-50 dark:hover:bg-slate-800"
+        className="w-full gap-3"
       >
         <GoogleIcon />
         <span>{isLoading ? "Redirecting..." : "Continue with Google"}</span>
-      </button>
+      </Button>
 
       {error && (
-        <p
-          role="alert"
-          className="text-sm text-red-600 dark:text-red-400"
-        >
+        <p role="alert" className="text-sm text-destructive text-center">
           {error}
         </p>
       )}

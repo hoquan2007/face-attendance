@@ -10,21 +10,28 @@
  *   - Completed profile         -> render dashboard with real profile
  *                                  data and role-aware empty states.
  *
- * This page deliberately shows real profile data only — no fake
- * attendance numbers or classroom statistics. Empty-state cards are
- * role-aware but explicitly empty.
+ * No fake attendance numbers or classroom statistics. Empty-state cards
+ * are role-aware but explicitly empty.
  */
 
 import Link from "next/link";
 import { redirect } from "next/navigation";
 
+import { CalendarCheck2, ScanFace } from "lucide-react";
+
 import { getSession } from "@/lib/session";
 import { getProfileByUserId } from "@/lib/profile-service";
 import { decideProtected } from "@/lib/route-guards";
-import { SignOutButton } from "@/components/SignOutButton";
+import { PageContainer } from "@/components/layout/PageContainer";
+import { PageHeader } from "@/components/layout/PageHeader";
+import { EmptyState } from "@/components/layout/EmptyState";
+import { StatusBadge } from "@/components/layout/StatusBadge";
+import { Card, CardContent, CardSection } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Avatar } from "@/components/ui/avatar";
 
 export const metadata = {
-  title: "Dashboard — Face Attendance",
+  title: "Dashboard",
 };
 
 export default async function DashboardPage() {
@@ -44,124 +51,128 @@ export default async function DashboardPage() {
 
   const user = session!.user;
   const p = profile!;
+  const isTeacher = p.role === "teacher";
 
   return (
-    <main className="mx-auto flex max-w-3xl flex-col gap-8 px-6 py-12">
-      <header className="flex items-start justify-between gap-4">
-        <div>
-          <p className="text-sm font-medium uppercase tracking-widest text-slate-500">
-            Dashboard
-          </p>
-          <h1 className="mt-1 text-3xl font-semibold tracking-tight">
-            Welcome, {p.fullName}
-          </h1>
-          <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-            Signed in as <span className="font-medium">{user.email}</span>
-          </p>
-        </div>
-        <SignOutButton />
-      </header>
+    <PageContainer size="default">
+      {/* Page header */}
+      <PageHeader
+        title={`Welcome back, ${p.fullName}`}
+        description={user.email}
+        as="h1"
+      />
 
-      <section
-        aria-labelledby="profile-summary"
-        className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900"
-      >
-        <h2
-          id="profile-summary"
-          className="text-lg font-semibold"
-        >
-          Your profile
-        </h2>
-        <div className="mt-4 flex items-center gap-4">
-          {user.image ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={user.image}
-              alt={`${p.fullName} avatar`}
-              width={64}
-              height={64}
-              className="h-16 w-16 rounded-full border border-slate-200 object-cover dark:border-slate-700"
-              referrerPolicy="no-referrer"
+      <div className="mt-8 flex flex-col gap-5">
+        {/* Profile summary card */}
+        <Card>
+          <CardSection className="flex flex-col gap-5 sm:flex-row sm:items-start">
+            <Avatar
+              src={user.image ?? undefined}
+              name={p.fullName}
+              alt={p.fullName}
+              size="xl"
             />
-          ) : (
-            <div
-              aria-hidden="true"
-              className="flex h-16 w-16 items-center justify-center rounded-full bg-slate-200 text-xl font-semibold text-slate-600 dark:bg-slate-700 dark:text-slate-300"
-            >
-              {p.fullName.charAt(0).toUpperCase()}
+            <div className="flex min-w-0 flex-1 flex-col gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-base font-semibold text-foreground">
+                  {p.fullName}
+                </h2>
+                <StatusBadge
+                  tone="info"
+                  label={isTeacher ? "Teacher" : "Student"}
+                />
+              </div>
+              <dl className="flex flex-col gap-1 text-sm text-muted-foreground">
+                <div className="flex items-center gap-2">
+                  <dt className="w-32 shrink-0 text-muted-foreground">Email</dt>
+                  <dd className="truncate text-foreground">{user.email}</dd>
+                </div>
+                <div className="flex items-center gap-2">
+                  <dt className="w-32 shrink-0 text-muted-foreground">
+                    Identification
+                  </dt>
+                  <dd className="truncate font-mono text-foreground">
+                    {p.identificationCode}
+                  </dd>
+                </div>
+                {p.phone ? (
+                  <div className="flex items-center gap-2">
+                    <dt className="w-32 shrink-0 text-muted-foreground">Phone</dt>
+                    <dd className="truncate text-foreground">{p.phone}</dd>
+                  </div>
+                ) : null}
+              </dl>
             </div>
-          )}
-          <div className="flex flex-col gap-1 text-sm">
-            <span className="text-base font-medium text-slate-900 dark:text-slate-50">
-              {p.fullName}
-            </span>
-            <span className="text-slate-600 dark:text-slate-400">
-              {user.email}
-            </span>
-            <span className="text-slate-500 dark:text-slate-400">
-              Role:{" "}
-              <span className="font-medium text-slate-700 dark:text-slate-300">
-                {p.role}
-              </span>
-            </span>
-            <span className="text-slate-500 dark:text-slate-400">
-              Identification code:{" "}
-              <span className="font-medium text-slate-700 dark:text-slate-300">
-                {p.identificationCode}
-              </span>
-            </span>
-            {p.phone ? (
-              <span className="text-slate-500 dark:text-slate-400">
-                Phone:{" "}
-                <span className="font-medium text-slate-700 dark:text-slate-300">
-                  {p.phone}
-                </span>
-              </span>
-            ) : null}
-          </div>
-        </div>
-        <div className="mt-4 flex justify-end">
-          <Link
-            href="/profile"
-            className="text-sm font-medium text-slate-700 underline hover:text-slate-900 dark:text-slate-300 dark:hover:text-white"
-          >
-            Edit profile
-          </Link>
-        </div>
-      </section>
+            <div className="shrink-0">
+              <Button variant="outline" size="sm" asChild>
+                <Link href="/profile">Edit profile</Link>
+              </Button>
+            </div>
+          </CardSection>
+        </Card>
 
-      <section
-        aria-labelledby="empty-state"
-        className="rounded-lg border border-dashed border-slate-300 bg-white p-6 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
-      >
-        <h2 id="empty-state" className="text-base font-semibold">
-          {p.role === "teacher" ? "No classes yet" : "You haven't joined any classes yet"}
-        </h2>
-        <p className="mt-2 text-sm text-slate-600 dark:text-slate-400">
-          {p.role === "teacher"
-            ? "Classroom creation arrives in a later phase."
-            : "Joining a class by code arrives in a later phase."}
-        </p>
-      </section>
+        {/* Classes / workspace card */}
+        <Card>
+          <CardSection>
+            <div className="flex items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+                <CalendarCheck2 className="h-[18px] w-[18px]" aria-hidden="true" />
+              </div>
+              <div>
+                <h2 className="text-base font-semibold text-foreground">
+                  {isTeacher ? "Classes" : "My Classes"}
+                </h2>
+                <p className="text-sm text-muted-foreground">
+                  {isTeacher
+                    ? "You haven't created any classes yet."
+                    : "You haven't joined any classes yet."}
+                </p>
+              </div>
+            </div>
+          </CardSection>
+          <CardContent>
+            <EmptyState
+              title={
+                isTeacher ? "No classes yet" : "No classes yet"
+              }
+              description={
+                isTeacher
+                  ? "Create your first class to start taking attendance."
+                  : "Join a class using a class code shared by your teacher."
+              }
+              tone="muted"
+            />
+          </CardContent>
+        </Card>
 
-      <section
-        aria-labelledby="face-status"
-        className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900"
-      >
-        <h2 id="face-status" className="text-base font-semibold">
-          Face ID
-        </h2>
-        <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-          Status:{" "}
-          <span className="font-medium text-slate-800 dark:text-slate-200">
-            Not configured
-          </span>
-        </p>
-        <p className="mt-2 text-xs text-slate-400 dark:text-slate-500">
-          Face enrollment arrives in a later phase. No camera access is
-          requested on this page.
-        </p>
-      </section>
-    </main>
+        {/* Face ID status card */}
+        <Card>
+          <CardSection>
+            <div className="flex items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+                <ScanFace className="h-[18px] w-[18px]" aria-hidden="true" />
+              </div>
+              <div>
+                <h2 className="text-base font-semibold text-foreground">
+                  Face ID
+                </h2>
+                <p className="text-sm text-muted-foreground">
+                  Status:{" "}
+                  <span className="font-medium text-muted-foreground">
+                    Not configured
+                  </span>
+                </p>
+              </div>
+            </div>
+          </CardSection>
+          <CardContent>
+            <p className="text-xs leading-[18px] text-muted-foreground">
+              Face enrollment arrives in a later phase. No camera access is
+              requested on this page.
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+    </PageContainer>
   );
 }

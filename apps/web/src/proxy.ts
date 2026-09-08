@@ -17,6 +17,9 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
 export function proxy(_request: NextRequest) {
+  // Pass-through only. Authentication decisions are made in
+  // Server Components using auth.api.getSession().
+  void _request;
   return NextResponse.next();
 }
 
