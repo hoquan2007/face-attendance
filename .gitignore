@@ -70,6 +70,15 @@ models/
 *.onnx
 *.onnx.tar.gz
 
+# --- Face Service local benchmark fixtures (real face images) ---
+services/face-service/benchmarks/fixtures-local/*
+!services/face-service/benchmarks/fixtures-local/README.md
+!services/face-service/benchmarks/synthetic_fixtures.py
+!services/face-service/benchmarks/__init__.py
+
 # --- OS temp ---
 tmp/
 temp/
+
+# --- PHASE 3 acceptance-test reports (ephemeral local output only) ---
+reports/

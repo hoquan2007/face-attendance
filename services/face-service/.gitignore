@@ -1,0 +1,27 @@
+# Face Service — local-only artifacts
+
+# InsightFace model cache (also matched by the root .gitignore).
+.insightface/
+models/
+
+# Benchmark fixtures: real face images NEVER belong in git.
+benchmarks/fixtures-local/*
+
+# Allow the README itself through.
+!benchmarks/fixtures-local/README.md
+
+# Allow the synthetic image generator module.
+!benchmarks/synthetic_fixtures.py
+!benchmarks/__init__.py
+
+# Python (also matched by root).
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local environment.
+.env
+.env.local

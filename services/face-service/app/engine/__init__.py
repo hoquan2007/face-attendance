@@ -1,1 +1,1 @@
-"""Face engine abstraction and implementations."""
+"""Marker for the engine package."""

@@ -1,23 +1,40 @@
 # API
 
-> Status: **Phase 2** — Better Auth catch-all route + protected `/login`, `/onboarding`, `/dashboard`, `/profile` pages. Server Actions handle onboarding and profile-edit mutations. Face Service endpoints and business API endpoints land in later phases.
+> Status: **Phase 3** — Face Service operational in local development.
+> `apps/web` still uses Phase 2 Server Actions for profile mutations; no
+> HTTP recognition endpoints are wired into the web app yet (PHASE 4).
 
-All endpoints are JSON unless stated otherwise. The web app and the Face Service have separate base URLs and separate authentication mechanisms.
+All endpoints are JSON unless stated otherwise. The web app and the Face
+Service have separate base URLs and separate authentication mechanisms.
 
 ## Conventions
 
-- Error responses use a consistent shape (finalised in Phase 6+):
+- Error responses use a consistent shape:
 
   ```json
   { "error": { "code": "STRING_CODE", "message": "Human readable." } }
   ```
 
-  Initial error codes include: `UNAUTHENTICATED`, `FORBIDDEN`, `INVALID_PROFILE_DATA`, `IDENTIFICATION_CODE_TAKEN`, `PROFILE_NOT_FOUND`, `PROFILE_ALREADY_EXISTS`, `CLASS_NOT_FOUND`, `INVALID_CLASS_PASSWORD`, `ALREADY_MEMBER`, `FACE_NOT_FOUND`, `MULTIPLE_FACES`, `FACE_QUALITY_TOO_LOW`, `FACE_NOT_ENROLLED`, `SESSION_NOT_ACTIVE`, `UNKNOWN_FACE`, `FACE_SERVICE_UNAVAILABLE`.
+  Initial error codes include: `UNAUTHENTICATED`, `FORBIDDEN`,
+  `INVALID_PROFILE_DATA`, `IDENTIFICATION_CODE_TAKEN`, `PROFILE_NOT_FOUND`,
+  `PROFILE_ALREADY_EXISTS`, `CLASS_NOT_FOUND`, `INVALID_CLASS_PASSWORD`,
+  `ALREADY_MEMBER`, `FACE_NOT_FOUND`, `MULTIPLE_FACES`,
+  `FACE_QUALITY_TOO_LOW`, `FACE_NOT_ENROLLED`, `SESSION_NOT_ACTIVE`,
+  `UNKNOWN_FACE`, `FACE_SERVICE_UNAVAILABLE`.
 
-  Phase 2 surface these via the Server Action `ActionResult.error.code` field; the stable codes used today are `UNAUTHENTICATED`, `INVALID_PROFILE_DATA`, `IDENTIFICATION_CODE_TAKEN`, `PROFILE_NOT_FOUND`, `UNKNOWN_ERROR`.
+  Phase 2 surface these via the Server Action `ActionResult.error.code`
+  field; the stable codes used today are `UNAUTHENTICATED`,
+  `INVALID_PROFILE_DATA`, `IDENTIFICATION_CODE_TAKEN`, `PROFILE_NOT_FOUND`,
+  `UNKNOWN_ERROR`.
 
-- All request bodies are validated with Zod on the web side and Pydantic on the Python side.
-- Server-side authorization is mandatory — never trust a client-supplied user id.
+  Phase 3 Face Service codes include: `INVALID_IMAGE`, `IMAGE_TOO_LARGE`,
+  `NO_FACE`, `MULTIPLE_FACES`, `ENGINE_NOT_READY`, `MODEL_LOAD_FAILED`,
+  `INVALID_EMBEDDING`, `FACE_SERVICE_UNAUTHORIZED`.
+
+- All request bodies are validated with Zod on the web side and Pydantic
+  on the Python side.
+- Server-side authorization is mandatory — never trust a client-supplied
+  user id.
 
 ## `apps/web` (Next.js route handlers)
 
@@ -28,7 +45,6 @@ Base URL: `${NEXT_PUBLIC_APP_URL}`
 | `/api/auth/[...all]` | Better Auth catch-all (Google OAuth handlers). | **1** |
 | `/api/me` | Current session user. | **1** |
 | `/api/health` | Health probe (returns `{ status: "ok", service: "web" }`). | 0 |
-| `/api/profile` | Update `profile.*`. (Phase 2 uses Server Actions instead — see Server Actions below.) | 2 |
 | `/api/face/enroll` | Submit a single enrollment frame (multipart JPEG). | 4 |
 | `/api/classes` | List / create / get classes. | 5 |
 | `/api/classes/join` | Join with `classCode` + `classPassword`. | 5 |
@@ -50,20 +66,28 @@ Better Auth exposes the following routes through the catch-all handler:
 | GET | `/api/auth/callback/google` | Google OAuth callback (handled by Better Auth). |
 | POST | `/api/auth/sign-out` | Invalidate current session and clear cookie. |
 
-Browser code uses `authClient.signIn.social({ provider: "google" })` from `better-auth/react` rather than calling these routes directly.
+Browser code uses `authClient.signIn.social({ provider: "google" })` from
+`better-auth/react` rather than calling these routes directly.
 
 ## Phase 2 Server Actions
 
-Phase 2 uses Server Actions (not HTTP route handlers) for profile mutations. They live in `apps/web/src/lib/profile-actions.ts` and are invoked from the multi-step onboarding form and the profile edit form.
+Phase 2 uses Server Actions (not HTTP route handlers) for profile
+mutations. They live in `apps/web/src/lib/profile-actions.ts` and are
+invoked from the multi-step onboarding form and the profile edit form.
 
 | Action | Purpose | Identity source |
 | --- | --- | --- |
 | `submitOnboarding(prev, FormData)` | Upsert the current user's `Profile`, set `onboardingCompleted: true`, redirect to `/dashboard`. | `getSession()` → `session.user.id`, `session.user.email` |
 | `submitProfileUpdate(prev, FormData)` | Update the current user's `fullName` / `identificationCode` / `phone`. | `getSession()` → `session.user.id` |
 
-Both actions validate form input with Zod, derive identity from the Better Auth session (never from the form body), map MongoDB duplicate-key errors to safe user-facing `ProfileError` instances, and revalidate the dashboard / profile pages on success.
+Both actions validate form input with Zod, derive identity from the
+Better Auth session (never from the form body), map MongoDB duplicate-key
+errors to safe user-facing `ProfileError` instances, and revalidate the
+dashboard / profile pages on success.
 
-There is no `/api/profile` HTTP endpoint in Phase 2 — the only mutating API is the Server Action. There is no public lookup endpoint for arbitrary profiles.
+There is no `/api/profile` HTTP endpoint in Phase 2 — the only mutating
+API is the Server Action. There is no public lookup endpoint for
+arbitrary profiles.
 
 ### Action result shape
 
@@ -75,7 +99,10 @@ type ActionResult =
   | { ok: false; error: { code: string; message: string; fieldErrors?: Record<string, string[] | undefined> } };
 ```
 
-Stable error codes include: `UNAUTHENTICATED`, `INVALID_PROFILE_DATA`, `IDENTIFICATION_CODE_TAKEN`, `PROFILE_NOT_FOUND`, `UNKNOWN_ERROR`. MongoDB internals (stack traces, connection strings, the `11000` code) are never returned to the client.
+Stable error codes include: `UNAUTHENTICATED`, `INVALID_PROFILE_DATA`,
+`IDENTIFICATION_CODE_TAKEN`, `PROFILE_NOT_FOUND`, `UNKNOWN_ERROR`.
+MongoDB internals (stack traces, connection strings, the `11000` code) are
+never returned to the client.
 
 ## Page routes (Phase 2)
 
@@ -91,43 +118,107 @@ Stable error codes include: `UNAUTHENTICATED`, `INVALID_PROFILE_DATA`, `IDENTIFI
 
 Base URL: `${FACE_SERVICE_URL}`
 
-Authentication: `X-Service-Token: ${FACE_SERVICE_SECRET}` on every request except `/health`.
+Authentication: `X-Service-Token: ${FACE_SERVICE_SECRET}` on every request
+**except `GET /health`**.
 
-| Endpoint | Method | Purpose | Phase |
-| --- | --- | --- | --- |
-| `/health` | GET | Liveness, reports current engine and provider. | 0 |
-| `/v1/recognize` | POST | Detect + embed + match against provided candidate index. | 3, 7 |
-| `/v1/enroll` | POST | Validate enrollment frame (single high-quality face). | 4 |
-| `/v1/index/build` | POST | Build a normalized candidate matrix from embeddings. | 7 |
+| Endpoint | Method | Auth | Purpose | Phase |
+| --- | --- | --- | --- | --- |
+| `/health` | GET | public | Liveness + readiness (engine state, model, provider, embedding dimension). | **3** |
+| `/v1/faces/analyze` | POST | service token | Detect 0 / 1 / many faces + quality metadata. **No embeddings returned.** | **3** |
+| `/v1/faces/compare` | POST | service token | 1:1 verification between two single-face images (internal / Phase 4). | **3** |
+| `/v1/recognize` | POST | service token | Detect + embed + match against provided candidate index. | 7 |
+| `/v1/enroll` | POST | service token | Validate enrollment frame (single high-quality face). | 4 |
+| `/v1/index/build` | POST | service token | Build a normalized candidate matrix from embeddings. | 7 |
+| `/docs` | GET | public | OpenAPI Swagger UI. | **3** |
 
-### `/v1/recognize` response shape (target)
+### `GET /health`
+
+Returns:
 
 ```json
 {
-  "faces": [
-    {
-      "bbox": [x, y, w, h],
-      "candidateId": "65f...",
-      "similarity": 0.91,
-      "status": "candidate"
-    },
-    {
-      "bbox": [x, y, w, h],
-      "candidateId": null,
-      "similarity": 0.51,
-      "status": "unknown"
-    }
-  ],
-  "engine": "insightface:buffalo_l",
-  "provider": "cpu"
+  "status": "ok",
+  "engine": "insightface",
+  "model": "buffalo_l",
+  "provider": "CPUExecutionProvider",
+  "ready": true,
+  "embedding_dimension": 512
 }
 ```
 
-`status` is one of `candidate` (above threshold), `low_quality` (frame rejected), or `unknown` (below threshold). The threshold is per-session and lives in `attendance_sessions.recognitionSettings.threshold`.
+`status` is `"ok"` only when the model is loaded; otherwise
+`"degraded"` with `ready=false`. When `MODEL_LOAD_FAILED` occurs the
+response also carries `error_code` + `error_message`.
+
+### `POST /v1/faces/analyze`
+
+Request: `multipart/form-data` with a single `file` field
+(JPEG / PNG / WebP / BMP).
+
+Response:
+
+```json
+{
+  "image": { "width": 1280, "height": 720 },
+  "face_count": 2,
+  "faces": [
+    {
+      "face_index": 0,
+      "bbox": { "x": 312.5, "y": 145.0, "width": 168.0, "height": 168.0 },
+      "detection_score": 0.96,
+      "landmarks": [
+        { "x": 354.0, "y": 191.0 }, { "x": 437.0, "y": 191.0 },
+        { "x": 396.0, "y": 230.0 }, { "x": 354.0, "y": 269.0 },
+        { "x": 437.0, "y": 269.0 }
+      ],
+      "quality": {
+        "detection_score": 0.96,
+        "face_width": 168.0,
+        "face_height": 168.0,
+        "relative_face_area": 0.0306,
+        "blur_score": 142.7,
+        "brightness": 0.58,
+        "near_edge": false
+      }
+    }
+  ],
+  "processing_ms": 87.4
+}
+```
+
+Faces are ordered **left-to-right** by bbox centre X with a stable
+tie-break. The response **never** includes raw embeddings.
+
+### `POST /v1/faces/compare`
+
+Request: `multipart/form-data` with two image fields
+(`image_a`, `image_b`). Each must contain exactly one face.
+
+Response:
+
+```json
+{
+  "similarity": 0.83,
+  "threshold": 0.4,
+  "match": true,
+  "processing_ms": 165.1
+}
+```
+
+The threshold is the configured `FACE_MATCH_THRESHOLD` —
+**DEVELOPMENT BASELINE ONLY**. Re-calibrate with representative
+evaluation data before any production deployment.
+
+Domain errors:
+
+- `NO_FACE` — 422, when either image contains 0 faces.
+- `MULTIPLE_FACES` — 422, when either image contains > 1 face.
 
 ## Camera transport (future)
 
-- The browser samples the local `MediaStream` at a configurable rate (target 2–5 fps).
-- Each sampled frame is resized, JPEG-encoded, sent as `multipart/form-data` `file=@frame.jpg`.
+- The browser samples the local `MediaStream` at a configurable rate
+  (target 2–5 fps).
+- Each sampled frame is resized, JPEG-encoded, sent as
+  `multipart/form-data` `file=@frame.jpg`.
 - Base64 image transport is avoided unless technically required.
 - No video streaming.

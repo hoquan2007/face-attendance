@@ -1,1 +1,1 @@
-"""Core configuration and cross-cutting concerns."""
+"""Marker for the core package."""

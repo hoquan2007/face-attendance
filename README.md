@@ -12,11 +12,11 @@ The web app never performs facial recognition locally — it sends sampled JPEG 
 
 ## Status
 
-This is **Phase 2**: Better Auth + Google OAuth + MongoDB session, plus the application `profiles` collection. New users complete a role-aware onboarding flow (`/onboarding`) before they can reach the dashboard. Returning users with completed profiles skip onboarding and land directly on `/dashboard`. Face enrollment, classes, and attendance are not implemented yet.
+This is **Phase 3**: Better Auth + Google OAuth + MongoDB session, the application `profiles` collection, and a working **InsightFace Face Service** (FastAPI + ONNX Runtime, CPU-only). New users complete a role-aware onboarding flow (`/onboarding`) before they can reach the dashboard. Returning users with completed profiles skip onboarding and land directly on `/dashboard`. Face enrollment, classes, and attendance are not implemented yet.
 
-See `docs/architecture.md` for the full phase plan.
+See [`docs/architecture.md`](docs/architecture.md) for the full phase plan.
 
-See `docs/deployment-vercel.md` for the Vercel deployment procedure.
+See [`docs/deployment-vercel.md`](docs/deployment-vercel.md) for the Vercel deployment procedure (web app only — the Face Service is local).
 
 ## Prerequisites
 
@@ -50,8 +50,8 @@ Required variables for Phase 1 (all server-side, **never** committed):
 | `GOOGLE_CLIENT_ID` | Google OAuth client ID. |
 | `GOOGLE_CLIENT_SECRET` | Google OAuth client secret. |
 | `NEXT_PUBLIC_APP_URL` | Browser-exposed public origin. Must match `BETTER_AUTH_URL` in dev. |
-| `FACE_SERVICE_SECRET` | Server-to-server token (optional in Phase 1, required in Phase 3+). |
-| `FACE_SERVICE_URL` | Face Service endpoint (optional in Phase 1, required in Phase 3+). |
+| `FACE_SERVICE_SECRET` | Server-to-server token (required from Phase 3). |
+| `FACE_SERVICE_URL` | Face Service endpoint (required from Phase 3). |
 
 ### 3. Run the web app
 
@@ -79,13 +79,16 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8001
 ```
 
-Then `GET http://127.0.0.1:8001/health` should return `{ "status": "ok", "engine": "stub" }`.
+Then `GET http://127.0.0.1:8001/health` should return `{ "status": "ok", "engine": "insightface", "model": "buffalo_l", "provider": "CPUExecutionProvider", "ready": true, "embedding_dimension": 512 }`. The first call downloads the `buffalo_l` model pack (~326 MB) into `~/.insightface/` — never into the repository.
 
 Run tests:
 
 ```powershell
-pytest -q
+pytest -q                 # unit tests (no real model)
+pytest -q -m integration  # real-model lifecycle tests
 ```
+
+See [`services/face-service/README.md`](services/face-service/README.md) for the full Face Service reference (configuration, API, benchmark, evaluation tools, licensing notice).
 
 ## Documentation
 

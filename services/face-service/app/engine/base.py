@@ -5,54 +5,25 @@ The rest of the Face Service (and the web app, indirectly) depends on this
 abstraction — NOT on InsightFace — so the model can be swapped without
 rewriting callers.
 
-PHASE 0: stub only. Every method raises NotImplementedError so the skeleton
-can boot without a model. Phase 3 plugs in `InsightFaceEngine`.
+All application-owned types are canonical in :mod:`app.engine.types`. This
+module re-exports them and additionally defines the :class:`FaceEngine`
+Protocol.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Iterable, Protocol, Sequence, runtime_checkable
 
-
-@dataclass(frozen=True)
-class BoundingBox:
-    """Axis-aligned face bounding box in pixel coordinates."""
-
-    x: float
-    y: float
-    width: float
-    height: float
-
-    def as_list(self) -> list[float]:
-        return [self.x, self.y, self.width, self.height]
-
-
-@dataclass(frozen=True)
-class DetectedFace:
-    bbox: BoundingBox
-    detection_score: float
-
-
-@dataclass(frozen=True)
-class FaceEmbedding:
-    """A normalized face embedding (unit-norm float vector)."""
-
-    vector: list[float]
-
-
-@dataclass(frozen=True)
-class Candidate:
-    user_id: str
-    embedding: list[float]
-
-
-@dataclass(frozen=True)
-class RecognitionResult:
-    bbox: BoundingBox
-    candidate_id: str | None
-    similarity: float
-    status: str  # "candidate" | "low_quality" | "unknown"
+from app.engine.types import (
+    BoundingBox,
+    Candidate,
+    DecodedImage,
+    DetectedFace,
+    EngineMetadata,
+    EngineStatus,
+    FaceEmbedding,
+    RecognitionResult,
+)
 
 
 @runtime_checkable
@@ -63,56 +34,40 @@ class FaceEngine(Protocol):
     model: str | None
     provider: str | None
 
-    def detect_faces(self, image: bytes) -> list[DetectedFace]:
-        """Detect faces in a JPEG/PNG image and return bounding boxes."""
-        ...
-
+    # --- Phase 0 surface ---
+    def detect_faces(self, image: bytes) -> list[DetectedFace]: ...
     def extract_embeddings(
         self, image: bytes, faces: Sequence[DetectedFace]
-    ) -> list[FaceEmbedding]:
-        """For each detected face, return a normalized embedding."""
-        ...
+    ) -> list[FaceEmbedding]: ...
+    def build_index(self, candidates: Iterable[Candidate]) -> object: ...
+    def recognize_faces(self, image: bytes, index: object) -> list[RecognitionResult]: ...
 
-    def build_index(self, candidates: Iterable[Candidate]) -> object:
-        """Prepare an in-memory recognition index from candidate embeddings.
-
-        Returns an opaque index object that `recognize_faces` can consume.
-        """
-        ...
-
-    def recognize_faces(
-        self, image: bytes, index: object
-    ) -> list[RecognitionResult]:
-        """Detect + embed + match. Returns one result per detected face."""
-        ...
+    # --- Phase 3 additions ---
+    def load(self) -> None: ...
+    def status(self) -> EngineStatus: ...
+    def metadata(self) -> EngineMetadata: ...
+    def analyze(self, image: bytes) -> list[DetectedFace]: ...
 
 
-class StubFaceEngine:
-    """Phase 0 placeholder. All operations raise NotImplementedError."""
+# Re-export everything for the public API surface.
+# Re-export engine factory helpers (used by routes and tests).
+from app.engine.runtime import get_active_engine, set_active_engine
 
-    name = "stub"
-    model = None
-    provider = None
+from app.engine.runtime import get_active_engine, set_active_engine
 
-    def detect_faces(self, image: bytes) -> list[DetectedFace]:
-        raise NotImplementedError("StubFaceEngine: InsightFace implementation arrives in Phase 3.")
+get_engine = get_active_engine
+set_engine = set_active_engine
 
-    def extract_embeddings(
-        self, image: bytes, faces: Sequence[DetectedFace]
-    ) -> list[FaceEmbedding]:
-        raise NotImplementedError("StubFaceEngine: InsightFace implementation arrives in Phase 3.")
-
-    def build_index(self, candidates: Iterable[Candidate]) -> object:
-        raise NotImplementedError("StubFaceEngine: InsightFace implementation arrives in Phase 3.")
-
-    def recognize_faces(self, image: bytes, index: object) -> list[RecognitionResult]:
-        raise NotImplementedError("StubFaceEngine: InsightFace implementation arrives in Phase 3.")
-
-
-def get_engine() -> FaceEngine:
-    """Return the active FaceEngine implementation.
-
-    PHASE 0: always returns the stub. Phase 3 will select the real engine
-    based on settings (and warm it up once at process start).
-    """
-    return StubFaceEngine()
+__all__ = [
+    "FaceEngine",
+    "BoundingBox",
+    "DetectedFace",
+    "FaceEmbedding",
+    "Candidate",
+    "RecognitionResult",
+    "DecodedImage",
+    "EngineMetadata",
+    "EngineStatus",
+    "get_engine",
+    "set_engine",
+]
