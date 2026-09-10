@@ -26,6 +26,9 @@
    protect against photo spoof, screen replay, or printed face attacks.
    Anti-spoof / liveness detection will arrive in a dedicated later phase
    (Phase 9).
+7. **Biometric encryption.** From PHASE 4.1, face embeddings are
+   encrypted with AES-256-GCM before storage. The encryption key is
+   independent from authentication secrets.
 
 ## Phase 2 identity vs business data
 
@@ -83,6 +86,58 @@ The application does **not** store:
 - sensitive demographic information
 - raw face photos, embeddings, or any biometric data
 
+## Phase 4+ biometric encryption
+
+**Face embeddings will use application-level AES-256-GCM encryption before
+persistent storage.** This is implemented in PHASE 4.1 as a dedicated
+encryption foundation module.
+
+### Dedicated encryption key
+
+Biometric data is protected with a dedicated key:
+
+- `BIOMETRIC_ENCRYPTION_KEY` — independent from authentication and
+  service secrets
+- Must be exactly 32 random bytes, base64-encoded
+- Generate locally with: `openssl rand -base64 32`
+- Do NOT reuse `BETTER_AUTH_SECRET`, `FACE_SERVICE_SECRET`,
+  `GOOGLE_CLIENT_SECRET`, or any other secret
+
+### Encryption details
+
+| Property | Value |
+| --- | --- |
+| Algorithm | AES-256-GCM |
+| Key size | 256 bits (32 bytes) |
+| Key encoding | base64 |
+| IV | Fresh random per encryption (96 bits / 12 bytes) |
+| Auth tag | 128 bits / 16 bytes (GCM built-in) |
+| AAD | Context binding (userId, modelIdentity, templateVersion, vectorType) |
+| Key version | `1` (for future rotation support) |
+
+### Authenticated encryption
+
+- AES-256-GCM provides authenticated encryption (AEAD)
+- Every encryption operation generates a fresh IV
+- IV is never derived from userId or any other predictable value
+- Authenticated Associated Data (AAD) binds ciphertext to a specific
+  context (user, model, template version)
+- Decryption requires the same AAD — tampering causes authentication
+  failure
+
+### Key rotation readiness
+
+- `keyVersion: 1` is included in all encrypted output
+- The module infrastructure supports future key rotation
+- Actual key rotation is not implemented in PHASE 4.1
+
+### Vector serialization
+
+- Face embeddings are serialized as float32 binary before encryption
+- Float32 precision is sufficient for normalized ArcFace embeddings
+- Binary format is deterministic and compact
+- No JSON serialization for biometric vectors
+
 ## Secrets
 
 - All secrets live in environment variables. `.env.example` exists at the
@@ -108,6 +163,7 @@ The application does **not** store:
 | `NEXT_PUBLIC_APP_URL` | yes | public |
 | `FACE_SERVICE_SECRET` | **yes from Phase 3** | server |
 | `FACE_SERVICE_URL` | optional (Phase 3+ required) | server |
+| `BIOMETRIC_ENCRYPTION_KEY` | optional (Phase 4.1+); required from Phase 4.2 | server |
 
 ## Face Service authentication (Phase 3)
 

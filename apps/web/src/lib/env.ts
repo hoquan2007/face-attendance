@@ -25,6 +25,7 @@ const parsed = buildEnvSchema().safeParse({
   GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
   FACE_SERVICE_URL: process.env.FACE_SERVICE_URL,
   FACE_SERVICE_SECRET: process.env.FACE_SERVICE_SECRET,
+  BIOMETRIC_ENCRYPTION_KEY: process.env.BIOMETRIC_ENCRYPTION_KEY,
 });
 
 if (!parsed.success) {

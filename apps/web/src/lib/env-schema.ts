@@ -87,4 +87,10 @@ export const buildEnvSchema = () =>
     // Internal Face Service — optional (not required for Phase 1 auth)
     FACE_SERVICE_URL: optionalUrl,
     FACE_SERVICE_SECRET: optionalString,
+
+    // Biometric encryption key — optional now (Phase 4.1 infrastructure only)
+    // Required from Phase 4.2+ when actual biometric enrollment is implemented.
+    // Must be exactly 32 random bytes, base64-encoded.
+    // Generate locally with: openssl rand -base64 32
+    BIOMETRIC_ENCRYPTION_KEY: optionalString,
   });
