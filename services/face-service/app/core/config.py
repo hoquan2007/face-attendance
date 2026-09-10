@@ -97,6 +97,62 @@ class Settings(BaseSettings):
     face_service_host: str = Field(default="127.0.0.1", alias="FACE_SERVICE_HOST")
     face_service_port: int = Field(default=8001, alias="FACE_SERVICE_PORT")
 
+    # --- Enrollment quality policy (PHASE 4.3) ---
+    # These are CONSERVATIVE DEVELOPMENT BASELINES. Real production values
+    # MUST be calibrated against a representative evaluation set before any
+    # production deployment. Values are intentionally stricter than the
+    # informational PHASE 3 quality metrics but permissive enough for normal
+    # indoor webcam captures.
+    face_enrollment_min_detection_score: float = Field(
+        default=0.7,
+        alias="FACE_ENROLLMENT_MIN_DETECTION_SCORE",
+        description=(
+            "Minimum SCRFD detection_score (0..1) required for an enrollment "
+            "sample. DEVELOPMENT BASELINE — calibrate before production."
+        ),
+    )
+    face_enrollment_min_face_area: float = Field(
+        default=0.03,
+        alias="FACE_ENROLLMENT_MIN_FACE_AREA",
+        description=(
+            "Minimum relative face area (face_area / image_area) required. "
+            "DEVELOPMENT BASELINE — calibrate before production."
+        ),
+    )
+    face_enrollment_max_face_area: float = Field(
+        default=0.6,
+        alias="FACE_ENROLLMENT_MAX_FACE_AREA",
+        description=(
+            "Maximum relative face area (face_area / image_area) allowed. "
+            "DEVELOPMENT BASELINE — calibrate before production."
+        ),
+    )
+    face_enrollment_min_blur_score: float = Field(
+        default=80.0,
+        alias="FACE_ENROLLMENT_MIN_BLUR_SCORE",
+        description=(
+            "Minimum variance-of-Laplacian required for a sharp sample. "
+            "Resolution-dependent. DEVELOPMENT BASELINE — calibrate before "
+            "production."
+        ),
+    )
+    face_enrollment_min_brightness: float = Field(
+        default=0.18,
+        alias="FACE_ENROLLMENT_MIN_BRIGHTNESS",
+        description=(
+            "Minimum normalised mean luminance (0..1). DEVELOPMENT BASELINE — "
+            "calibrate before production."
+        ),
+    )
+    face_enrollment_max_brightness: float = Field(
+        default=0.85,
+        alias="FACE_ENROLLMENT_MAX_BRIGHTNESS",
+        description=(
+            "Maximum normalised mean luminance (0..1). DEVELOPMENT BASELINE — "
+            "calibrate before production."
+        ),
+    )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

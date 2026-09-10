@@ -13,14 +13,14 @@ from app.engine.types import (
 from app.main import app
 
 
-def test_root_returns_phase_3_metadata() -> None:
+def test_root_returns_phase_4_3_metadata() -> None:
     client = TestClient(app)
     r = client.get("/")
     assert r.status_code == 200
     body = r.json()
     assert body["service"] == "face-service"
-    assert body["phase"] == "3"
-    assert body["version"] == "0.3.0"
+    assert body["phase"] == "4.3"
+    assert body["version"] == "0.4.0"
 
 
 def test_health_reports_not_ready_when_stub_engine_installed() -> None:

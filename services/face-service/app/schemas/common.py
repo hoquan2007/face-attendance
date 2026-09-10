@@ -23,4 +23,27 @@ class FaceErrorCode(str, Enum):
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
-__all__ = ["FaceErrorCode"]
+class EnrollmentQualityRejection(str, Enum):
+    """Stable rejection codes for the ``POST /v1/faces/enrollment/sample`` endpoint.
+
+    Quality-policy codes are returned in the response body (not as error
+    envelopes) when an upload is structurally valid but the face itself
+    is unsuitable for enrollment. They are intentionally distinct from
+    :class:`FaceErrorCode` because they do not indicate an infrastructure
+    failure — they signal that the user should retake the photo.
+
+    Face-count errors (``NO_FACE`` / ``MULTIPLE_FACES``) live in
+    :class:`FaceErrorCode` and remain infrastructure-level error codes
+    — they are still returned as ``{"error": {"code": ...}}`` envelopes.
+    """
+
+    LOW_DETECTION_CONFIDENCE = "LOW_DETECTION_CONFIDENCE"
+    FACE_TOO_SMALL = "FACE_TOO_SMALL"
+    FACE_TOO_LARGE = "FACE_TOO_LARGE"
+    TOO_BLURRY = "TOO_BLURRY"
+    TOO_DARK = "TOO_DARK"
+    TOO_BRIGHT = "TOO_BRIGHT"
+    FACE_NEAR_EDGE = "FACE_NEAR_EDGE"
+
+
+__all__ = ["FaceErrorCode", "EnrollmentQualityRejection"]

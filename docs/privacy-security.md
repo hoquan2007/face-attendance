@@ -1,14 +1,17 @@
 # Privacy & Security
 
-> Status: **Phase 4.2** — Face Service operational in local
+> Status: **Phase 4.3** — Face Service operational in local
 > development. PHASE 4.1 introduced AES-256-GCM encryption for biometric
 > vectors. PHASE 4.2 introduced the Mongoose persistence foundation for
-> `face_profiles` and `face_enrollment_sessions`. **No biometric data has
-> been persisted to the production database yet** — PHASE 4.2 ships the
-> model, indexes, service layer, and tests only; the enrollment UI,
-> Face Service integration, embedding extraction, quality gate, sample
-> upload, centroid calculation, and finalization arrive in PHASE 4.3+.
-> The privacy posture documented here still applies.
+> `face_profiles` and `face_enrollment_sessions`. **PHASE 4.3 adds the
+> protected Face Service enrollment-sample endpoint
+> (`POST /v1/faces/enrollment/sample`)** — server-to-server only, never
+> called from the browser. **No biometric data has been persisted to
+> the production database yet** — PHASE 4.3 ships the endpoint and
+> quality gate only; the Next.js-side enrollment orchestration
+> (sample upload, session finalisation, centroid calculation, re-
+> enrollment, delete Face ID) arrives in PHASE 4.4+. The privacy
+> posture documented here still applies.
 
 ## Biometric handling principles
 
@@ -252,6 +255,144 @@ PHASE 4.2 deliberately does NOT implement:
 
 Those belong to PHASE 4.3+ and are out of scope for this database-only
 mini-phase.
+
+## Phase 4.3 enrollment sample endpoint
+
+PHASE 4.3 ships **one** new Face Service operation:
+`POST /v1/faces/enrollment/sample`. The endpoint is the first piece of
+the PHASE 4 enrollment pipeline on the server side — a thin wrapper
+around the PHASE 3 detection + embedding primitives plus a new quality
+gate.
+
+### Server-to-server only
+
+The endpoint requires the shared `X-Service-Token` (same mechanism as
+every other `/v1/*` route). It is **internal infrastructure**: only the
+trusted Next.js server (`apps/web`) may call it. The browser must
+**never** call this endpoint directly. The Face Service does **not**
+configure CORS for arbitrary browser origins.
+
+The endpoint is the only place in the Face Service where an embedding
+leaves the process. It is allowed to do so ONLY because the documented
+caller is the Next.js server, which then encrypts the vector with
+AES-256-GCM (PHASE 4.1) before any persistent storage.
+
+### Exactly one face required
+
+The endpoint requires exactly one detected face. Behaviour:
+
+- 0 faces → `422 NO_FACE` (standard PHASE 3 error envelope).
+- 2+ faces → `422 MULTIPLE_FACES` (standard PHASE 3 error envelope).
+
+The endpoint never silently picks a single face out of many — it does
+not choose the largest or the highest-confidence face. The user must
+retake the photo so that exactly one face is in frame.
+
+### Quality gate
+
+The endpoint applies a quality policy on top of the PHASE 3 metrics:
+
+- `detection_score`
+- `face_width` / `face_height` (pixels)
+- `relative_face_area` (face area / image area)
+- `blur_score` (variance of Laplacian — resolution-dependent)
+- `brightness` (normalised mean luminance — exposure only)
+- `near_edge`
+
+A single sample may be rejected for **one or more** reasons; the
+endpoint returns the full list with deterministic ordering. Stable
+codes:
+
+| Code | Meaning |
+| --- | --- |
+| `LOW_DETECTION_CONFIDENCE` | `detection_score` below threshold. |
+| `FACE_TOO_SMALL` | `relative_face_area` below threshold. |
+| `FACE_TOO_LARGE` | `relative_face_area` above threshold. |
+| `TOO_BLURRY` | `blur_score` below threshold. |
+| `TOO_DARK` | normalised brightness below threshold. |
+| `TOO_BRIGHT` | normalised brightness above threshold. |
+| `FACE_NEAR_EDGE` | bbox touches the image border. |
+
+When the gate fails the endpoint still returns `200 OK` with
+`accepted=false` and the rejection list — this is a domain outcome, not
+an infrastructure error. **The embedding is omitted** on rejection.
+
+#### Scale strategy
+
+The policy uses `relative_face_area` for too-small / too-large
+decisions because raw pixel size depends on resolution. The same webcam
+is judged fairly across frame sizes.
+
+#### No demographic rejection
+
+The policy never rejects based on gender, age, skin tone, ethnicity, or
+appearance. Brightness refers to image exposure only.
+
+#### Thresholds
+
+The thresholds live in a single configuration source
+(`services/face-service/app/core/config.py`) and surface in
+`services/face-service/.env.example`. **They are CONSERVATIVE
+DEVELOPMENT BASELINES — NOT production-calibrated.** They MUST be re-
+calibrated against a representative evaluation set before any
+production deployment.
+
+| Variable | Default |
+| --- | --- |
+| `FACE_ENROLLMENT_MIN_DETECTION_SCORE` | `0.7` |
+| `FACE_ENROLLMENT_MIN_FACE_AREA` | `0.03` |
+| `FACE_ENROLLMENT_MAX_FACE_AREA` | `0.6` |
+| `FACE_ENROLLMENT_MIN_BLUR_SCORE` | `80.0` |
+| `FACE_ENROLLMENT_MIN_BRIGHTNESS` | `0.18` |
+| `FACE_ENROLLMENT_MAX_BRIGHTNESS` | `0.85` |
+
+### Liveness
+
+**Liveness / anti-spoofing is NOT implemented in PHASE 4.3.** The
+endpoint accepts any single face that passes the quality gate, including
+printed photos, screen replays, and recorded video. Anti-spoof arrives
+in a later release (Phase 9 in the architecture plan).
+
+### No persistence
+
+The Face Service remains **stateless**. It does NOT persist:
+
+- raw image bytes
+- face crops
+- embeddings
+- quality results
+
+Everything lives in the request lifecycle. There is no MongoDB, no
+SQLite, no JSON file, no `.npy`, no pickle.
+
+### Logging hygiene
+
+PHASE 4.3 safe log fields for the enrollment endpoint:
+
+- `accepted` (bool)
+- `face_count` (always 1 — face count errors use the standard envelope)
+- `rejection_count` (number of stable codes)
+- `processing_ms`
+
+The Face Service **never logs**:
+
+- raw image bytes
+- base64 frames
+- face crops
+- the embedding vector
+- the `X-Service-Token` header
+
+### Browser exposure
+
+The endpoint is the only place in the Face Service that returns an
+embedding. The existing endpoints remain unchanged:
+
+- `POST /v1/faces/analyze` — never returns embeddings.
+- `POST /v1/faces/compare` — returns similarity + threshold + match
+  flag only.
+
+These invariants are guarded by unit tests (`/v1/faces/analyze` still
+never contains the string `embedding` in its JSON body).
 
 ## Secrets
 

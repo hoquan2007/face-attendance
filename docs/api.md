@@ -1,8 +1,12 @@
 # API
 
-> Status: **Phase 3** — Face Service operational in local development.
-> `apps/web` still uses Phase 2 Server Actions for profile mutations; no
-> HTTP recognition endpoints are wired into the web app yet (PHASE 4).
+> Status: **Phase 4.3** — Face Service operational in local development.
+> Phase 3 shipped detection + 1:1 comparison + quality metadata. Phase
+> 4.3 adds the **protected enrollment sample endpoint** (server-to-server
+> only). `apps/web` still uses Phase 2 Server Actions for profile
+> mutations; no HTTP recognition endpoints are wired into the web app
+> yet. PHASE 4.4 (Next.js-side enrollment orchestration) is **NOT**
+> implemented yet — that arrives in a later phase.
 
 All endpoints are JSON unless stated otherwise. The web app and the Face
 Service have separate base URLs and separate authentication mechanisms.
@@ -126,6 +130,7 @@ Authentication: `X-Service-Token: ${FACE_SERVICE_SECRET}` on every request
 | `/health` | GET | public | Liveness + readiness (engine state, model, provider, embedding dimension). | **3** |
 | `/v1/faces/analyze` | POST | service token | Detect 0 / 1 / many faces + quality metadata. **No embeddings returned.** | **3** |
 | `/v1/faces/compare` | POST | service token | 1:1 verification between two single-face images (internal / Phase 4). | **3** |
+| `/v1/faces/enrollment/sample` | POST | service token | Validate one enrollment sample (exactly one face + quality gate). Returns the L2-normalised embedding only on accept. **Server-to-server only.** | **4.3** |
 | `/v1/recognize` | POST | service token | Detect + embed + match against provided candidate index. | 7 |
 | `/v1/enroll` | POST | service token | Validate enrollment frame (single high-quality face). | 4 |
 | `/v1/index/build` | POST | service token | Build a normalized candidate matrix from embeddings. | 7 |
@@ -213,6 +218,117 @@ Domain errors:
 
 - `NO_FACE` — 422, when either image contains 0 faces.
 - `MULTIPLE_FACES` — 422, when either image contains > 1 face.
+
+### `POST /v1/faces/enrollment/sample`
+
+**Server-to-server only.** The browser must never call this endpoint
+directly — it returns the L2-normalised embedding, a piece of biometric
+data the Face Service otherwise never exposes. CORS is intentionally
+not configured for arbitrary browser origins. Only the trusted Next.js
+server (`apps/web`) is allowed to call this endpoint via the shared
+`X-Service-Token`.
+
+> Phase 4.3 ships this single sample endpoint only. Multi-sample
+> finalisation, centroid calculation, re-enrollment, and the
+> `EnrollmentSession` orchestration live in **PHASE 4.4** (not yet
+> implemented).
+
+Request: `multipart/form-data` with a single `image` field
+(JPEG / PNG / WebP / BMP). Reuses the existing PHASE 3 image-decoding
+pipeline and upload limits (`FACE_MAX_UPLOAD_MB`, `FACE_MAX_IMAGE_WIDTH`,
+`FACE_MAX_IMAGE_HEIGHT`).
+
+Behaviour:
+
+- 0 faces → `422 NO_FACE` (stable PHASE 3 error envelope).
+- 2+ faces → `422 MULTIPLE_FACES` (stable PHASE 3 error envelope).
+- Exactly 1 face, quality gate passes → `200 OK` with `accepted=true`
+  and the L2-normalised embedding + engine metadata.
+- Exactly 1 face, quality gate fails → `200 OK` with `accepted=false`,
+  a list of rejection codes, **no embedding**, **no model metadata**.
+
+The endpoint never returns:
+
+- the raw uploaded image,
+- a face crop or aligned chip,
+- filesystem paths,
+- the `X-Service-Token` value.
+
+Accepted response shape:
+
+```json
+{
+  "accepted": true,
+  "quality": {
+    "detection_score": 0.95,
+    "face_width": 120.0,
+    "face_height": 120.0,
+    "relative_face_area": 0.06,
+    "blur_score": 400.0,
+    "brightness": 0.5,
+    "near_edge": false
+  },
+  "embedding": [/* 512 floats, L2-normalised, in order */],
+  "rejection_reasons": [],
+  "model": {
+    "identity": "insightface-buffalo-l",
+    "name": "buffalo_l",
+    "embedding_dimension": 512,
+    "normalization": "l2"
+  },
+  "processing_ms": 165.1
+}
+```
+
+Rejected (single-face, poor quality) response shape:
+
+```json
+{
+  "accepted": false,
+  "quality": { "...": "..." },
+  "embedding": null,
+  "rejection_reasons": ["TOO_BLURRY"],
+  "model": null,
+  "processing_ms": 80.2
+}
+```
+
+Stable quality rejection codes:
+
+| Code | Meaning |
+| --- | --- |
+| `LOW_DETECTION_CONFIDENCE` | `detection_score` below threshold. |
+| `FACE_TOO_SMALL` | `relative_face_area` below threshold. |
+| `FACE_TOO_LARGE` | `relative_face_area` above threshold. |
+| `TOO_BLURRY` | `blur_score` (variance of Laplacian) below threshold. |
+| `TOO_DARK` | normalised brightness below threshold. |
+| `TOO_BRIGHT` | normalised brightness above threshold. |
+| `FACE_NEAR_EDGE` | bbox touches the image border. |
+
+A sample may carry more than one rejection reason. The order is
+deterministic (see `app/engine/enrollment_quality.py`).
+
+#### Development thresholds — NOT PRODUCTION-CALIBRATED
+
+All thresholds live in a single configuration source
+(`services/face-service/app/core/config.py`):
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `FACE_ENROLLMENT_MIN_DETECTION_SCORE` | `0.7` | Minimum SCRFD detection score. |
+| `FACE_ENROLLMENT_MIN_FACE_AREA` | `0.03` | Minimum face / image area ratio. |
+| `FACE_ENROLLMENT_MAX_FACE_AREA` | `0.6` | Maximum face / image area ratio. |
+| `FACE_ENROLLMENT_MIN_BLUR_SCORE` | `80.0` | Minimum variance-of-Laplacian. |
+| `FACE_ENROLLMENT_MIN_BRIGHTNESS` | `0.18` | Minimum normalised luminance. |
+| `FACE_ENROLLMENT_MAX_BRIGHTNESS` | `0.85` | Maximum normalised luminance. |
+
+**These baselines are not production-calibrated.** Re-calibrate against a
+representative evaluation set before any production deployment.
+
+Scale strategy: the policy uses `relative_face_area` (face_area /
+image_area) for too-small / too-large decisions because raw pixel size
+depends on resolution. Brightness refers to image exposure only — the
+policy never rejects based on skin tone, ethnicity, age, or gender.
 
 ## Camera transport (future)
 

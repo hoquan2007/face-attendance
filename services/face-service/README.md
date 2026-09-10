@@ -1,7 +1,9 @@
 # Face Service
 
 FastAPI + InsightFace service that owns all facial-recognition logic for the
-Face Attendance System. **Phase 3** ships the engine foundation:
+Face Attendance System. **Phase 4.3** adds the protected enrollment-sample
+endpoint (`POST /v1/faces/enrollment/sample`); Phase 3 remains the engine
+foundation:
 
 - One-time InsightFace model load at FastAPI startup.
 - Detection of 0 / 1 / many faces in an uploaded image.
@@ -10,6 +12,13 @@ Face Attendance System. **Phase 3** ships the engine foundation:
 - Deterministic cosine similarity matcher + configurable threshold.
 - Versioned, server-to-server authenticated endpoints (`/v1/faces/*`).
 - Local CPU benchmark and offline threshold-evaluation tools.
+
+**PHASE 4.3** ships the enrollment sample endpoint. The endpoint accepts
+**exactly one** face, applies a development-baseline quality gate, and
+returns the L2-normalised embedding only on accept. It is
+**server-to-server only** — the browser must never call it directly.
+Multi-sample finalisation, centroid calculation, re-enrollment, and
+the Next.js-side orchestration arrive in PHASE 4.4+.
 
 PHASE 3 explicitly does **not** enroll users, persist embeddings, or run
 face identification against a class gallery. Those arrive in later phases.
@@ -89,6 +98,12 @@ Key variables:
 | `FACE_DET_SIZE` | `auto` | InsightFace 1.0 default — joint 128 + 640 NMS. |
 | `FACE_MAX_UPLOAD_MB` | `8` | Reject larger uploads as `IMAGE_TOO_LARGE`. |
 | `FACE_MAX_IMAGE_WIDTH` / `FACE_MAX_IMAGE_HEIGHT` | `4096` | Reject larger dimensions as `IMAGE_TOO_LARGE`. |
+| `FACE_ENROLLMENT_MIN_DETECTION_SCORE` | `0.7` | Phase 4.3 — **development baseline**, re-calibrate. |
+| `FACE_ENROLLMENT_MIN_FACE_AREA` | `0.03` | Phase 4.3 — **development baseline**, re-calibrate. |
+| `FACE_ENROLLMENT_MAX_FACE_AREA` | `0.6` | Phase 4.3 — **development baseline**, re-calibrate. |
+| `FACE_ENROLLMENT_MIN_BLUR_SCORE` | `80.0` | Phase 4.3 — **development baseline**, re-calibrate. |
+| `FACE_ENROLLMENT_MIN_BRIGHTNESS` | `0.18` | Phase 4.3 — **development baseline**, re-calibrate. |
+| `FACE_ENROLLMENT_MAX_BRIGHTNESS` | `0.85` | Phase 4.3 — **development baseline**, re-calibrate. |
 | `FACE_SERVICE_HOST` / `FACE_SERVICE_PORT` | `127.0.0.1` / `8001` | Bind config. |
 
 ## Run
@@ -125,6 +140,13 @@ curl -X POST http://127.0.0.1:8001/v1/faces/compare \
   -H "X-Service-Token: $TOKEN" \
   -F "image_a=@benchmarks/fixtures-local/pairs/p1_a.jpg" \
   -F "image_b=@benchmarks/fixtures-local/pairs/p1_b.jpg"
+
+# Validate one enrollment sample — server-to-server only. Exactly one
+# face required. Returns the L2-normalised embedding only when the
+# quality gate passes.
+curl -X POST http://127.0.0.1:8001/v1/faces/enrollment/sample \
+  -H "X-Service-Token: $TOKEN" \
+  -F "image=@benchmarks/fixtures-local/person-a/a1.jpg"
 ```
 
 Stable error codes:
@@ -133,12 +155,29 @@ Stable error codes:
 | --- | --- | --- |
 | `INVALID_IMAGE` | 400 | Payload did not decode as JPEG / PNG / WebP / BMP. |
 | `IMAGE_TOO_LARGE` | 413 | Exceeded upload size or dimension limit. |
-| `NO_FACE` | 422 | `/compare` image contained 0 faces. |
-| `MULTIPLE_FACES` | 422 | `/compare` image contained > 1 faces. |
+| `NO_FACE` | 422 | `/compare` or `/v1/faces/enrollment/sample` image contained 0 faces. |
+| `MULTIPLE_FACES` | 422 | `/compare` or `/v1/faces/enrollment/sample` image contained > 1 faces. |
 | `ENGINE_NOT_READY` | 503 | Model is not yet loaded (or load failed). |
 | `MODEL_LOAD_FAILED` | (reported via `/health`) | InsightFace init failed. |
-| `INVALID_EMBEDDING` | (matcher layer) | Empty / NaN / zero-norm / mismatched-dim. |
+| `INVALID_EMBEDDING` | (matcher / service layer) | Empty / NaN / zero-norm / mismatched-dim. |
 | `FACE_SERVICE_UNAUTHORIZED` | 401 | `X-Service-Token` missing or wrong. |
+
+Phase 4.3 enrollment-sample rejection codes (returned in the response
+body, **not** as an error envelope):
+
+| Code | Meaning |
+| --- | --- |
+| `LOW_DETECTION_CONFIDENCE` | `detection_score` below threshold. |
+| `FACE_TOO_SMALL` | `relative_face_area` below threshold. |
+| `FACE_TOO_LARGE` | `relative_face_area` above threshold. |
+| `TOO_BLURRY` | `blur_score` below threshold. |
+| `TOO_DARK` | normalised brightness below threshold. |
+| `TOO_BRIGHT` | normalised brightness above threshold. |
+| `FACE_NEAR_EDGE` | bbox touches the image border. |
+
+**The thresholds are CONSERVATIVE DEVELOPMENT BASELINES, NOT
+production-calibrated.** They MUST be re-calibrated against a
+representative evaluation set before any production deployment.
 
 ## Tests
 
@@ -195,9 +234,10 @@ services/face-service/
 │   ├── api/
 │   │   ├── health.py                 # GET /health
 │   │   ├── faces.py                  # POST /v1/faces/analyze
-│   │   └── compare.py                # POST /v1/faces/compare
+│   │   ├── compare.py                # POST /v1/faces/compare
+│   │   └── enrollment.py             # POST /v1/faces/enrollment/sample (4.3)
 │   ├── core/
-│   │   ├── config.py                 # Pydantic Settings
+│   │   ├── config.py                 # Pydantic Settings (incl. 4.3 thresholds)
 │   │   ├── lifespan.py               # one-time engine load
 │   │   └── security.py               # X-Service-Token dependency
 │   ├── engine/
@@ -206,13 +246,16 @@ services/face-service/
 │   │   ├── insightface_engine.py     # real engine implementation
 │   │   ├── matcher.py                # cosine similarity + threshold
 │   │   ├── quality.py                # blur, brightness, near-edge
+│   │   ├── enrollment_quality.py     # 4.3 quality policy
 │   │   └── types.py                  # application-owned DTOs
 │   ├── schemas/
-│   │   ├── common.py                 # FaceErrorCode enum
+│   │   ├── common.py                 # FaceErrorCode + EnrollmentQualityRejection
 │   │   ├── face.py                   # analyze response
-│   │   └── compare.py                # compare response
+│   │   ├── compare.py                # compare response
+│   │   └── enrollment.py             # 4.3 enrollment-sample response
 │   ├── services/
-│   │   └── recognition_service.py    # route-layer pipeline
+│   │   ├── recognition_service.py    # route-layer pipeline
+│   │   └── enrollment_sample_service.py  # 4.3 enrollment pipeline
 │   └── utils/
 │       └── image.py                  # in-memory decoder + limits
 ├── benchmarks/
@@ -234,6 +277,9 @@ services/face-service/
 │   ├── test_quality.py
 │   ├── test_security.py
 │   ├── test_settings.py
+│   ├── test_enrollment_quality.py        # 4.3
+│   ├── test_enrollment_sample_service.py # 4.3
+│   ├── test_enrollment_endpoint.py       # 4.3
 │   ├── fakes.py
 │   └── integration/
 │       └── test_engine_lifecycle.py
@@ -243,6 +289,20 @@ services/face-service/
 ├── pyproject.toml
 └── requirements.txt
 ```
+
+## What PHASE 4.3 does NOT do
+
+- Persist embeddings or quality metadata (lives in PHASE 4.4 via the
+  Next.js-side `FaceEnrollmentSession`).
+- Run multiple samples, compute centroids, or finalise enrollment
+  (PHASE 4.4).
+- Re-enroll, replace, or delete an existing Face ID (PHASE 4.4+).
+- Accept camera frames directly from the browser (PHASE 4.4+).
+- Implement liveness / anti-spoofing (PHASE 9).
+- Identify a 1:N candidate gallery (PHASE 7).
+- Modify any of the `apps/web` Phase 1–4.2 features (Better Auth,
+  Google OAuth, profile, onboarding, biometric encryption foundation,
+  `FaceProfile` / `FaceEnrollmentSession` persistence).
 
 ## What PHASE 3 does NOT do
 

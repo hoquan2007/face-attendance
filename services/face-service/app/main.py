@@ -5,6 +5,11 @@ PHASE 3:
 - ``/health`` is unauthenticated.
 - ``/v1/*`` endpoints require the shared service token.
 - No raw InsightFace objects are exposed in any response.
+
+PHASE 4.3:
+- Adds ``POST /v1/faces/enrollment/sample`` — internal enrollment sample
+  endpoint. Returns embeddings only to the trusted Next.js server. Browser
+  must never call this endpoint directly.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api import compare as compare_api
+from app.api import enrollment as enrollment_api
 from app.api import faces as faces_api
 from app.api.health import router as health_router
 from app.core.config import get_settings
@@ -32,11 +38,13 @@ settings = get_settings()
 
 app = FastAPI(
     title="Face Attendance — Face Service",
-    version="0.3.0",
+    version="0.4.0",
     description=(
         "Internal facial-recognition service. Phase 3 ships detection + 1:1 "
-        "comparison + quality metadata. All endpoints except /health require "
-        "the X-Service-Token shared secret. Raw embeddings are never returned."
+        "comparison + quality metadata. Phase 4.3 adds the protected "
+        "enrollment-sample endpoint (server-to-server only — the browser "
+        "must never call it directly). All endpoints except /health "
+        "require the X-Service-Token shared secret."
     ),
     docs_url="/docs",
     redoc_url=None,
@@ -46,6 +54,7 @@ app = FastAPI(
 app.include_router(health_router)
 app.include_router(faces_api.router)
 app.include_router(compare_api.router)
+app.include_router(enrollment_api.router)
 
 
 def _error_payload(code: str, message: str) -> dict[str, dict[str, str]]:
@@ -107,6 +116,6 @@ async def _validation_exception_handler(request: Request, exc: RequestValidation
 def root() -> dict[str, str]:
     return {
         "service": "face-service",
-        "version": "0.3.0",
-        "phase": "3",
+        "version": "0.4.0",
+        "phase": "4.3",
     }
