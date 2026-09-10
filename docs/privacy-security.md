@@ -1,9 +1,14 @@
 # Privacy & Security
 
-> Status: **Phase 3** — Face Service operational in local development. No
-> biometric data has been persisted to the production database yet; PHASE 4
-> will introduce enrollment. The privacy posture documented here still
-> applies.
+> Status: **Phase 4.2** — Face Service operational in local
+> development. PHASE 4.1 introduced AES-256-GCM encryption for biometric
+> vectors. PHASE 4.2 introduced the Mongoose persistence foundation for
+> `face_profiles` and `face_enrollment_sessions`. **No biometric data has
+> been persisted to the production database yet** — PHASE 4.2 ships the
+> model, indexes, service layer, and tests only; the enrollment UI,
+> Face Service integration, embedding extraction, quality gate, sample
+> upload, centroid calculation, and finalization arrive in PHASE 4.3+.
+> The privacy posture documented here still applies.
 
 ## Biometric handling principles
 
@@ -138,6 +143,116 @@ Biometric data is protected with a dedicated key:
 - Binary format is deterministic and compact
 - No JSON serialization for biometric vectors
 
+### Template version vs key version
+
+The biometric database uses two distinct version fields that must not
+be confused:
+
+- `templateVersion` — biometric template structure / format version.
+  Lives on `FaceProfile` and `FaceEnrollmentSession`. A future change to
+  the embedded schema (e.g. new quality fields, new sample ordering)
+  increments this value.
+- `keyVersion` (inside `EncryptedBiometricValue`) — encryption key
+  generation. Lives on every encrypted value. A future key rotation
+  increments this value. Currently always `1`.
+
+The two are independent: rotating the encryption key does not require
+a template migration, and bumping the template version does not require
+re-encrypting old ciphertexts (old documents remain readable with the
+old key).
+
+## Phase 4.2 biometric database schema
+
+PHASE 4.2 introduces two Mongoose collections. Both store ONLY
+encrypted biometric vectors (`ciphertext`, `iv`, `authTag`, `keyVersion`)
+plus aggregated, non-identifying quality metadata.
+
+### `face_profiles`
+
+Permanent active biometric enrollment. **Unique per Better Auth user**
+via a unique index on `userId`.
+
+Stored fields (PHASE 4.2 — persistence foundation only):
+
+- `userId`, `status` (`"active"`), `modelIdentity`, `modelName`,
+  `embeddingDimension`, `normalization` (`"l2"`), `templateVersion`,
+  `requiredSampleCount`, `sampleCount`
+- `samples[]`: each entry carries an encrypted vector (`encryptedVector`),
+  `sampleIndex`, and an optional quality block (`detectionScore`,
+  `blurScore`, `brightness`, `relativeFaceArea`)
+- `centroid`: a single encrypted reference vector
+- `qualitySummary`: aggregated, non-biometric metrics
+  (`meanDetectionScore`, `meanBlurScore`, `meanBrightness`,
+  `minSelfSimilarity`, `meanSelfSimilarity`)
+- `enrolledAt`, `createdAt`, `updatedAt`
+
+The schema does NOT include any field for plaintext embeddings, raw
+images, base64 frames, face crops, landmarks, bounding boxes, image
+hashes, or camera frames.
+
+### `face_enrollment_sessions`
+
+Temporary per-user state used while a user is enrolling. **Unique per
+Better Auth user** via a unique index on `userId`. A TTL index on
+`expiresAt` (with `expireAfterSeconds: 0`) instructs MongoDB to delete
+the document once `expiresAt` is in the past.
+
+Stored fields (PHASE 4.2 — persistence foundation only):
+
+- `userId`, `mode` (`"create"` or `"replace"`), `templateVersion`,
+  `requiredSampleCount`
+- Optional model metadata (`modelIdentity`, `modelName`,
+  `embeddingDimension`, `normalization`) — these fields are absent until
+  the first sample is processed in a future phase
+- `acceptedSamples[]`: each entry carries an encrypted vector
+  (`encryptedVector`), `sampleIndex`, an optional quality block, and
+  `acceptedAt`
+- `expiresAt`, `createdAt`, `updatedAt`
+
+**TTL deletion is asynchronous.** Service code must call
+`isEnrollmentSessionExpired(session)` to detect expiration; relying
+solely on physical deletion would create race conditions.
+
+The schema does NOT include any field for plaintext embeddings, raw
+images, base64 frames, face crops, or camera frames.
+
+### Service layer
+
+PHASE 4.2 ships two server-only service modules:
+
+- `apps/web/src/lib/biometrics/face-profile-service.ts`
+  — `getFaceProfileByUserId`, `hasFaceProfile`, `saveFaceProfile`
+  (upsert keyed on `userId`), `deleteFaceProfileByUserId`.
+- `apps/web/src/lib/biometrics/enrollment-session-service.ts`
+  — `getEnrollmentSessionByUserId`,
+  `createOrResetEnrollmentSession` (upsert keyed on `userId`, clears
+  `acceptedSamples`, refreshes `expiresAt`, resets model metadata to
+  `undefined`), `deleteEnrollmentSessionByUserId`,
+  `isEnrollmentSessionExpired`.
+
+Both services map MongoDB duplicate-key errors to safe
+`BiometricPersistenceError` instances; raw driver errors never escape
+the service layer.
+
+### What is NOT yet implemented
+
+PHASE 4.2 deliberately does NOT implement:
+
+- Camera access (`getUserMedia`) or Face ID UI
+- Next.js API routes or Server Actions
+- Face Service enrollment endpoints
+- InsightFace changes
+- Embedding extraction
+- Quality gate
+- Sample upload
+- Enrollment finalization
+- Centroid calculation
+- Re-enrollment UI
+- Face ID deletion UI
+
+Those belong to PHASE 4.3+ and are out of scope for this database-only
+mini-phase.
+
 ## Secrets
 
 - All secrets live in environment variables. `.env.example` exists at the
@@ -163,7 +278,7 @@ Biometric data is protected with a dedicated key:
 | `NEXT_PUBLIC_APP_URL` | yes | public |
 | `FACE_SERVICE_SECRET` | **yes from Phase 3** | server |
 | `FACE_SERVICE_URL` | optional (Phase 3+ required) | server |
-| `BIOMETRIC_ENCRYPTION_KEY` | optional (Phase 4.1+); required from Phase 4.2 | server |
+| `BIOMETRIC_ENCRYPTION_KEY` | optional (Phase 4.1); required from Phase 4.2 | server |
 
 ## Face Service authentication (Phase 3)
 

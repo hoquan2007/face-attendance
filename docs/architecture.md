@@ -1,9 +1,14 @@
 # Architecture
 
-> Status: **Phase 3** — InsightFace Face Service is operational in local
-> development. `apps/web` remains a separate Next.js application; **the
-> browser never calls the Face Service directly**. Face enrollment,
-> classes, and attendance are not implemented yet.
+> Status: **Phase 4.2** — InsightFace Face Service is operational in
+> local development (Phase 3). PHASE 4.1 introduced AES-256-GCM
+> biometric encryption. PHASE 4.2 introduces the **MongoDB / Mongoose
+> persistence foundation** for face profiles (`face_profiles`) and
+> temporary enrollment sessions (`face_enrollment_sessions`).
+> **PHASE 4.2 is a database-only mini-phase.** It does NOT ship a real
+> enrollment flow yet — camera capture, Face Service calls, embedding
+> extraction, quality gate, sample upload, centroid calculation, and
+> enrollment finalization arrive in PHASE 4.3+.
 
 ## Goals
 
@@ -37,9 +42,10 @@ flowchart LR
   is loaded once at process start and reused for every request.
 - **MongoDB Atlas** stores Better Auth collections (`user`, `session`,
   `account`, `verification`) in the `face_attendance` database. The
-  application owns `profiles` (Phase 2) and will own future business
-  collections (`classrooms`, `class_memberships`, `attendance_sessions`,
-  `attendance_records`, `face_profiles`) in later phases via Mongoose.
+  application owns `profiles` (Phase 2), `face_profiles` and
+  `face_enrollment_sessions` (Phase 4.2) via Mongoose, and will own
+  future business collections (`classrooms`, `class_memberships`,
+  `attendance_sessions`, `attendance_records`) in later phases.
 - **Google** is identity-only — only `sub`, `email`, `name`, `picture` are
   requested via the `openid email profile` scopes.
 
@@ -198,8 +204,10 @@ sequenceDiagram
 | 0.6 | Vercel deployment readiness. |
 | **1** | Better Auth + Google OAuth + MongoDB session. |
 | **2** | Application profile + role + onboarding. |
-| **3** | **FastAPI + InsightFace Face Service — current phase.** |
+| **3** | **FastAPI + InsightFace Face Service.** |
 | 4 | Face enrollment (`/face-enrollment`). |
+| 4.1 | AES-256-GCM biometric encryption foundation. |
+| **4.2** | **FaceProfile + FaceEnrollmentSession Mongoose persistence (database-only).** |
 | 5 | Classroom creation and join-by-code+password. |
 | 6 | Attendance session lifecycle. |
 | 7 | Multi-face recognition + temporal confirmation. |

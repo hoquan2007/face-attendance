@@ -20,7 +20,7 @@ import {
   clearCachedKey,
   type BiometricAAD,
   type EncryptedBiometricValue,
-} from "@/lib biometrics/encryption";
+} from "@/lib/biometrics/encryption";
 
 // =============================================================================
 // Test Fixtures
