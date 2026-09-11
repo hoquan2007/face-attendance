@@ -1,6 +1,6 @@
 # API
 
-> Status: **Phase 4.4C** — PHASE 4.4A shipped the Next.js server-only
+> Status: **Phase 4.6B1B** — PHASE 4.4A shipped the Next.js server-only
 > `FaceServiceClient`. PHASE 4.4B1 shipped the first Next.js Face ID
 > route — `POST /api/face-id/enrollment/start` — which safely starts a
 > temporary enrollment session for the authenticated user.
@@ -12,6 +12,22 @@
 > forwards it to the Face Service, encrypts accepted embeddings,
 > and stores them in the temporary enrollment session.
 > Camera UI, finalization, and re-enrollment belong to later phases.
+> PHASE 4.6B1A extends the existing server-only `FaceServiceClient`
+> with a `finalizeFaceEnrollment(...)` function that calls
+> `POST /v1/faces/enrollment/finalize`. The function is the
+> server-only Next.js client for the protected finalization endpoint;
+> it is server-only, validates the request and the returned centroid,
+> preserves the upstream domain codes, and does NOT read MongoDB,
+> decrypt samples, or persist anything.
+> PHASE 4.6B1B adds the server-only Next.js orchestration function
+> `finalizeEnrollmentSessionForUser(userId)` that loads the
+> temporary enrollment session, decrypts its accepted samples
+> server-side, validates plaintext vectors, calls the B1A client
+> exactly once, and re-checks the enrollment generation after the
+> response. B1B is server-internal only: there is still NO public
+> Next.js finalization API. PHASE 4.6B2 will expose the orchestration
+> through an authenticated route and add the atomic persistence
+> generation compare; until then no finalization is user-accessible.
 
 All endpoints are JSON unless stated otherwise. The web app and the Face
 Service have separate base URLs and separate authentication mechanisms.
@@ -779,6 +795,210 @@ DEVELOPMENT BASELINE ONLY — calibrate before production.
 **Privacy:** Embeddings, centroid values, and request bodies are never
 logged. Safe log fields: `sample_count`, `pair_count`, `consistent`,
 `model_identity`, domain error code.
+
+## Server-only Next.js finalization client (PHASE 4.6B1A)
+
+PHASE 4.6B1A extends the existing PHASE 4.4A server-only
+`FaceServiceClient` with one new function:
+
+```
+finalizeFaceEnrollment(input: FinalizeFaceEnrollmentInput)
+                       -> Promise<FinalizeFaceEnrollmentResult>
+```
+
+It is the Next.js server-only client for the PHASE 4.6A2 endpoint
+`POST /v1/faces/enrollment/finalize`.
+
+### Import
+
+```ts
+import { finalizeFaceEnrollment } from "@/lib/biometrics/face-service-client";
+```
+
+Because the module opens with `import "server-only"`, this import is
+forbidden inside Client Components. Use it from Server Components,
+Server Actions, or Route Handlers.
+
+### Input shape (server-internal)
+
+```ts
+type FinalizeFaceEnrollmentInput = {
+  model: {
+    identity: string;          // e.g. "insightface-buffalo-l"
+    name: string;              // e.g. "buffalo_l"
+    embeddingDimension: number;
+    normalization: "l2";
+  };
+  requiredSampleCount: number; // >= 2
+  embeddings: number[][];      // length === requiredSampleCount
+};
+```
+
+The request never carries `userId`, `email`, `generationId`, or any
+MongoDB identifier.
+
+### Success result shape
+
+```ts
+type FinalizeFaceEnrollmentResult = {
+  consistent: true;
+  sampleCount: number;
+  pairCount: number;
+  minSelfSimilarity: number;
+  meanSelfSimilarity: number;
+  threshold: number;
+  centroid: number[];
+  model: {
+    identity: string;
+    name: string;
+    embeddingDimension: number;
+    normalization: string;
+  };
+};
+```
+
+The HTTP envelope is NOT exposed; the result is a strongly typed
+server-internal object.
+
+### Behaviour
+
+- Sends `Content-Type: application/json`.
+- Sends `X-Service-Token` using the existing auth path.
+- Reuses the existing 10-second timeout.
+- Exactly one POST per invocation. No automatic retry.
+- Validates the request shape server-side BEFORE the HTTP call.
+- Validates the returned centroid: non-empty, finite, dimension
+  matches both request and response model metadata, L2 norm ≈ 1
+  (tolerance 1e-3).
+- Enforces exact response `model` metadata match against request
+  metadata; mismatches fail safely.
+
+### Domain error codes (preserved on `domainError.code`)
+
+| Upstream code | HTTP | Mapped client code |
+| --- | --- | --- |
+| `INCONSISTENT_FACE_SAMPLES` | 422 | `FACE_SERVICE_REJECTED_REQUEST` + centroid never exposed |
+| `MODEL_MISMATCH` | 422 | `FACE_SERVICE_REJECTED_REQUEST` |
+| `INVALID_SAMPLE_COUNT` | 422 | `FACE_SERVICE_REJECTED_REQUEST` |
+| `INVALID_EMBEDDING` | 422 | `FACE_SERVICE_REJECTED_REQUEST` |
+| `EMBEDDING_DIMENSION_MISMATCH` | 422 | `FACE_SERVICE_REJECTED_REQUEST` |
+| `EMBEDDING_NOT_NORMALIZED` | 422 | `FACE_SERVICE_REJECTED_REQUEST` |
+| `INVALID_CENTROID` | 422 | `FACE_SERVICE_REJECTED_REQUEST` |
+
+Transport-level codes are unchanged:
+`FACE_SERVICE_NOT_CONFIGURED`, `FACE_SERVICE_UNAVAILABLE`,
+`FACE_SERVICE_TIMEOUT`, `FACE_SERVICE_UNAUTHORIZED`,
+`FACE_SERVICE_INVALID_RESPONSE`, `FACE_SERVICE_REJECTED_REQUEST`.
+
+### Privacy
+
+The plaintext embeddings and centroid live only in server memory for
+the lifetime of the call. They are never logged, never serialized
+into a safe error message, and never persisted.
+
+### What PHASE 4.6B1A does NOT do
+
+- No MongoDB read / write
+- No AES-GCM decryption
+- No `FaceEnrollmentSession` or `FaceProfile` persistence
+- No temporary-session deletion
+- No finalization API route or Server Action
+- No browser fetch
+- No re-enrollment
+
+## Phase 4.6B1B Next.js finalization orchestration (server-only)
+
+PHASE 4.6B1B adds the first server-only Next.js orchestration layer
+that combines the PHASE 4.5B4.3 enrollment session persistence
+service, the PHASE 4.1 AES-GCM decryption utility, and the PHASE
+4.6B1A `finalizeFaceEnrollment` client. The orchestrator is exposed
+internally as a single function:
+
+```ts
+finalizeEnrollmentSessionForUser(userId: string)
+  -> Promise<EnrollmentFinalizationResult>
+```
+
+Implementation lives at
+`apps/web/src/lib/biometrics/enrollment-finalization-service.ts`.
+The module opens with `import "server-only"`. There is no
+public Next.js route, Server Action, or browser fetch in B1B —
+orchestration exposure is a precondition for PHASE 4.6B3, and
+authentication is documented as a precondition for callers.
+
+### Public Next.js API in PHASE 4.6B1B
+
+- No new public Next.js API.
+- No Next.js Server Action.
+- No browser fetch.
+- No UI / button / `router.refresh`.
+
+### Stable error codes
+
+The orchestrator exposes a focused set of orchestration codes that
+mirror the validation it actually performs:
+
+| Code | Status (when surfaced) | Notes |
+| --- | --- | --- |
+| `ENROLLMENT_SESSION_NOT_FOUND` | 404 | No current session for `userId`. |
+| `ENROLLMENT_SESSION_EXPIRED` | 410 | Session expired — no decrypt, no Face Service call. |
+| `ENROLLMENT_INCOMPLETE` | 409 | `acceptedSamples.length !== requiredSampleCount`. |
+| `ENROLLMENT_SESSION_INVALID` | 422 | Required authoritative metadata missing or malformed. |
+| `UNSUPPORTED_ENROLLMENT_MODE` | 409 | Only `create` is supported in B1B. |
+| `UNSUPPORTED_TEMPLATE_VERSION` | 422 | `templateVersion` not in the supported set. |
+| `ENROLLMENT_SAMPLE_INDEX_INVALID` | 422 | Sample indexes are not exactly `0..N-1`. |
+| `ENROLLMENT_SAMPLE_DECRYPTION_FAILED` | 422 | AES-GCM auth tag failed; the whole batch is aborted. |
+| `ENROLLMENT_SAMPLE_VECTOR_INVALID` | 422 | Decrypted plaintext vector failed dimension / finiteness / L2-norm check. |
+| `ENROLLMENT_GENERATION_CHANGED` | 409 | Post-finalize recheck failed — the centroid is discarded. |
+
+The orchestrator preserves B1A's `FaceServiceClientError` codes
+(`INCONSISTENT_FACE_SAMPLES`, `MODEL_MISMATCH`, `INVALID_SAMPLE_COUNT`,
+`INVALID_EMBEDDING`, `EMBEDDING_DIMENSION_MISMATCH`,
+`EMBEDDING_NOT_NORMALIZED`, `INVALID_CENTROID`) on `domainError.code`
+so a future API layer can distinguish them.
+
+### Result shape (server-only)
+
+```ts
+type EnrollmentFinalizationResult = {
+  sourceGenerationId: string;     // captured before finalize
+  mode: "create";
+  templateVersion: number;
+  requiredSampleCount: number;
+  model: {
+    identity: string;
+    name: string;
+    embeddingDimension: number;
+    normalization: "l2";
+  };
+  finalization: {
+    sampleCount: number;
+    pairCount: number;
+    minSelfSimilarity: number;
+    meanSelfSimilarity: number;
+    threshold: number;
+    centroid: number[];            // SERVER-ONLY; not user-accessible in B1B
+  };
+};
+```
+
+The result intentionally excludes `userId`, encrypted samples,
+plaintext sample embeddings, ciphertext, IV, and authTag. The
+plaintext sample vectors are wiped best-effort after the B1A call
+resolves.
+
+### Privacy
+
+- AES-GCM decryption happens ONLY inside the server-only
+  orchestrator. The browser never sees decrypted embeddings.
+- The AAD is reconstructed from authoritative persisted session
+  metadata and the function argument's `userId`. No browser-supplied
+  metadata participates in AAD reconstruction.
+- Plaintext sample embeddings live only in local server memory for
+  the duration of the call.
+- No FaceProfile is written; no temporary enrollment session is
+  deleted. PHASE 4.6B2 will add the atomic generation compare and
+  the persistence/delete operations.
 
 ## Camera transport (future)
 

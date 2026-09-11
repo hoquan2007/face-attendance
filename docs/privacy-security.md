@@ -1,10 +1,26 @@
 # Privacy & Security
 
-> Status: **Phase 4.6A2** — PHASE 4.6A1 shipped the pure enrollment finalization
+> Status: **Phase 4.6B1B** — PHASE 4.6A1 shipped the pure enrollment finalization
 > math foundation. PHASE 4.6A2 adds the protected internal finalization
 > endpoint (`POST /v1/faces/enrollment/finalize`) that receives
 > already-decrypted, already-L2-normalized embeddings from the trusted
-> Next.js server and returns a consistency result plus a normalized centroid.
+> Next.js server and returns a consistency result plus a normalized
+> centroid. PHASE 4.6B1A extends the existing server-only Next.js
+> `FaceServiceClient` with a `finalizeFaceEnrollment(...)` function that
+> calls the protected finalization endpoint. PHASE 4.6B1B adds the
+> server-only Next.js orchestration service
+> (`finalizeEnrollmentSessionForUser`) that loads the temporary
+> `FaceEnrollmentSession`, decrypts its accepted samples server-side
+> using the existing PHASE 4.1 AES-256-GCM utility, reconstructs the
+> exact AAD from authoritative persisted metadata, validates plaintext
+> vectors, calls the B1A client exactly once, and re-checks the
+> enrollment generation after the Face Service response. PHASE 4.6B1B
+> does NOT persist a `FaceProfile`, does NOT delete the temporary
+> session, and does NOT expose a Next.js route. Plaintext sample
+> embeddings exist only transiently in server memory. The post-finalize
+> generation re-check reduces stale-result risk but PHASE 4.6B2 must
+> still atomically verify `generationId` when persisting/replacing
+> `FaceProfile` and consuming the temporary session.
 
 ## Biometric handling principles
 
@@ -1785,3 +1801,178 @@ any production deployment.
 - Biometric decryption (AES-GCM, `BIOMETRIC_ENCRYPTION_KEY`).
 - Next.js server-side orchestration.
 - Face ID enrollment workflow completion (belongs to PHASE 4.6B).
+
+## Phase 4.6B1A Next.js finalization client (server-only)
+
+PHASE 4.6B1A extends the existing server-only Next.js `FaceServiceClient`
+(`apps/web/src/lib/biometrics/face-service-client.ts`) with a single
+focused function `finalizeFaceEnrollment(...)`. The function is the
+server-only Next.js client for the PHASE 4.6A2 endpoint.
+
+### Server-only and biometric-only in memory
+
+The function lives inside `face-service-client.ts`, which opens with
+`import "server-only"`. Client Components cannot import it. The
+plaintext embeddings and centroid exist only in server memory for
+the lifetime of the call.
+
+### No MongoDB / no decryption
+
+PHASE 4.6B1A deliberately does NOT:
+
+- read MongoDB,
+- decrypt AES-GCM ciphertext,
+- touch `BIOMETRIC_ENCRYPTION_KEY`,
+- create, replace, or delete `FaceEnrollmentSession` or `FaceProfile`,
+- call any enrollment API route or Server Action,
+- expose any biometric payload to the browser.
+
+The function is a thin server-side wrapper around the existing
+PHASE 4.4A `faceServiceRequest` HTTP client. MongoDB-backed
+orchestration, biometric decryption, and `FaceProfile` persistence
+belong to PHASE 4.6B1B.
+
+### Domain error preservation
+
+The upstream domain error codes are preserved verbatim on
+`FaceServiceClientError.domainError.code`:
+
+- `INCONSISTENT_FACE_SAMPLES` — the centroid is NEVER exposed on this
+  path. The function does NOT map this to `FACE_SERVICE_UNAVAILABLE`.
+- `MODEL_MISMATCH`
+- `INVALID_SAMPLE_COUNT`
+- `INVALID_EMBEDDING`
+- `EMBEDDING_DIMENSION_MISMATCH`
+- `EMBEDDING_NOT_NORMALIZED`
+- `INVALID_CENTROID`
+
+Raw response bodies are never exposed in safe error messages.
+
+### Privacy guarantees
+
+- Plaintext embeddings exist only inside the request body sent to
+  the Face Service. They are NOT logged.
+- The returned centroid exists only in the typed
+  `FinalizeFaceEnrollmentResult` until future Next.js orchestration
+  consumes it. It is NOT logged.
+- No persistence: nothing is written to disk, MongoDB, `.npy`,
+  `.npz`, `.pkl`, JSON dump, or any temp file.
+- The Face Service endpoint itself remains the authoritative
+  owner of its privacy posture (PHASE 4.6A2 guarantees); the
+  client does not weaken it.
+
+### What PHASE 4.6B1A does NOT claim
+
+- Web finalization is NOT yet wired end-to-end. The function is a
+  client abstraction only; no Next.js API route, Server Action, or
+  UI calls it in PHASE 4.6B1A.
+- `FaceProfile` persistence is NOT yet implemented.
+- Temporary enrollment sessions are NOT yet finalized or cleaned up.
+
+## Phase 4.6B1B Next.js enrollment finalization orchestration (server-only)
+
+PHASE 4.6B1B adds the first server-only Next.js orchestration that
+combines the PHASE 4.5B4.3 enrollment session persistence service,
+the PHASE 4.1 AES-GCM decryption utility, and the PHASE 4.6B1A
+`finalizeFaceEnrollment` client. The orchestrator lives at
+`apps/web/src/lib/biometrics/enrollment-finalization-service.ts` and
+is opened with `import "server-only"`.
+
+### Server-only data flow
+
+```
+authoritative userId (PHASE 4.6B3 will supply from auth.api.getSession())
+    ↓
+getEnrollmentSessionByUserId(userId)   ← existing PHASE 4.5B4.3 read service
+    ↓
+session preconditions (expiration, generationId, mode, sample count, model metadata)
+    ↓
+AAD reconstruction (PHASE 4.1 fields: userId, modelIdentity, templateVersion, vectorType="sample", sampleIndex)
+    ↓
+decryptBiometricVector(...) for each sample   ← PHASE 4.1 utility
+    ↓
+plaintext validation (dimension, finiteness, |v|≈1, tolerance 1e-3)
+    ↓
+finalizeFaceEnrollment(...)   ← PHASE 4.6B1A client (exactly once)
+    ↓
+re-read session: existence + expiration + generationId match + completeness
+    ↓
+return EnrollmentFinalizationResult (centroid + metrics + sourceGenerationId)
+```
+
+### Plaintext lifetime
+
+- Plaintext sample embeddings exist only in local server memory for
+  the lifetime of the `finalizeEnrollmentSessionForUser` call.
+- After the B1A call resolves, the orchestrator best-effort wipes
+  the per-sample local buffers (the `decryptedVectors[i]` arrays).
+  JavaScript does not guarantee memory zeroization, but this
+  best-effort scrub keeps the residual window small.
+- Plaintext embeddings never enter:
+  - module / global / cache state,
+  - React state, cookies, or browser code,
+  - logs (no `console.log` of plaintext, centroid, ciphertext, IV,
+    authTag, AAD bytes, or full session documents),
+  - MongoDB or the filesystem.
+
+### AAD reconstruction
+
+The orchestrator rebuilds the EXACT AAD bytes used by PHASE 4.4C
+when the sample was first encrypted. No new AAD fields are
+introduced. The fields are:
+
+```
+userId                    ← from the function argument (authoritative)
+modelIdentity             ← session.modelIdentity
+templateVersion           ← session.templateVersion
+vectorType                ← constant "sample"
+sampleIndex               ← persisted sample.sampleIndex
+```
+
+### Session validation
+
+The orchestrator refuses a malformed or expired session, an
+unsupported enrollment mode (currently only `create` is supported;
+`replace` is rejected with `UNSUPPORTED_ENROLLMENT_MODE`), or
+missing authoritative model metadata. It does NOT silently repair
+malformed sessions.
+
+### Generation re-check
+
+`sourceGenerationId = session.generationId` is captured BEFORE the
+Face Service call. AFTER the call the session is re-read through
+the same service. If the generation changed (e.g. another tab
+reset the session), the successful centroid is DISCARDED and a
+stable `ENROLLMENT_GENERATION_CHANGED` error is thrown. No
+persistence happens.
+
+> **PHASE 4.6B2 still requires the atomic CAS.** The B1B recheck
+> is a single-document, non-atomic read. PHASE 4.6B2 MUST still
+> atomically verify `generationId === sourceGenerationId` when
+> persisting the new `FaceProfile` and consuming the temporary
+> session. B1B reduces stale-result risk but does NOT close the
+> persistence race.
+
+### What PHASE 4.6B1B does NOT do (privacy guarantees)
+
+- No `FaceProfile` write
+- No `deleteEnrollmentSessionByUserId` / temporary-session delete
+- No `MONGODB_URI` write / transaction
+- No Next.js API route, Server Action, or browser fetch
+- No UI button / router.refresh
+- No plaintext sample embedding returned to any caller
+- No logging of plaintext, centroid, ciphertext, IV, authTag, AAD,
+  key configuration, or full biometric session documents
+- No filesystem write of biometric data (no `.npy`, `.npz`, `.pkl`,
+  JSON dumps, etc.)
+
+### What PHASE 4.6B1B does NOT claim
+
+- Enrollment finalization is NOT yet user-accessible. There is NO
+  Next.js API, Server Action, or UI for it in PHASE 4.6B1B. The
+  orchestrator function exists as a server-internal entry point for
+  future phases.
+- PHASE 4.6B2 must still perform the atomic generation compare
+  before persisting. B1B alone is not sufficient.
+- Plaintext sample vectors are wiped best-effort; the orchestrator
+  does not claim JavaScript memory zeroization.

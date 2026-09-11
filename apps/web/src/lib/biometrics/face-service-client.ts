@@ -59,10 +59,12 @@ import {
 // Re-export for external consumption
 export {
   FACE_SERVICE_ERROR_CODES,
+  FINALIZATION_ERROR_CODES,
   FaceServiceClientError,
 } from "./face-service-errors";
 export type {
   FaceServiceErrorCode,
+  FinalizationErrorCode,
   FaceServiceErrorShape,
 } from "./face-service-errors";
 
@@ -508,4 +510,370 @@ export async function analyzeEnrollmentSample(
   }
 
   return result;
+}
+
+// =============================================================================
+// Enrollment Finalization (PHASE 4.6B1A)
+// =============================================================================
+
+/**
+ * Tolerance for L2-norm validation of returned centroids.
+ *
+ * Mirrors the existing PHASE 4.6A1 backend tolerance (1e-3) so
+ * that future Next.js orchestration rejects the same vectors the
+ * Face Service would reject. We do NOT silently repair invalid
+ * centroids here.
+ */
+const CENTROID_L2_NORM_TOLERANCE = 1e-3;
+
+/** Runtime model metadata — request-side contract. */
+const FinalizeRequestModelMetadataSchema = z.object({
+  identity: z.string(),
+  name: z.string(),
+  embeddingDimension: z.number().int().positive(),
+  normalization: z.string(),
+});
+
+/** Finalization input — server-internal only. */
+const FinalizeFaceEnrollmentInputSchema = z.object({
+  model: FinalizeRequestModelMetadataSchema,
+  requiredSampleCount: z.number().int().min(2),
+  embeddings: z
+    .array(z.array(z.number()))
+    .min(1, "Embeddings must be non-empty"),
+});
+
+export type FinalizeFaceEnrollmentInput = z.infer<
+  typeof FinalizeFaceEnrollmentInputSchema
+>;
+
+/** Successful response model metadata (runtime engine). */
+const FinalizeResponseModelMetadataSchema = z.object({
+  identity: z.string(),
+  name: z.string(),
+  embedding_dimension: z.number().int().positive(),
+  normalization: z.string(),
+});
+
+/** Successful finalization response schema. */
+const FinalizeFaceEnrollmentResponseSchema = z.object({
+  consistent: z.literal(true),
+  sample_count: z.number().int().nonnegative(),
+  pair_count: z.number().int().nonnegative(),
+  min_self_similarity: z.number(),
+  mean_self_similarity: z.number(),
+  threshold: z.number(),
+  centroid: z.array(z.number()),
+  model: FinalizeResponseModelMetadataSchema,
+});
+
+export type FinalizeFaceEnrollmentResult = {
+  consistent: true;
+  sampleCount: number;
+  pairCount: number;
+  minSelfSimilarity: number;
+  meanSelfSimilarity: number;
+  threshold: number;
+  centroid: number[];
+  model: {
+    identity: string;
+    name: string;
+    embeddingDimension: number;
+    normalization: string;
+  };
+};
+
+/**
+ * Validates a single embedding vector (length only, finiteness only,
+ * and dimension match against the supplied metadata).
+ *
+ * The Face Service remains authoritative for normalization, zero-norm,
+ * and arithmetic validation. We do NOT silently re-normalize here.
+ */
+function validateFinalizationEmbedding(
+  embedding: number[],
+  expectedDimension: number,
+): void {
+  if (!embedding || embedding.length === 0) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: "Finalization embedding is empty.",
+    });
+  }
+
+  if (embedding.length !== expectedDimension) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: `Finalization embedding dimension mismatch: expected ${expectedDimension}, got ${embedding.length}.`,
+    });
+  }
+
+  for (let i = 0; i < embedding.length; i++) {
+    if (!Number.isFinite(embedding[i]!)) {
+      throw new FaceServiceClientError({
+        code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+        message: `Finalization embedding contains non-finite value at index ${i}.`,
+      });
+    }
+  }
+}
+
+/**
+ * Validates the centroid returned by the Face Service before we hand
+ * it to future Next.js orchestration.
+ *
+ * - array is non-empty,
+ * - all values finite,
+ * - dimension equals returned model embedding dimension,
+ * - dimension equals expected request model dimension,
+ * - L2 norm is approximately 1.
+ *
+ * Does NOT silently repair invalid centroids.
+ */
+function validateCentroid(
+  centroid: number[],
+  responseEmbeddingDimension: number,
+  requestEmbeddingDimension: number,
+): void {
+  if (!centroid || centroid.length === 0) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: "Finalization centroid is empty.",
+    });
+  }
+
+  if (centroid.length !== responseEmbeddingDimension) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: `Finalization centroid dimension mismatch with response model: expected ${responseEmbeddingDimension}, got ${centroid.length}.`,
+    });
+  }
+
+  if (centroid.length !== requestEmbeddingDimension) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: `Finalization centroid dimension mismatch with request model: expected ${requestEmbeddingDimension}, got ${centroid.length}.`,
+    });
+  }
+
+  for (let i = 0; i < centroid.length; i++) {
+    if (!Number.isFinite(centroid[i]!)) {
+      throw new FaceServiceClientError({
+        code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+        message: `Finalization centroid contains non-finite value at index ${i}.`,
+      });
+    }
+  }
+
+  let sumSquares = 0;
+  for (let i = 0; i < centroid.length; i++) {
+    sumSquares += centroid[i]! * centroid[i]!;
+  }
+  const norm = Math.sqrt(sumSquares);
+
+  if (!Number.isFinite(norm)) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: "Finalization centroid L2 norm is not finite.",
+    });
+  }
+
+  if (Math.abs(norm - 1) > CENTROID_L2_NORM_TOLERANCE) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: `Finalization centroid is not L2-normalised (|v|=${norm}).`,
+    });
+  }
+}
+
+/**
+ * Finalizes an enrollment batch by sending already-decrypted,
+ * already-L2-normalised embeddings to the trusted Face Service
+ * (`POST /v1/faces/enrollment/finalize`).
+ *
+ * PHASE 4.6B1A — server-only Next.js client. The caller is expected
+ * to be trusted Next.js orchestration code (a Route Handler or
+ * Server Action) running outside any Client Component tree.
+ *
+ * Server-internal contract:
+ * - The request never carries `userId`, `email`, generationId, or
+ *   any MongoDB identifier.
+ * - Embeddings must already be L2-normalised — the client validates
+ *   shape and finite-ness only. Mathematical validation remains the
+ *   responsibility of the Face Service.
+ *
+ * Behaviour:
+ * - One POST. No automatic retry.
+ * - Uses `X-Service-Token` for server-to-server auth.
+ * - Reuses the existing `AbortController` + 10-second timeout.
+ * - On `INCONSISTENT_FACE_SAMPLES`, throws a
+ *   `FaceServiceClientError` with `code = FACE_SERVICE_REJECTED_REQUEST`
+ *   and `domainError.code = INCONSISTENT_FACE_SAMPLES`. The centroid
+ *   is NEVER exposed on this path.
+ * - Preserves upstream domain codes (MODEL_MISMATCH,
+ *   INVALID_SAMPLE_COUNT, INVALID_EMBEDDING,
+ *   EMBEDDING_DIMENSION_MISMATCH, EMBEDDING_NOT_NORMALIZED,
+ *   INVALID_CENTROID) on `domainError.code`.
+ * - Response model metadata must EXACTLY match the requested model —
+ *   mismatches are treated as `FACE_SERVICE_INVALID_RESPONSE` so that
+ *   future persistence under mismatched metadata is impossible.
+ *
+ * @throws {FaceServiceClientError} On configuration, network,
+ *   validation, or domain failure. The error never includes raw
+ *   embeddings, centroid values, or secrets.
+ */
+export async function finalizeFaceEnrollment(
+  input: FinalizeFaceEnrollmentInput,
+): Promise<FinalizeFaceEnrollmentResult> {
+  // ---- 1. Input validation (server-side boundary) ---------------------
+  const parsed = FinalizeFaceEnrollmentInputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: "Invalid finalization input.",
+    });
+  }
+  const validInput = parsed.data;
+
+  // Sample count >= 2.
+  if (validInput.requiredSampleCount < 2) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: `requiredSampleCount must be >= 2; got ${validInput.requiredSampleCount}.`,
+    });
+  }
+
+  // Embeddings non-empty.
+  if (validInput.embeddings.length === 0) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: "Embeddings list is empty.",
+    });
+  }
+
+  // Embedding count must match required sample count.
+  if (validInput.embeddings.length !== validInput.requiredSampleCount) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: `Embeddings count (${validInput.embeddings.length}) must equal requiredSampleCount (${validInput.requiredSampleCount}).`,
+    });
+  }
+
+  // Normalization metadata must be supported.
+  if (validInput.model.normalization !== "l2") {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: `Unsupported normalization: ${validInput.model.normalization}. Expected "l2".`,
+    });
+  }
+
+  // Per-vector validation: dimension match + finite values.
+  for (let i = 0; i < validInput.embeddings.length; i++) {
+    validateFinalizationEmbedding(
+      validInput.embeddings[i]!,
+      validInput.model.embeddingDimension,
+    );
+  }
+
+  // ---- 2. Build the request body (NO userId / generationId / etc.) ---
+  const requestBody = {
+    model: {
+      identity: validInput.model.identity,
+      name: validInput.model.name,
+      embedding_dimension: validInput.model.embeddingDimension,
+      normalization: validInput.model.normalization,
+    },
+    required_sample_count: validInput.requiredSampleCount,
+    embeddings: validInput.embeddings,
+  };
+
+  // ---- 3. Single POST, no automatic retry ----------------------------
+  // We deliberately do NOT inspect a "consistent:false" success
+  // envelope as success: PHASE 4.6A2 currently maps every domain
+  // failure (including INCONSISTENT_FACE_SAMPLES) to an HTTP 422
+  // error envelope, which the lower-level `faceServiceRequest`
+  // already classifies as `FACE_SERVICE_REJECTED_REQUEST` with
+  // `domainError` populated. We only need to ensure the
+  // INCONSISTENT_FACE_SAMPLES code is preserved verbatim — which
+  // the lower-level path already does — and we must NOT expose
+  // any centroid value on that path. The success schema below
+  // refuses anything other than `consistent: true` at the Zod
+  // level, so a stale or incorrectly-classified inconsistent
+  // response can never be returned as a centroid-carrying result.
+  const response = await faceServiceRequest<{
+    consistent: true;
+    sample_count: number;
+    pair_count: number;
+    min_self_similarity: number;
+    mean_self_similarity: number;
+    threshold: number;
+    centroid: number[];
+    model: {
+      identity: string;
+      name: string;
+      embedding_dimension: number;
+      normalization: string;
+    };
+  }>("/v1/faces/enrollment/finalize", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(requestBody),
+    requireAuth: true,
+    schema: FinalizeFaceEnrollmentResponseSchema,
+  });
+
+  // ---- 4. Response model metadata must exactly match request ---------
+  if (response.model.identity !== validInput.model.identity) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: "Finalization response model identity does not match request.",
+    });
+  }
+  if (response.model.name !== validInput.model.name) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: "Finalization response model name does not match request.",
+    });
+  }
+  if (
+    response.model.embedding_dimension !==
+    validInput.model.embeddingDimension
+  ) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: "Finalization response model embedding dimension does not match request.",
+    });
+  }
+  if (response.model.normalization !== validInput.model.normalization) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: "Finalization response model normalization does not match request.",
+    });
+  }
+
+  // ---- 5. Centroid validation ---------------------------------------
+  validateCentroid(
+    response.centroid,
+    response.model.embedding_dimension,
+    validInput.model.embeddingDimension,
+  );
+
+  // ---- 6. Build strongly typed server-only result --------------------
+  return {
+    consistent: true,
+    sampleCount: response.sample_count,
+    pairCount: response.pair_count,
+    minSelfSimilarity: response.min_self_similarity,
+    meanSelfSimilarity: response.mean_self_similarity,
+    threshold: response.threshold,
+    centroid: response.centroid,
+    model: {
+      identity: response.model.identity,
+      name: response.model.name,
+      embeddingDimension: response.model.embedding_dimension,
+      normalization: response.model.normalization,
+    },
+  };
 }

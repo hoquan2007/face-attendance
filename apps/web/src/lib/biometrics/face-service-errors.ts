@@ -78,3 +78,30 @@ export class FaceServiceClientError extends Error {
     };
   }
 }
+
+/**
+ * Stable Face Service domain error codes for the enrollment
+ * finalization endpoint (`POST /v1/faces/enrollment/finalize`).
+ *
+ * These are the upstream codes that PHASE 4.6A2 may return in its
+ * `{ "error": { "code", "message" } }` envelope. They are preserved
+ * verbatim inside `FaceServiceClientError.domainError.code` so
+ * future orchestration layers can map them to user-facing codes
+ * without leaking raw fetch internals.
+ *
+ * NOTE: these are NOT `FaceServiceErrorCode` values — they live on
+ * `domainError.code` only. The top-level `FaceServiceClientError.code`
+ * stays one of the transport-level `FACE_SERVICE_ERROR_CODES`.
+ */
+export const FINALIZATION_ERROR_CODES = {
+  MODEL_MISMATCH: "MODEL_MISMATCH",
+  INVALID_SAMPLE_COUNT: "INVALID_SAMPLE_COUNT",
+  INVALID_EMBEDDING: "INVALID_EMBEDDING",
+  EMBEDDING_DIMENSION_MISMATCH: "EMBEDDING_DIMENSION_MISMATCH",
+  EMBEDDING_NOT_NORMALIZED: "EMBEDDING_NOT_NORMALIZED",
+  INCONSISTENT_FACE_SAMPLES: "INCONSISTENT_FACE_SAMPLES",
+  INVALID_CENTROID: "INVALID_CENTROID",
+} as const;
+
+export type FinalizationErrorCode =
+  (typeof FINALIZATION_ERROR_CODES)[keyof typeof FINALIZATION_ERROR_CODES];
