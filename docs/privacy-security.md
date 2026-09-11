@@ -1,16 +1,10 @@
 # Privacy & Security
 
-> Status: **Phase 4.4C** — PHASE 4.4A shipped the Next.js server-only
-> `FaceServiceClient`. PHASE 4.4B1 shipped the first Next.js Face ID
-> route — `POST /api/face-id/enrollment/start` — which safely starts a
-> temporary enrollment session for the authenticated user.
-> PHASE 4.4B2 added the read-only status route
-> `GET /api/face-id/enrollment/status`. PHASE 4.4C adds the sample
-> upload route `POST /api/face-id/enrollment/sample`, which accepts
-> one image, forwards it to the Face Service, encrypts accepted
-> embeddings, and persists them encrypted in the temporary enrollment
-> session. **The browser never receives embeddings.** Camera UI,
-> finalization, and re-enrollment belong to later phases.
+> Status: **Phase 4.6A2** — PHASE 4.6A1 shipped the pure enrollment finalization
+> math foundation. PHASE 4.6A2 adds the protected internal finalization
+> endpoint (`POST /v1/faces/enrollment/finalize`) that receives
+> already-decrypted, already-L2-normalized embeddings from the trusted
+> Next.js server and returns a consistency result plus a normalized centroid.
 
 ## Biometric handling principles
 
@@ -199,7 +193,8 @@ Better Auth user** via a unique index on `userId`. A TTL index on
 `expiresAt` (with `expireAfterSeconds: 0`) instructs MongoDB to delete
 the document once `expiresAt` is in the past.
 
-Stored fields (PHASE 4.2 — persistence foundation only):
+Stored fields (PHASE 4.2 — persistence foundation only, plus
+PHASE 4.5B4.3 `generationId`):
 
 - `userId`, `mode` (`"create"` or `"replace"`), `templateVersion`,
   `requiredSampleCount`
@@ -210,6 +205,12 @@ Stored fields (PHASE 4.2 — persistence foundation only):
   (`encryptedVector`), `sampleIndex`, an optional quality block, and
   `acceptedAt`
 - `expiresAt`, `createdAt`, `updatedAt`
+- `generationId` (PHASE 4.5B4.3) — a UUID v4 minted by the server at
+  create-or-reset time. Required, non-unique. Used as the
+  reconciliation discriminator for multi-tab and reload resilience.
+  For legacy documents created before PHASE 4.5B4.3 the field is
+  backfilled lazily, atomically, and exactly once on the first
+  read of the document (see "Legacy session migration" below).
 
 **TTL deletion is asynchronous.** Service code must call
 `isEnrollmentSessionExpired(session)` to detect expiration; relying
@@ -229,7 +230,10 @@ PHASE 4.2 ships two server-only service modules:
   — `getEnrollmentSessionByUserId`,
   `createOrResetEnrollmentSession` (upsert keyed on `userId`, clears
   `acceptedSamples`, refreshes `expiresAt`, resets model metadata to
-  `undefined`), `deleteEnrollmentSessionByUserId`,
+  `undefined`, mints a fresh `generationId`), and PHASE 4.5B4.3
+  performs an atomic lazy server-side backfill of `generationId`
+  for legacy sessions,
+  `deleteEnrollmentSessionByUserId`,
   `isEnrollmentSessionExpired`.
 
 Both services map MongoDB duplicate-key errors to safe
@@ -910,6 +914,646 @@ PHASE 4.4C deliberately does NOT implement:
 
 PHASE 4.4C ships only the sample route and its dedicated tests.
 
+## Phase 4.5A browser camera foundation
+
+PHASE 4.5A ships the first **client-side** Face ID code in the
+web app: a small, reusable camera primitive for future enrollment
+UI. The mini-phase is deliberately minimal — a live preview and
+nothing more.
+
+### Client-only surface
+
+The new files live entirely under
+`apps/web/src/components/face-id/`:
+
+- `camera-constants.ts` — stable error codes, friendly messages,
+  and `getUserMedia` constraints (`audio: false`, `facingMode:
+  "user"`, ideal `1280x720`).
+- `camera-errors.ts` — a pure `mapCameraError(unknown)` utility that
+  returns a closed-enum `CameraErrorShape` and never leaks raw
+  exception names, messages, or stacks.
+- `use-face-camera.ts` — a `"use client"` React hook exposing
+  `videoRef`, `status` (`idle | requesting | ready | error`),
+  `error`, `isReady`, `startCamera`, `stopCamera`.
+- `camera-preview.tsx` — a `"use client"` React component that
+  renders a `<video>`, "Turn on camera" / "Stop camera" buttons,
+  an accessible error block, and a small privacy note.
+- `index.ts` — public surface re-exports.
+
+The module MUST NOT import any server-only module. In particular
+the camera code never references:
+
+- `face-service-client.ts`
+- `encryption.ts`
+- Mongoose models
+- `FACE_SERVICE_SECRET`
+- `BIOMETRIC_ENCRYPTION_KEY`
+- `MONGODB_URI`
+
+### Permission is explicit
+
+The browser's `getUserMedia` permission dialog is one of the most
+disruptive UX events on the web. PHASE 4.5A enforces the rule:
+
+- `getUserMedia` is NEVER called on mount, render, or effect.
+- The ONLY trigger is the user pressing **"Turn on camera"**.
+- Opening a page that embeds `CameraPreview` must NOT immediately
+  trigger the browser permission dialog.
+
+This is the exact same posture called for in
+`docs/frontend-design.md`: no surprise permission prompts.
+
+### Audio is off
+
+PHASE 4.5A requests `audio: false` unconditionally. Microphone
+permission is NEVER requested. The microphone LED on supported
+platforms therefore never lights up during PHASE 4.5A usage.
+
+### Track cleanup on stop
+
+`stopCamera()` stops EVERY active `MediaStreamTrack` and detaches
+the stream from the `<video>` element. The OS-level camera LED is
+guaranteed to turn off when the user presses Stop, navigates away,
+or closes the consuming component.
+
+The hook also performs the same cleanup in its unmount effect,
+so leaving a page that embeds `CameraPreview` never leaves the
+webcam running.
+
+### No image capture / no upload
+
+PHASE 4.5A does NOT capture, encode, or upload any image. There
+is no:
+
+- `<canvas>` element in the foundation code
+- `drawImage`, `toBlob`, or `toDataURL` call
+- `ImageCapture` API usage
+- `fetch` call to `/api/face-id/enrollment/sample`
+- persistent browser storage (`localStorage`, `IndexedDB`)
+
+The only thing the camera writes to is the `<video>` element's
+`srcObject` — a live in-memory `MediaStream`. There is no
+persistent browser-side state to clean up.
+
+### Privacy copy
+
+`CameraPreview` includes a small, restrained privacy note near
+the preview: "The camera preview stays on this device until you
+choose to capture a sample." This wording is deliberately
+limited to what is true in PHASE 4.5A. It does NOT claim that
+future samples are never transmitted, because PHASE 4.5B will
+send user-chosen samples to the server.
+
+### Secure context
+
+`navigator.mediaDevices.getUserMedia` is only available in a
+secure context (HTTPS or localhost). `useFaceCamera` checks
+`window.isSecureContext` BEFORE calling `getUserMedia` and
+returns `CAMERA_INSECURE_CONTEXT` if the page is not in a secure
+context. No production domains are hard-coded; localhost is
+treated as secure by modern browsers.
+
+### Stable camera error codes
+
+Browser exceptions are mapped to a closed enum:
+
+| Browser exception                                              | Mapped code                |
+| -------------------------------------------------------------- | -------------------------- |
+| `NotAllowedError`                                              | `CAMERA_PERMISSION_DENIED` |
+| `NotFoundError`, `OverconstrainedError`                        | `CAMERA_NOT_FOUND`         |
+| `NotReadableError`                                             | `CAMERA_IN_USE`            |
+| `SecurityError`                                                | `CAMERA_INSECURE_CONTEXT`  |
+| anything else (incl. `null`, `undefined`, primitives)          | `CAMERA_UNAVAILABLE`       |
+
+The mapping is pure, isolated to `camera-errors.ts`, and is
+unit-tested independently of the hook and the component. Raw
+exception names, messages, and stacks are NEVER surfaced to
+the user, to logs, or to the UI tree.
+
+### What is NOT yet implemented
+
+PHASE 4.5A deliberately does NOT implement:
+
+- Image capture (`<canvas>`, `ImageCapture`, `toBlob`, `toDataURL`,
+  `drawImage`).
+- JPEG / PNG / WebP encoding.
+- Sample submission to `/api/face-id/enrollment/sample`.
+- 5-sample progress, embedding extraction, encryption, or
+  persistence.
+- Face Service calls.
+- Finalization or `FaceProfile` creation.
+- Re-enrollment or FaceProfile deletion flows.
+- A `/face-id` or `/face-id/setup` application route.
+- Any change to sidebar navigation.
+- Dashboard, attendance, or classes integration.
+- Camera device enumeration / selection.
+
+PHASE 4.5B will integrate the camera foundation into a real
+`/face-id` enrollment page and add the missing capture / submit
+loop. No part of that work belongs to PHASE 4.5A.
+
+## Phase 4.5B1 Face ID page shell
+
+PHASE 4.5B1 introduces the first two Server Component pages that
+expose Face ID to the authenticated user:
+
+- `/face-id` — safe overview page
+- `/face-id/setup` — enrollment shell
+
+Both pages share the same server-side authentication and profile
+gating as `/dashboard` and `/profile`. No biometric payload enters
+or leaves these pages. No Face Service calls are made from the
+pages themselves.
+
+### No biometric exposure on the overview page
+
+The `/face-id` page renders ONLY safe fields:
+
+- `configured` (boolean)
+- `faceId.enrolledAt` (ISO string)
+- `faceId.sampleCount` (integer)
+- `enrollment.active`, `enrollment.mode`, `enrollment.acceptedSamples`,
+  `enrollment.requiredSamples`, `enrollment.expiresAt`
+
+The page never renders or references:
+
+- `userId`, `email`
+- encrypted samples (`ciphertext`, `iv`, `authTag`, `keyVersion`)
+- model metadata (`modelIdentity`, `modelName`,
+  `embeddingDimension`, `normalization`)
+- embeddings
+- centroids
+- quality summaries
+- the actual `acceptedSamples` array
+
+### Explicit start action, no auto-enrollment
+
+The `/face-id/setup` page never auto-starts enrollment and never
+auto-requests camera permission. The user must explicitly press the
+"Start setup" button. The button calls a Server Action
+(`startFaceEnrollment`) that wraps the same auth and profile checks
+as `POST /api/face-id/enrollment/start`. The action sets the
+session under the authenticated user's identity only — it never
+accepts a `userId` from the browser.
+
+### CameraPreview retains PHASE 4.5A guarantees
+
+When the enrollment page renders `CameraPreview`, the component
+behaves exactly as in PHASE 4.5A:
+
+- `getUserMedia` is only triggered by an explicit button click.
+- `audio: false` — no microphone access is requested.
+- All MediaStreamTracks are stopped on unmount and on Stop press.
+
+The setup page never exposes a functional Capture button. The
+preview's purpose in PHASE 4.5B1 is purely to verify camera access
+works before later phases add capture and submission.
+
+### Privacy copy on the setup page
+
+The setup page includes restrained, neutral privacy information:
+
+- "Face setup will use several camera samples to create an
+  encrypted biometric template."
+- "Raw camera images are not kept by the application."
+- "Liveness and anti-spoofing are not enabled in this preview."
+
+These statements are deliberately limited to what the current
+architecture supports. No unbacked promises (e.g. "100% secure",
+"cannot be fooled") are made. The page is not rendered as a legal
+consent form.
+
+### Shared safe status service
+
+To avoid duplicating safe status logic between the existing
+`GET /api/face-id/enrollment/status` route and the new Server
+Components, a shared module is introduced:
+
+```
+apps/web/src/lib/biometrics/face-id-status-service.ts
+```
+
+It is server-only, returns typed objects (no JSON-over-HTTP), and
+performs the same TTL handling as the status route. It deliberately
+NEVER returns any biometric field listed above.
+
+### Server-secret hygiene
+
+The page code NEVER imports:
+
+- `face-service-client.ts`
+- `encryption.ts`
+- Mongoose models
+- `FACE_SERVICE_SECRET`
+- `BIOMETRIC_ENCRYPTION_KEY`
+- `MONGODB_URI`
+
+Only Client Components in the strict sense (the page-level Client
+components for the start button and the pre-existing `CameraPreview`)
+are present in the browser bundle. Both use only React, the
+shared `cn()` helper, and the camera foundation modules.
+
+### What PHASE 4.5B1 does NOT include
+
+- Image capture / encoding / upload
+- POST `/api/face-id/enrollment/sample`
+- 5-sample capture loop
+- Quality feedback
+- Embedding handling
+- Finalization
+- Centroid calculation
+- FaceProfile creation
+- Re-enrollment or Face ID deletion
+
+Those belong to PHASE 4.5B2.
+
+## Phase 4.5B2 video frame capture foundation
+
+PHASE 4.5B2 ships the first **client-side image processing** primitive
+in the web app: a reusable utility that captures one frame from an
+already-ready HTMLVideoElement and returns it as a JPEG Blob held
+only in browser memory. PHASE 4.5B2 does NOT submit the frame
+anywhere, does NOT persist it, and does NOT integrate into a UI yet.
+
+### Client-only, server-secret free
+
+The new file lives under
+`apps/web/src/components/face-id/capture-video-frame.ts`. It is
+client-only and never imports:
+
+- `face-service-client.ts`
+- `encryption.ts`
+- Mongoose models
+- `FACE_SERVICE_SECRET`
+- `BIOMETRIC_ENCRYPTION_KEY`
+- `MONGODB_URI`
+
+The utility performs ZERO network requests — no `fetch`,
+`XMLHttpRequest`, `sendBeacon`, or Server Action call. An explicit
+unit test asserts `fetch` is never called.
+
+### The captured JPEG stays in memory
+
+The captured frame exists only as:
+
+- temporary canvas pixels during encoding
+- the returned in-memory JPEG `Blob`
+
+The frame is NEVER written to:
+
+- the filesystem
+- IndexedDB
+- localStorage
+- sessionStorage
+- the Cache API
+- MongoDB
+- a public directory
+
+After `toBlob` completes, the ephemeral canvas backing memory is
+released (`canvas.width = 0; canvas.height = 0`). The utility does
+NOT create an object URL — `URL.createObjectURL()` is not called in
+PHASE 4.5B2. There is no captured preview yet.
+
+### Encoding policy
+
+| Property | Value |
+| --- | --- |
+| MIME type | `image/jpeg` |
+| Quality | `0.85` (development setting) |
+| Max long edge | `1280` |
+| Aspect ratio | preserved |
+| Upscale | NEVER |
+| Encoder | `canvas.toBlob` only |
+| `toDataURL` | NOT used |
+| Base64 output | NEVER produced |
+
+The Next.js sample endpoint remains authoritative for its existing
+1.5 MB request limit.
+
+### Preview mirror does NOT mirror capture
+
+The `CameraPreview` component applies a CSS
+`[transform:scaleX(-1)]` to its `<video>` for selfie-style
+presentation. CSS transforms do NOT affect the source pixels drawn
+via `drawImage`. The capture utility does NOT apply
+`ctx.scale(-1, 1)` or `ctx.translate(...)` — the captured image
+preserves the original camera frame orientation. A test verifies
+that no mirror transform is invoked.
+
+### No biometric payload, no upload yet
+
+The captured `Blob` is held only in browser memory. PHASE 4.5B2 does
+NOT claim that future samples are never transmitted, because PHASE
+4.5B3 will submit user-chosen samples to
+`POST /api/face-id/enrollment/sample`. No part of that submission
+flow belongs to PHASE 4.5B2.
+
+### What PHASE 4.5B2 does NOT include
+
+- POST `/api/face-id/enrollment/sample`
+- A functional Capture button on `/face-id/setup`
+- 5-sample progress mutations
+- Quality feedback
+- Embedding extraction, encryption, or persistence
+- Face Service calls
+- Finalization or `FaceProfile` creation
+- Re-enrollment or Face ID deletion
+
+Sample submission, finalization, and any embedding handling belong
+to PHASE 4.5B3.
+
+## Phase 4.5B3 capture + submit + quality feedback
+
+PHASE 4.5B3 turns the previously-inert `CameraPreview` on
+`/face-id/setup` into a working capture loop. Every biometric frame
+still travels through the existing Next.js authenticated route; the
+browser never speaks to the Face Service directly.
+
+### Browser only ever calls the Next.js route
+
+The browser is restricted to a single network endpoint:
+
+- `POST /api/face-id/enrollment/sample`
+
+The browser does **not** call:
+
+- `${FACE_SERVICE_URL}` directly
+- the FastAPI `/v1/faces/enrollment/sample` endpoint
+- any other internal infrastructure
+
+The browser does **not** send `X-Service-Token`, `FACE_SERVICE_SECRET`,
+`userId`, `email`, `sampleIndex`, or `modelIdentity`. Identity is
+derived from the Better Auth session exclusively, sample index is
+managed atomically server-side.
+
+### Strict network-boundary invariants
+
+The browser request:
+
+- Uses `multipart/form-data` with exactly one field, `image`,
+  carrying the JPEG `Blob`.
+- Filename: `"face-sample.jpg"` — harmless metadata only.
+- NEVER manually sets `Content-Type: multipart/form-data`. The
+  browser is responsible for generating the multipart boundary. A
+  manual `Content-Type` would break the boundary and the request
+  would be rejected.
+- Sends NO `Authorization`, `X-Service-Token`, or any other internal
+  header from the browser.
+
+### What the browser sees from the server
+
+The browser receives only safe fields from the existing route:
+
+```json
+{
+  "accepted": true,
+  "rejectionReasons": [],
+  "progress": {
+    "acceptedSamples": 1,
+    "requiredSamples": 5,
+    "complete": false
+  }
+}
+```
+
+…or the standard `{ "error": { "code", "message" } }` envelope. The
+browser never sees:
+
+- `embedding`
+- `ciphertext`, `iv`, `authTag`, `keyVersion`
+- `modelIdentity`, `modelName`, `embeddingDimension`,
+  `normalization`
+- `userId`, `email`
+- any other biometric payload
+
+### No Blob persistence in the browser
+
+The captured JPEG `Blob` lives only in the local variable inside the
+click handler. It is **never**:
+
+- stored in React state, context, or any store
+- written to `localStorage`, `sessionStorage`, IndexedDB, or the
+  Cache API
+- exposed via `URL.createObjectURL()` or rendered into an `<img>`
+  thumbnail
+
+The PHASE 4.5B2 utility and the new submission helper both avoid
+`toDataURL`, base64, object URLs, and `<canvas>` round-trips. There
+is no captured-image preview UI in PHASE 4.5B3.
+
+### Explicit action only
+
+A "Capture sample" button is rendered only while:
+
+- an active enrollment session exists, AND
+- the camera hook reports `ready`, AND
+- no submission is currently pending, AND
+- `progress.complete === false`.
+
+Two rapid clicks are prevented from producing two POSTs by a
+synchronous `submissionInFlightRef` guard inside the click handler,
+in addition to React's `pending` state used for the disabled
+attribute. There is no timer, no interval, no `requestAnimationFrame`
+loop, no face-triggered capture. One click produces exactly one
+capture and exactly one POST.
+
+### No automatic retry
+
+The browser never retries the POST on:
+
+- timeout
+- 409 conflict (`ENROLLMENT_SAMPLE_CONFLICT`,
+  `ENROLLMENT_SAMPLE_LIMIT_REACHED`)
+- 5xx (`FACE_SERVICE_UNAVAILABLE`, `FACE_SERVICE_TIMEOUT`, ...)
+- network failure
+- `FACE_SERVICE_INVALID_RESPONSE`
+
+The user must press "Capture sample" again explicitly. Quality
+rejection, `NO_FACE`, and `MULTIPLE_FACES` are recoverable
+domain-level outcomes; the camera is left running for the next
+attempt.
+
+### Server-authoritative progress
+
+The browser receives safe initial progress from the existing
+`face-id-status-service` and passes it to the panel as
+`initialAcceptedSamples` and `requiredSamples`. The panel NEVER
+increments its own counter (`setCount(count + 1)` is forbidden).
+After every successful POST response the panel replaces its
+displayed progress with the `progress` block from the server
+response. Rejected samples, conflicts, and timeouts do NOT advance
+progress.
+
+### `complete=true` is an honest temporary state
+
+When the server reports `progress.complete === true` the panel:
+
+- disables further "Capture sample" submissions,
+- displays an honest informational message such as *"All required
+  samples collected. Final setup is not connected yet."*
+
+The browser does **NOT** claim Face ID is configured, an identity is
+verified, or a `FaceProfile` exists. `FaceProfile` creation belongs
+to PHASE 4.5B4 / 4.6.
+
+### Privacy copy on the setup page
+
+The setup page privacy note is updated to reflect that each sample
+the user explicitly chooses to capture is sent to the application
+for face analysis, and that raw camera images are not kept by the
+application. This is product information, not legal consent text.
+The page does not claim end-to-end encryption.
+
+### Camera lifecycle unchanged
+
+PHASE 4.5B3 does NOT modify the PHASE 4.5A camera behavior:
+
+- `getUserMedia` is still only triggered by an explicit button
+  click.
+- `audio: false` is still enforced.
+- The pending-request guard, the request generation token, the
+  unmount cleanup, and the error mapping all remain.
+
+After a successful POST or a quality rejection the camera stream
+is left running so the user can try again without re-requesting
+permission. The camera is never restarted automatically.
+
+### What is NOT yet implemented
+
+PHASE 4.5B3 deliberately does NOT implement:
+
+- `FaceProfile` creation or any finalization
+- Centroid calculation
+- Decryption of any persisted encrypted sample
+- Re-enrollment or Face ID deletion
+- Liveness / anti-spoofing
+- Automatic capture, continuous capture, video recording
+- base64 encoding, `toDataURL`, object URL preview
+- `localStorage`, `sessionStorage`, IndexedDB, Cache API
+  persistence of any captured frame
+- Direct browser → Face Service calls
+- Sending `X-Service-Token` or `FACE_SERVICE_SECRET` from the
+  browser
+- Sending `userId`, `email`, `sampleIndex`, or `modelIdentity` from
+  the browser
+- Manual `Content-Type: multipart/form-data`
+- Any automatic retry of the POST
+
+Finalization and any related workflow belong to PHASE 4.5B5 / 4.6.
+
+## Phase 4.5B4.3 server-authoritative generation discriminator + legacy migration
+
+PHASE 4.5B4.3 introduces a stable, server-authoritative
+**`generationId`** for each `FaceEnrollmentSession` document. It
+replaces `expiresAt` as the primary reconciliation discriminator for
+multi-tab and reload-resilience paths. The browser continues to
+receive `expiresAt` for display ("Session expires at …") but it is
+**not** the trigger for the downward-replacement reconciliation
+branch.
+
+### Why a server-issued `generationId`?
+
+`expiresAt` is a TTL field that may change on legitimate
+non-reset operations (TTL extension). Two reads of the same
+`FaceEnrollmentSession` may legitimately observe different
+`expiresAt` values without the session having been replaced.
+`generationId` is a UUID v4 minted by the server exactly once per
+create-or-reset operation, so two reads of the same document
+always observe the same `generationId`, and any operation that
+replaces the session clears and re-mints it.
+
+### Schema invariant
+
+`generationId` is a non-unique, required `String` (minlength 1).
+No global unique index is added — `userId` remains the unique
+ownership index. Adding a global unique index would be a global
+write bottleneck for an identifier that is only consumed locally
+by the browser for reconciliation.
+
+### Legacy session migration strategy
+
+Documents created before PHASE 4.5B4.3 may not have a
+`generationId` field. Mongoose does not auto-backfill required
+fields on existing documents. The migration is therefore:
+
+- **Lazy / on-demand.** Triggered on the first
+  `getEnrollmentSessionByUserId(userId)` call after the schema
+  change goes live.
+- **Server-side only.** No migration script, no batch update, no
+  global scan.
+- **Atomic per-document.** Implemented as a single
+  `findOneAndUpdate` with the guard
+  `{ userId, generationId: { $exists: false } }` and the
+  `$set: { generationId: randomUUID() }` payload. MongoDB's
+  atomic write semantics guarantee only one concurrent request
+  wins the match.
+- **No in-memory lock.** The atomic guard is sufficient. The
+  service does not rely on any singleton or module-level lock
+  to ensure one-`generationId`-per-document.
+- **Field-preserving.** The backfill sets only `generationId`.
+  `acceptedSamples`, `expiresAt`, `mode`, model metadata, and
+  `FaceProfile` are not touched.
+- **Idempotent.** Subsequent reads find `generationId` already
+  present and return the document unchanged. The second read
+  returns the same `generationId` as the first.
+
+### Concurrency contract
+
+Two simultaneous readers of the same legacy session:
+
+| Request | Candidate UUID | Atomic match | Outcome |
+| --- | --- | --- | --- |
+| A | UUID-A | wins | DB `generationId = UUID-A` |
+| B | UUID-B | loses | re-reads, observes `UUID-A` |
+
+Only **one** `generationId` is ever persisted. All readers
+observe the same stable value.
+
+### Expired legacy session
+
+The lazy backfill runs lazily but the expired-session check runs
+first. An already-expired legacy session is treated as inactive
+and is **not** revived merely to attach a `generationId`. The
+existing TTL / cleanup behaviour is unchanged.
+
+### Status contract (safe DTO)
+
+For any ACTIVE session returned by the safe status service:
+
+```
+generationId: <stable, server-issued, non-empty UUID>
+```
+
+For inactive enrollment:
+
+```
+generationId: null
+```
+
+The status service **never** invents an ephemeral UUID to satisfy
+a `generationId ?? randomUUID()` fallback. Identity comes from
+the persisted session document (or from the lazy atomic
+backfill for legacy sessions). DTO construction must not compute
+the ID.
+
+### Browser-side guarantees
+
+- The browser never sends `generationId` to the server in any
+  fetch body or header.
+- The browser never persists `generationId` to localStorage,
+  sessionStorage, IndexedDB, the Cache API, or cookies.
+- `expiresAt` is never used as a fallback for `generationId`.
+- The same-generation vs new-generation decision uses only
+  `generationId`.
+
+### What this phase does NOT change
+
+- `FaceProfile` finalization is unchanged.
+- The TTL / expiration semantics are unchanged.
+- The unique `userId` ownership invariant is unchanged.
+- The session response shape only adds one optional field
+  (`generationId`). Existing fields are untouched.
+
 ## Secrets
 
 - All secrets live in environment variables. `.env.example` exists at the
@@ -1031,3 +1675,113 @@ license and updated the verification log there.
 `FACE_SERVICE_SECRET` is the MVP mechanism. The architecture allows
 swapping it for mTLS, signed JWTs from the web app's identity provider,
 or workload identity (e.g. cloud IAM) without changing route signatures.
+
+## Phase 4.6A1 pure enrollment finalization math
+
+PHASE 4.6A1 ships a **pure-Python math module** inside the Face
+Service — `services/face-service/app/engine/enrollment_finalization.py`.
+The module turns a batch of *already validated, L2-normalised*
+embeddings into an L2-normalised centroid *iff* the batch is
+mutually consistent enough to form one enrollment template.
+
+### No HTTP, no persistence, no engine access
+
+The pure math foundation explicitly does NOT:
+
+- call the InsightFace engine
+- read environment variables
+- write to disk, MongoDB, SQLite, JSON, `.npy`, `.npz`, or `.pkl`
+- touch the network
+- decode images, handle JPEG bytes, or open raw camera frames
+- log embedding values, centroid values, or pairwise vector contents
+
+Configuration is supplied as function arguments by the caller.
+`min_self_similarity` is a caller-supplied argument.
+
+### No raw biometric fixtures or persistence
+
+The unit test suite constructs deterministic normalised vectors
+synthetically from a seeded numpy generator; no real biometric data is
+loaded or referenced.
+
+### Reuse of the PHASE 3 matcher
+
+Pairwise cosine similarity is computed by the existing
+`app.engine.matcher.cosine_similarity` helper. This guarantees:
+
+- similarity semantics identical to the existing 1:1 / 1:N code paths
+- the same float-drift clamping (`[-1.0, 1.0]`)
+- the same shared `INVALID_EMBEDDING` error path for malformed
+  inputs
+
+The pure finalization layer wraps the matcher's domain errors into
+its own stable codes (`INVALID_EMBEDDING`,
+`EMBEDDING_DIMENSION_MISMATCH`, `EMBEDDING_NOT_NORMALIZED`,
+`INCONSISTENT_FACE_SAMPLES`, `INVALID_CENTROID`,
+`INVALID_SAMPLE_COUNT`) so the future endpoint layer can map them
+onto HTTP envelopes without leaking matcher internals.
+
+### What this phase does NOT do
+
+- `FaceProfile` persistence
+- Biometric encryption / decryption
+- Re-enrollment, deletion, replacement
+- Attendance, liveness, anti-spoofing
+
+Those belong to later phases.
+
+## Phase 4.6A2 protected finalization endpoint
+
+PHASE 4.6A2 adds the protected internal HTTP endpoint
+`POST /v1/faces/enrollment/finalize` to the Face Service.
+
+### Server-to-server only
+
+The endpoint is designed for **server-to-server communication** between
+the trusted Next.js application and the Face Service. It receives
+already-decrypted, already-L2-normalised embeddings and returns a
+consistency result plus a normalized centroid. The browser must never
+call this endpoint directly.
+
+### Architecture boundary
+
+The Face Service remains **stateless** in PHASE 4.6A2. It does NOT:
+
+- read MongoDB (`FaceEnrollmentSession`, `FaceProfile`)
+- perform biometric decryption (AES-GCM, `BIOMETRIC_ENCRYPTION_KEY`)
+- know about `userId` or Better Auth
+- persist the centroid or any other result
+
+The Next.js server (PHASE 4.6B) will be responsible for:
+1. Reading encrypted samples from MongoDB.
+2. Decrypting them with `BIOMETRIC_ENCRYPTION_KEY`.
+3. Sending already-decrypted vectors to this endpoint.
+
+### Authentication
+
+The endpoint is protected by the existing `X-Service-Token` mechanism
+(`FACE_SERVICE_SECRET`). `GET /health` remains unchanged and public.
+
+### Privacy guarantees
+
+The endpoint receives biometric vectors, so:
+
+- **Never log:** embeddings, centroid values, request bodies.
+- **Safe log fields:** `sample_count`, `pair_count`, `consistent`,
+  `model_identity`, domain error code.
+- **No persistence:** the Face Service does not write anything to disk,
+  MongoDB, or any storage.
+
+### Configuration
+
+`FACE_ENROLLMENT_MIN_SELF_SIMILARITY` (default: `0.7`) controls the
+consistency threshold. This is a **DEVELOPMENT BASELINE ONLY** — it
+must be re-calibrated against representative evaluation data before
+any production deployment.
+
+### What PHASE 4.6A2 does NOT implement
+
+- MongoDB access or `FaceEnrollmentSession` / `FaceProfile` persistence.
+- Biometric decryption (AES-GCM, `BIOMETRIC_ENCRYPTION_KEY`).
+- Next.js server-side orchestration.
+- Face ID enrollment workflow completion (belongs to PHASE 4.6B).

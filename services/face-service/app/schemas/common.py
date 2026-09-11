@@ -46,4 +46,30 @@ class EnrollmentQualityRejection(str, Enum):
     FACE_NEAR_EDGE = "FACE_NEAR_EDGE"
 
 
-__all__ = ["FaceErrorCode", "EnrollmentQualityRejection"]
+class FinalizationErrorCode(str, Enum):
+    """Stable error codes for the ``POST /v1/faces/enrollment/finalize`` endpoint.
+
+    These codes cover model incompatibility, embedding validation, and
+    batch consistency. They are intentionally distinct from
+    :class:`FaceErrorCode` because they belong to a different endpoint
+    and concern a different failure class (enrollment consistency rather
+    than image decoding or face detection).
+    """
+
+    # Model / metadata incompatibility
+    MODEL_MISMATCH = "MODEL_MISMATCH"
+
+    # Embedding validation (upstream of finalization math)
+    INVALID_SAMPLE_COUNT = "INVALID_SAMPLE_COUNT"
+    INVALID_EMBEDDING = "INVALID_EMBEDDING"
+    EMBEDDING_DIMENSION_MISMATCH = "EMBEDDING_DIMENSION_MISMATCH"
+    EMBEDDING_NOT_NORMALIZED = "EMBEDDING_NOT_NORMALIZED"
+
+    # Batch consistency
+    INCONSISTENT_FACE_SAMPLES = "INCONSISTENT_FACE_SAMPLES"
+
+    # Centroid output guard
+    INVALID_CENTROID = "INVALID_CENTROID"
+
+
+__all__ = ["FaceErrorCode", "EnrollmentQualityRejection", "FinalizationErrorCode"]

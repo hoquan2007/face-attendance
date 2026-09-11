@@ -153,6 +153,25 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Enrollment finalization (PHASE 4.6A2) ---
+    # DEVELOPMENT BASELINE ONLY — NOT production-calibrated.
+    # Must be in the valid cosine similarity range [-1.0, 1.0].
+    # The value 0.7 is chosen to be slightly below the 0.75
+    # mean-self-similarity observed for 5 real enrollment samples in
+    # PHASE 3 evaluation, providing a conservative safety margin.
+    face_enrollment_min_self_similarity: float = Field(
+        default=0.7,
+        alias="FACE_ENROLLMENT_MIN_SELF_SIMILARITY",
+        description=(
+            "Minimum pairwise cosine similarity between enrollment samples "
+            "for a batch to be considered consistent. "
+            "DEVELOPMENT BASELINE — calibrate before production. "
+            "Must be in [-1.0, 1.0]."
+        ),
+        ge=-1.0,
+        le=1.0,
+    )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

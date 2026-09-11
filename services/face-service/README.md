@@ -17,8 +17,20 @@ foundation:
 **exactly one** face, applies a development-baseline quality gate, and
 returns the L2-normalised embedding only on accept. It is
 **server-to-server only** — the browser must never call it directly.
-Multi-sample finalisation, centroid calculation, re-enrollment, and
-the Next.js-side orchestration arrive in PHASE 4.4+.
+
+**PHASE 4.6A1** ships a pure-Python **enrollment finalization math
+foundation** (`app/engine/enrollment_finalization.py`). The module
+turns a batch of validated, L2-normalised embeddings into a single
+L2-normalised centroid *iff* the batch is mutually consistent enough
+to form one enrollment template. The module is intentionally
+decoupled from HTTP, the engine, and persistence.
+
+**PHASE 4.6A2** adds the protected internal finalization endpoint
+(`POST /v1/faces/enrollment/finalize`). The endpoint receives
+already-decrypted, already-L2-normalized embeddings from the trusted
+Next.js server and returns a consistency result plus a normalized centroid.
+The Face Service does NOT read MongoDB, does NOT decrypt biometric data,
+and does NOT persist the centroid.
 
 PHASE 3 explicitly does **not** enroll users, persist embeddings, or run
 face identification against a class gallery. Those arrive in later phases.
@@ -247,15 +259,18 @@ services/face-service/
 │   │   ├── matcher.py                # cosine similarity + threshold
 │   │   ├── quality.py                # blur, brightness, near-edge
 │   │   ├── enrollment_quality.py     # 4.3 quality policy
+│   │   ├── enrollment_finalization.py  # 4.6A1 pure finalization math
 │   │   └── types.py                  # application-owned DTOs
 │   ├── schemas/
-│   │   ├── common.py                 # FaceErrorCode + EnrollmentQualityRejection
+│   │   ├── common.py                 # FaceErrorCode, EnrollmentQualityRejection, FinalizationErrorCode
 │   │   ├── face.py                   # analyze response
 │   │   ├── compare.py                # compare response
-│   │   └── enrollment.py             # 4.3 enrollment-sample response
+│   │   ├── enrollment.py             # 4.3 enrollment-sample response
+│   │   └── enrollment_finalization.py # 4.6A2 finalize request/response schemas
 │   ├── services/
 │   │   ├── recognition_service.py    # route-layer pipeline
-│   │   └── enrollment_sample_service.py  # 4.3 enrollment pipeline
+│   │   ├── enrollment_sample_service.py  # 4.3 enrollment pipeline
+│   │   └── enrollment_finalization_service.py # 4.6A2 finalization service
 │   └── utils/
 │       └── image.py                  # in-memory decoder + limits
 ├── benchmarks/
@@ -280,6 +295,10 @@ services/face-service/
 │   ├── test_enrollment_quality.py        # 4.3
 │   ├── test_enrollment_sample_service.py # 4.3
 │   ├── test_enrollment_endpoint.py       # 4.3
+│   ├── test_enrollment_finalization.py   # 4.6A1
+│   ├── test_enrollment_finalization_config.py  # 4.6A2 config tests
+│   ├── test_enrollment_finalization_service.py  # 4.6A2 service tests
+│   ├── test_enrollment_finalization_endpoint.py # 4.6A2 endpoint tests
 │   ├── fakes.py
 │   └── integration/
 │       └── test_engine_lifecycle.py

@@ -122,7 +122,8 @@ Success response (`200 OK`):
   "mode": "create",
   "acceptedSamples": 0,
   "requiredSamples": 5,
-  "expiresAt": "2026-09-10T14:30:00.000Z"
+  "expiresAt": "2026-09-10T14:30:00.000Z",
+  "generationId": "<stable server-issued UUID>"
 }
 ```
 
@@ -130,6 +131,11 @@ The response deliberately does **not** include `userId`, `email`,
 encrypted samples, ciphertext / IV / authTag, model metadata, or
 embeddings — the browser does not need them and they are not safe to
 expose.
+
+`generationId` is a stable UUID v4 issued by the server at
+create-or-reset time (PHASE 4.5B4.3). The browser uses it as the
+primary reconciliation discriminator for multi-tab and reload
+resilience. It is not a secret and is safe to render.
 
 Error responses follow the project-wide shape:
 
@@ -187,7 +193,8 @@ Success response (`200 OK`):
     "mode": null,
     "acceptedSamples": 0,
     "requiredSamples": 0,
-    "expiresAt": null
+    "expiresAt": null,
+    "generationId": null
   }
 }
 ```
@@ -206,7 +213,8 @@ When the user has a permanent `FaceProfile`:
     "mode": null,
     "acceptedSamples": 0,
     "requiredSamples": 0,
-    "expiresAt": null
+    "expiresAt": null,
+    "generationId": null
   }
 }
 ```
@@ -223,7 +231,8 @@ REPLACE):
     "mode": "create",
     "acceptedSamples": 2,
     "requiredSamples": 5,
-    "expiresAt": "2026-09-10T14:30:00.000Z"
+    "expiresAt": "2026-09-10T14:30:00.000Z",
+    "generationId": "<stable server-issued UUID>"
   }
 }
 ```
@@ -231,6 +240,13 @@ REPLACE):
 `mode` is the literal stored value — either `"create"` or
 `"replace"`. `acceptedSamples` is the LENGTH of the stored
 `acceptedSamples` array; the actual array is never returned.
+
+`generationId` (PHASE 4.5B4.3) is the stable UUID the server uses
+as the reconciliation discriminator. For any active session it is
+a non-empty server-issued value. For inactive enrollment it is
+`null`. The status service never invents an ephemeral UUID; the
+identity comes from the persisted session document (or from a lazy
+atomic backfill for legacy sessions created before B4.3).
 
 The response deliberately does **not** include `userId`, `email`,
 encrypted samples, ciphertext / IV / authTag, model metadata,
@@ -380,6 +396,45 @@ Stable codes for this endpoint:
 | `BIOMETRIC_ENCRYPTION_UNAVAILABLE` | 503 | Encryption key missing or invalid. |
 | `ENROLLMENT_SAMPLE_FAILED` | 500 | Could not save sample (concurrency conflict, persistence error). |
 
+### Browser consumption of `POST /api/face-id/enrollment/sample` (PHASE 4.5B3)
+
+PHASE 4.5B3 introduces the first browser caller of the sample
+endpoint. The contract above is unchanged; this subsection documents
+the small, restrained client shape.
+
+- **Single network target:** the browser posts to
+  `POST /api/face-id/enrollment/sample` ONLY. The browser does not
+  call `${FACE_SERVICE_URL}` or the FastAPI
+  `/v1/faces/enrollment/sample` route.
+- **Headers:** no `Authorization`, no `X-Service-Token`, no manual
+  `Content-Type: multipart/form-data`. The browser is allowed to
+  generate the multipart boundary itself.
+- **Body:** `multipart/form-data` with exactly one field named
+  `image`, carrying the JPEG `Blob`. Filename is the harmless
+  metadata string `"face-sample.jpg"`.
+- **Identity:** the request body MUST NOT carry `userId`, `email`,
+  `sampleIndex`, or `modelIdentity`. Identity is derived from the
+  Better Auth session exclusively, and the sample index is managed
+  atomically server-side.
+- **One capture, one POST:** each Capture sample click produces
+  exactly one capture and exactly one POST. There is no automatic
+  retry on timeout, 409 conflict, 5xx, or network failure.
+- **Parsed response:** the browser parses the route's safe shape
+  with a Zod schema. Recognised fields are `accepted`,
+  `rejectionReasons`, and `progress.{acceptedSamples,
+  requiredSamples, complete}`. On error the standard envelope
+  `{ error: { code, message } }` is consumed. The browser never sees
+  `embedding`, `ciphertext`, `iv`, `authTag`, `keyVersion`,
+  `modelIdentity`, or `userId`.
+- **Blob lifecycle:** the captured JPEG `Blob` is held only in a
+  local variable inside the click handler. It is never stored in
+  React state, never passed through `URL.createObjectURL`, and never
+  written to `localStorage` / `sessionStorage` / IndexedDB / the
+  Cache API.
+- **Finalization:** `progress.complete === true` only disables
+  further submissions. It does NOT trigger any other endpoint, does
+  NOT calculate a centroid, and does NOT create a `FaceProfile`.
+
 ## Phase 2 Server Actions
 
 Phase 2 uses Server Actions (not HTTP route handlers) for profile
@@ -438,6 +493,7 @@ Authentication: `X-Service-Token: ${FACE_SERVICE_SECRET}` on every request
 | `/v1/faces/analyze` | POST | service token | Detect 0 / 1 / many faces + quality metadata. **No embeddings returned.** | **3** |
 | `/v1/faces/compare` | POST | service token | 1:1 verification between two single-face images (internal / Phase 4). | **3** |
 | `/v1/faces/enrollment/sample` | POST | service token | Validate one enrollment sample (exactly one face + quality gate). Returns the L2-normalised embedding only on accept. **Server-to-server only.** | **4.3** |
+| `/v1/faces/enrollment/finalize` | POST | service token | Finalize an enrollment batch: validate model compatibility, run pairwise consistency check, return normalized centroid on success. **Server-to-server only.** | **4.6A2** |
 | `/v1/recognize` | POST | service token | Detect + embed + match against provided candidate index. | 7 |
 | `/v1/enroll` | POST | service token | Validate enrollment frame (single high-quality face). | 4 |
 | `/v1/index/build` | POST | service token | Build a normalized candidate matrix from embeddings. | 7 |
@@ -636,6 +692,93 @@ Scale strategy: the policy uses `relative_face_area` (face_area /
 image_area) for too-small / too-large decisions because raw pixel size
 depends on resolution. Brightness refers to image exposure only — the
 policy never rejects based on skin tone, ethnicity, age, or gender.
+
+### `POST /v1/faces/enrollment/finalize`
+
+**Server-to-server only (PHASE 4.6A2).** The browser must never call
+this endpoint directly — it receives biometric vectors and returns a
+centroid. Only the trusted Next.js server calls it after decrypting
+MongoDB data.
+
+**Architecture boundary:** The Face Service does NOT read MongoDB,
+does NOT perform biometric decryption (AES-GCM, `BIOMETRIC_ENCRYPTION_KEY`),
+and does NOT persist the centroid. These responsibilities belong to
+PHASE 4.6B.
+
+**Authentication:** `X-Service-Token` required (same as other `/v1/*` routes).
+
+**Request shape:**
+
+```json
+{
+  "model": {
+    "identity": "insightface-buffalo-l",
+    "name": "buffalo_l",
+    "embedding_dimension": 512,
+    "normalization": "l2"
+  },
+  "required_sample_count": 5,
+  "embeddings": [
+    [0.123, -0.456, ...],
+    [0.111, -0.444, ...],
+    ...
+  ]
+}
+```
+
+The request NEVER carries: `userId`, `email`, `ciphertext`, `iv`,
+`authTag`, `keyVersion`, images, or face crops.
+
+**Response (consistent batch, HTTP 200):**
+
+```json
+{
+  "consistent": true,
+  "sample_count": 5,
+  "pair_count": 10,
+  "min_self_similarity": 0.82,
+  "mean_self_similarity": 0.87,
+  "threshold": 0.7,
+  "centroid": [0.123, -0.456, ...],
+  "model": {
+    "identity": "insightface-buffalo-l",
+    "name": "buffalo_l",
+    "embedding_dimension": 512,
+    "normalization": "l2"
+  }
+}
+```
+
+**Response (inconsistent batch, HTTP 422):**
+
+```json
+{
+  "consistent": false,
+  "error": {
+    "code": "INCONSISTENT_FACE_SAMPLES",
+    "message": "Enrollment batch is internally inconsistent..."
+  }
+}
+```
+
+**Stable domain error codes:**
+
+| Code | HTTP | Meaning |
+| --- | --- | --- |
+| `MODEL_MISMATCH` | 422 | Request metadata incompatible with active engine. |
+| `INVALID_SAMPLE_COUNT` | 422 | `required_sample_count < 2` or count mismatch. |
+| `INVALID_EMBEDDING` | 422 | Empty / non-finite / wrong dimension embedding. |
+| `EMBEDDING_DIMENSION_MISMATCH` | 422 | Embedding dimension disagrees with metadata. |
+| `EMBEDDING_NOT_NORMALIZED` | 422 | Embedding is not L2-normalised. |
+| `INCONSISTENT_FACE_SAMPLES` | 422 | Min pairwise similarity below threshold. No centroid. |
+| `INVALID_CENTROID` | 422 | Defensive: arithmetic mean non-finite or zero-norm. |
+
+**Configuration:** `FACE_ENROLLMENT_MIN_SELF_SIMILARITY` (default: `0.7`).
+DEVELOPMENT BASELINE ONLY — calibrate before production.
+
+**Privacy:** Embeddings, centroid values, and request bodies are never
+logged. Safe log fields: `sample_count`, `pair_count`, `consistent`,
+`model_identity`, domain error code.
 
 ## Camera transport (future)
 
