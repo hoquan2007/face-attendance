@@ -2,6 +2,7 @@
  * FaceEnrollmentSession service layer.
  *
  * PHASE 4.2 — FaceProfile + FaceEnrollmentSession database foundation.
+ * PHASE 4.5B4.3 — Stable `generationId` + lazy legacy backfill.
  *
  * Encapsulates all reads and writes against the
  * `face_enrollment_sessions` collection. Server Components, Server
@@ -18,12 +19,26 @@
  *     `userId`. The unique index on `userId` guarantees at most one
  *     active session per user at the database layer.
  *   - Reset semantics: `acceptedSamples` is cleared, `expiresAt` is
- *     refreshed, and model metadata is reset to `undefined`.
+ *     refreshed, `generationId` is freshly regenerated, and model
+ *     metadata is reset to `undefined`.
  *
  * Expiration:
  *   - `isEnrollmentSessionExpired(session)` uses `expiresAt <= now`.
  *     Service code must call this before consuming a session because
  *     MongoDB TTL deletion is asynchronous.
+ *
+ * `generationId` (PHASE 4.5B4.3):
+ *   - Each enrollment session carries a stable, server-generated
+ *     `generationId` (UUID v4) created atomically with the document.
+ *   - The `generationId` is the primary multi-tab / reload-resilience
+ *     discriminator. It is the ONLY thing that survives across
+ *     upserts; `expiresAt` is only a TTL / display field.
+ *   - Legacy documents that pre-date this field are migrated lazily
+ *     and atomically by `getEnrollmentSessionByUserId`. The backfill
+ *     preserves every other field (samples, mode, model metadata,
+ *     expiresAt). Exactly one backfill wins when two concurrent
+ *     reads race; the loser re-reads and observes the persisted
+ *     winner's `generationId`.
  *
  * This service intentionally does NOT implement:
  *   - quality checking
@@ -32,6 +47,8 @@
  *
  * Those belong to later phases.
  */
+
+import { randomUUID } from "node:crypto";
 
 import { getMongooseConnection } from "@/lib/mongoose";
 import {
@@ -57,6 +74,17 @@ async function ensureConnection(): Promise<void> {
 }
 
 /**
+ * Generates a stable, server-side UUID for a single enrollment
+ * generation. Exported for tests that need deterministic IDs.
+ *
+ * Production callers MUST NOT import this directly — the service
+ * layer is the only place that creates / backfills `generationId`.
+ */
+export function createGenerationId(): string {
+  return randomUUID();
+}
+
+/**
  * Returns the active enrollment session for the given Better Auth
  * user, or `null` if none exists.
  *
@@ -64,6 +92,28 @@ async function ensureConnection(): Promise<void> {
  * `isEnrollmentSessionExpired(session)` to decide whether the session
  * is still usable; expired sessions should be discarded (or reset)
  * rather than consumed.
+ *
+ * Legacy backfill (PHASE 4.5B4.3):
+ *   - If the persisted document lacks `generationId` (a legacy
+ *     document from a PHASE 4.x version that pre-dates this field),
+ *     this function performs a one-time atomic backfill:
+ *       1. Read the persisted document.
+ *       2. If `generationId` is already present → return it unchanged.
+ *       3. Otherwise, generate a candidate UUID and apply an atomic
+ *          `findOneAndUpdate` that ONLY mutates a document matching
+ *          `userId === X` AND `generationId` is absent.
+ *       4. The winner sees its candidate persisted. The loser reads
+ *          back the persisted winner's `generationId` and returns it.
+ *   - The backfill preserves every other field (samples, mode, model
+ *     metadata, expiresAt, timestamps).
+ *   - No in-memory lock is held — concurrency safety is purely the
+ *     atomic MongoDB filter.
+ *   - The function returns `null` (does NOT invent a UUID) when no
+ *     document exists. Inventing a UUID for a non-existent session
+ *     would create the unstable-ID anti-pattern this phase forbids.
+ *   - Expired legacy sessions are NOT revived. They continue to be
+ *     treated as inactive by the caller via
+ *     `isEnrollmentSessionExpired(...)`.
  */
 export async function getEnrollmentSessionByUserId(
   userId: string,
@@ -72,7 +122,42 @@ export async function getEnrollmentSessionByUserId(
   const doc = await FaceEnrollmentSessionModel.findOne({ userId })
     .lean<FaceEnrollmentSessionAttrs>()
     .exec();
-  return doc ?? null;
+  if (!doc) return null;
+
+  // Fast path: legacy-free document — return it verbatim.
+  if (typeof doc.generationId === "string" && doc.generationId.length > 0) {
+    return doc;
+  }
+
+  // Legacy backfill path: persist a generationId atomically iff the
+  // field is still absent. Exactly one concurrent caller wins.
+  const candidate = createGenerationId();
+  let updated: FaceEnrollmentSessionAttrs | null = null;
+  try {
+    updated = await FaceEnrollmentSessionModel.findOneAndUpdate(
+      { userId, generationId: { $exists: false } },
+      { $set: { generationId: candidate } },
+      { new: true },
+    )
+      .lean<FaceEnrollmentSessionAttrs>()
+      .exec();
+  } catch (err) {
+    // The atomic filter cannot fail with a duplicate-key error
+    // (generationId has no unique index), so any thrown error here is
+    // a true infrastructure failure. Surface it via the safe mapper.
+    throw mapMongoDuplicateKeyErrorForBiometrics(err);
+  }
+
+  if (updated && updated.generationId) {
+    return updated;
+  }
+
+  // Either we lost the race, or another concurrent caller persisted a
+  // different value first. Re-read and return the persisted winner.
+  const reread = await FaceEnrollmentSessionModel.findOne({ userId })
+    .lean<FaceEnrollmentSessionAttrs>()
+    .exec();
+  return reread ?? null;
 }
 
 /**
@@ -92,6 +177,13 @@ export interface CreateOrResetEnrollmentSessionInput {
    * `now + DEFAULT_ENROLLMENT_SESSION_TTL_MS`.
    */
   expiresAt?: Date;
+  /**
+   * Override the generation-id generator (tests only). Production
+   * callers MUST leave this undefined.
+   *
+   * @internal
+   */
+  generateGenerationId?: () => string;
 }
 
 /**
@@ -105,6 +197,7 @@ export interface CreateOrResetEnrollmentSessionInput {
  *   - `modelIdentity`, `modelName`, `embeddingDimension`,
  *     `normalization` are reset to `undefined` because no sample has
  *     been processed yet.
+ *   - `generationId` is freshly regenerated (a new server-side UUID).
  *
  * This function deliberately does NOT touch any existing FaceProfile.
  * Replacement behavior (revoking the previous FaceProfile) belongs to
@@ -124,6 +217,9 @@ export async function createOrResetEnrollmentSession(
   const now = new Date();
   const expiresAt =
     input.expiresAt ?? new Date(now.getTime() + DEFAULT_ENROLLMENT_SESSION_TTL_MS);
+  const generationId = (
+    input.generateGenerationId ?? createGenerationId
+  )();
 
   try {
     const doc = await FaceEnrollmentSessionModel.findOneAndUpdate(
@@ -134,6 +230,7 @@ export async function createOrResetEnrollmentSession(
           templateVersion: input.templateVersion,
           requiredSampleCount: input.requiredSampleCount,
           expiresAt,
+          generationId,
           // Reset transient fields.
           acceptedSamples: [],
           // Model metadata is intentionally absent until the first
@@ -416,7 +513,7 @@ export async function appendAcceptedEnrollmentSample(
       detectionScore: input.quality.detectionScore,
       blurScore: input.quality.blurScore,
       brightness: input.quality.brightness,
-      relativeFaceArea: input.quality.relativeFaceArea,
+      relativeFaceArea: input.quality.relativeFaceArea ?? undefined,
     };
   }
 

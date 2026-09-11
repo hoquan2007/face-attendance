@@ -45,6 +45,13 @@ import {
 
 /**
  * Plain TypeScript representation of a FaceEnrollmentSession document.
+ *
+ * `generationId` is the stable, server-generated identity of an
+ * enrollment generation. It is created exactly once when the
+ * session is born (via `createOrResetEnrollmentSession`) and is
+ * backfilled lazily (atomically) for legacy documents created by
+ * earlier PHASE 4.x code that pre-dates this field. See
+ * `enrollment-session-service.ts` for the backfill contract.
  */
 export interface FaceEnrollmentSessionAttrs {
   userId: string;
@@ -57,6 +64,7 @@ export interface FaceEnrollmentSessionAttrs {
   requiredSampleCount: number;
   acceptedSamples: FaceEnrollmentAcceptedSampleDoc[];
   expiresAt: Date;
+  generationId: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -175,6 +183,17 @@ const FaceEnrollmentSessionSchema = new Schema<FaceEnrollmentSessionAttrs>(
       type: Date,
       required: true,
     },
+    generationId: {
+      type: String,
+      required: true,
+      // The generationId is created on document creation (via
+      // createOrResetEnrollmentSession) and lazily backfilled for
+      // legacy documents that pre-date this field. There is
+      // intentionally NO unique index on generationId: userId
+      // remains the unique ownership index, and a generationId is
+      // only meaningful in the context of a specific user's session.
+      minlength: [1, "generationId must be a non-empty string."],
+    },
   },
   {
     timestamps: true,
@@ -186,6 +205,10 @@ const FaceEnrollmentSessionSchema = new Schema<FaceEnrollmentSessionAttrs>(
  * Unique index on `userId` is created automatically by the field-level
  * `unique: true, index: true` declaration above — at most one
  * enrollment session per Better Auth user at any time.
+ *
+ * `generationId` does NOT carry a unique index. Its purpose is purely
+ * as a stable per-generation discriminator for multi-tab / reload
+ * resilience. The unique ownership index is still `userId`.
  */
 
 /**

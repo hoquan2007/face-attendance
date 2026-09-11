@@ -63,6 +63,40 @@ describe("FaceEnrollmentSession model / mode field", () => {
   });
 });
 
+describe("FaceEnrollmentSession model / generationId", () => {
+  it("requires generationId", () => {
+    expect(
+      FaceEnrollmentSessionModel.schema.path("generationId").isRequired,
+    ).toBe(true);
+  });
+
+  it("declares generationId as a String field", () => {
+    const path = FaceEnrollmentSessionModel.schema.path("generationId");
+    expect(path.instance).toBe("String");
+  });
+
+  it("has no unique index on generationId", () => {
+    const indexes = FaceEnrollmentSessionModel.schema.indexes();
+    // userId is the unique index; generationId must NOT be unique
+    const uniqueIndexes = indexes.filter(([, opts]) => {
+      const o = opts as Record<string, unknown>;
+      return o?.unique === true;
+    });
+    for (const [keys] of uniqueIndexes) {
+      const k = keys as Record<string, unknown>;
+      expect(k).not.toHaveProperty("generationId");
+    }
+  });
+
+  it("enforces minlength on generationId", () => {
+    const path = FaceEnrollmentSessionModel.schema.path("generationId");
+    const minlength = path.options.minlength as [number, string] | undefined;
+    expect(minlength).toBeDefined();
+    expect(Array.isArray(minlength)).toBe(true);
+    expect(minlength![0]).toBe(1);
+  });
+});
+
 describe("FaceEnrollmentSession model / defaults", () => {
   it("defaults acceptedSamples to an empty array", () => {
     const path = FaceEnrollmentSessionModel.schema.path("acceptedSamples");

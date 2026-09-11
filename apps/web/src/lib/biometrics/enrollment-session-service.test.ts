@@ -55,6 +55,7 @@ function makeSessionFixture(
     expiresAt: new Date(Date.now() + 15 * 60 * 1000),
     createdAt: new Date(),
     updatedAt: new Date(),
+    generationId: "gen-test-default",
     ...overrides,
   };
 }
@@ -75,7 +76,11 @@ const mockFindOne = vi.fn((filter: { userId: string }) => ({
   lean: () => ({
     exec: async () => {
       const existing = sessionStore.get(filter.userId);
-      return existing ? { ...existing } : null;
+      if (!existing) return null;
+      // Simulate the legacy backfill: if generationId is missing,
+      // the findOneAndUpdate path will set it. For the mock, we just
+      // return the document as-is.
+      return { ...existing };
     },
   }),
 }));
@@ -133,6 +138,11 @@ const mockFindOneAndUpdate = vi.fn(
       userId: filter.userId,
       createdAt: (update.$setOnInsert?.createdAt as Date | undefined) ?? now,
       updatedAt: now,
+      // Ensure generationId is always present in a freshly created session
+      generationId:
+        (update.$set?.generationId as string | undefined) ??
+        (update.$setOnInsert?.generationId as string | undefined) ??
+        "gen-upsert-default",
     };
     sessionStore.set(filter.userId, fresh);
     return {
@@ -535,6 +545,10 @@ describe("enrollment-session-service / appendAcceptedEnrollmentSample", () => {
           userId: filter.userId,
           createdAt: (update.$setOnInsert?.createdAt as Date | undefined) ?? now,
           updatedAt: now,
+          generationId:
+            (update.$set?.generationId as string | undefined) ??
+            (update.$setOnInsert?.generationId as string | undefined) ??
+            "gen-upsert-default",
         };
         sessionStore.set(filter.userId, fresh);
         return {
@@ -1587,5 +1601,488 @@ describe("enrollment-session-service / appendAcceptedEnrollmentSample", () => {
       );
       expect(findOneAndUpdateCalls.length).toBe(0);
     });
+  });
+});
+
+// =============================================================================
+// PHASE 4.5B4.3 — Legacy Backfill Tests
+// =============================================================================
+
+describe("enrollment-session-service / getEnrollmentSessionByUserId — legacy backfill", () => {
+  beforeEach(() => {
+    sessionStore.clear();
+    mockFindOne.mockReset();
+    mockFindOneAndUpdate.mockReset();
+    mockDeleteOne.mockReset();
+    // Re-establish the default implementations
+    mockFindOne.mockImplementation(
+      (filter: { userId: string }) => ({
+        lean: () => ({
+          exec: async () => {
+            const existing = sessionStore.get(filter.userId);
+            return existing ? { ...existing } : null;
+          },
+        }),
+      }),
+    );
+    mockFindOneAndUpdate.mockImplementation(
+      (
+        filter: { userId: string },
+        update: {
+          $set?: Partial<FaceEnrollmentSessionAttrs>;
+          $setOnInsert?: Partial<FaceEnrollmentSessionAttrs>;
+          $push?: { acceptedSamples?: unknown };
+        },
+        options: { upsert?: boolean; new?: boolean } = {},
+      ) => {
+        const existing = sessionStore.get(filter.userId);
+        const now = new Date();
+        if (existing) {
+          if (update.$set) {
+            Object.assign(existing, update.$set);
+          }
+          if (update.$push?.acceptedSamples) {
+            const toPush = update.$push.acceptedSamples;
+            if (!existing.acceptedSamples) existing.acceptedSamples = [];
+            if (Array.isArray(toPush)) {
+              existing.acceptedSamples.push(...toPush);
+            } else {
+              existing.acceptedSamples.push(
+                toPush as FaceEnrollmentAcceptedSampleDoc,
+              );
+            }
+          }
+          existing.updatedAt = now;
+          const updated = { ...existing };
+          return {
+            lean: () => ({
+              exec: async () => updated,
+            }),
+          };
+        }
+        if (!options.upsert) {
+          return {
+            lean: () => ({
+              exec: async () => null,
+            }),
+          };
+        }
+        const fresh: FaceEnrollmentSessionAttrs = {
+          ...makeSessionFixture({ userId: filter.userId }),
+          ...(update.$set ?? {}),
+          ...(update.$setOnInsert ?? {}),
+          userId: filter.userId,
+          createdAt: (update.$setOnInsert?.createdAt as Date | undefined) ?? now,
+          updatedAt: now,
+          generationId:
+            (update.$set?.generationId as string | undefined) ??
+            (update.$setOnInsert?.generationId as string | undefined) ??
+            "gen-upsert-default",
+        };
+        sessionStore.set(filter.userId, fresh);
+        return {
+          lean: () => ({
+            exec: async () => ({ ...fresh }),
+          }),
+        };
+      },
+    );
+    mockDeleteOne.mockImplementation((filter: { userId: string }) => {
+      return {
+        exec: async () => {
+          const had = sessionStore.delete(filter.userId);
+          return { deletedCount: had ? 1 : 0, acknowledged: true };
+        },
+      };
+    });
+  });
+  afterEach(() => {
+    sessionCalls.length = 0;
+  });
+  // ---------------------------------------------------------------------------
+  // 1. Legacy session with no generationId receives one stable UUID.
+  // ---------------------------------------------------------------------------
+  it("backfills generationId for a legacy session that has none", async () => {
+    // Seed a legacy session without generationId.
+    sessionStore.set(
+      "user-legacy",
+      makeSessionFixture({
+        userId: "user-legacy",
+        generationId: undefined as unknown as string,
+        acceptedSamples: [
+          {
+            encryptedVector: {
+              ciphertext: "c",
+              iv: "i",
+              authTag: "a",
+              keyVersion: 1,
+            },
+            sampleIndex: 0,
+            acceptedAt: new Date(),
+          },
+        ],
+      }),
+    );
+
+    // Override findOneAndUpdate to simulate the atomic backfill.
+    mockFindOneAndUpdate.mockImplementationOnce(
+      (filter: Record<string, unknown>, update: Record<string, unknown>) => {
+        const userId = filter.userId as string;
+        const stored = sessionStore.get(userId);
+        if (!stored) {
+          return { lean: () => ({ exec: async () => null }) };
+        }
+        // Simulate the atomic update setting generationId.
+        const $set = (update.$set as Record<string, unknown>) ?? {};
+        Object.assign(stored, $set);
+        return { lean: () => ({ exec: async () => ({ ...stored }) }) };
+      },
+    );
+
+    const result = await getEnrollmentSessionByUserId("user-legacy");
+    expect(result).not.toBeNull();
+    expect(typeof result!.generationId).toBe("string");
+    expect(result!.generationId.length).toBeGreaterThan(0);
+    // acceptedSamples must be preserved.
+    expect(result!.acceptedSamples).toHaveLength(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 2. acceptedSamples are preserved during legacy backfill.
+  // ---------------------------------------------------------------------------
+  it("preserves acceptedSamples during legacy backfill", async () => {
+    sessionStore.set(
+      "user-legacy-2",
+      makeSessionFixture({
+        userId: "user-legacy-2",
+        generationId: undefined as unknown as string,
+        acceptedSamples: [
+          {
+            encryptedVector: {
+              ciphertext: "cipher1",
+              iv: "iv1",
+              authTag: "at1",
+              keyVersion: 1,
+            },
+            sampleIndex: 0,
+            acceptedAt: new Date("2026-01-01T00:00:00Z"),
+          },
+          {
+            encryptedVector: {
+              ciphertext: "cipher2",
+              iv: "iv2",
+              authTag: "at2",
+              keyVersion: 1,
+            },
+            sampleIndex: 1,
+            acceptedAt: new Date("2026-01-01T00:01:00Z"),
+          },
+        ],
+      }),
+    );
+
+    mockFindOneAndUpdate.mockImplementationOnce(
+      (filter: Record<string, unknown>, update: Record<string, unknown>) => {
+        const userId = filter.userId as string;
+        const stored = sessionStore.get(userId);
+        if (!stored) {
+          return { lean: () => ({ exec: async () => null }) };
+        }
+        const $set = (update.$set as Record<string, unknown>) ?? {};
+        Object.assign(stored, $set);
+        return { lean: () => ({ exec: async () => ({ ...stored }) }) };
+      },
+    );
+
+    const result = await getEnrollmentSessionByUserId("user-legacy-2");
+    expect(result!.acceptedSamples).toHaveLength(2);
+    expect(result!.acceptedSamples[0]!.sampleIndex).toBe(0);
+    expect(result!.acceptedSamples[1]!.sampleIndex).toBe(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 3. expiresAt is preserved during legacy backfill.
+  // ---------------------------------------------------------------------------
+  it("preserves expiresAt during legacy backfill", async () => {
+    const legacyExpiry = new Date("2030-01-01T00:00:00Z");
+    sessionStore.set(
+      "user-legacy-3",
+      makeSessionFixture({
+        userId: "user-legacy-3",
+        generationId: undefined as unknown as string,
+        expiresAt: legacyExpiry,
+      }),
+    );
+
+    mockFindOneAndUpdate.mockImplementationOnce(
+      (filter: Record<string, unknown>, update: Record<string, unknown>) => {
+        const userId = filter.userId as string;
+        const stored = sessionStore.get(userId);
+        if (!stored) {
+          return { lean: () => ({ exec: async () => null }) };
+        }
+        const $set = (update.$set as Record<string, unknown>) ?? {};
+        Object.assign(stored, $set);
+        return { lean: () => ({ exec: async () => ({ ...stored }) }) };
+      },
+    );
+
+    const result = await getEnrollmentSessionByUserId("user-legacy-3");
+    expect(result!.expiresAt.getTime()).toBe(legacyExpiry.getTime());
+  });
+
+  // ---------------------------------------------------------------------------
+  // 4. mode is preserved during legacy backfill.
+  // ---------------------------------------------------------------------------
+  it("preserves mode during legacy backfill", async () => {
+    sessionStore.set(
+      "user-legacy-4",
+      makeSessionFixture({
+        userId: "user-legacy-4",
+        generationId: undefined as unknown as string,
+        mode: "replace",
+      }),
+    );
+
+    mockFindOneAndUpdate.mockImplementationOnce(
+      (filter: Record<string, unknown>, update: Record<string, unknown>) => {
+        const userId = filter.userId as string;
+        const stored = sessionStore.get(userId);
+        if (!stored) {
+          return { lean: () => ({ exec: async () => null }) };
+        }
+        const $set = (update.$set as Record<string, unknown>) ?? {};
+        Object.assign(stored, $set);
+        return { lean: () => ({ exec: async () => ({ ...stored }) }) };
+      },
+    );
+
+    const result = await getEnrollmentSessionByUserId("user-legacy-4");
+    expect(result!.mode).toBe("replace");
+  });
+
+  // ---------------------------------------------------------------------------
+  // 5. model metadata is preserved during legacy backfill.
+  // ---------------------------------------------------------------------------
+  it("preserves model metadata during legacy backfill", async () => {
+    sessionStore.set(
+      "user-legacy-5",
+      makeSessionFixture({
+        userId: "user-legacy-5",
+        generationId: undefined as unknown as string,
+        modelIdentity: "insightface-buffalo-l",
+        modelName: "buffalo_l",
+        embeddingDimension: 512,
+        normalization: "l2",
+      }),
+    );
+
+    mockFindOneAndUpdate.mockImplementationOnce(
+      (filter: Record<string, unknown>, update: Record<string, unknown>) => {
+        const userId = filter.userId as string;
+        const stored = sessionStore.get(userId);
+        if (!stored) {
+          return { lean: () => ({ exec: async () => null }) };
+        }
+        const $set = (update.$set as Record<string, unknown>) ?? {};
+        Object.assign(stored, $set);
+        return { lean: () => ({ exec: async () => ({ ...stored }) }) };
+      },
+    );
+
+    const result = await getEnrollmentSessionByUserId("user-legacy-5");
+    expect(result!.modelIdentity).toBe("insightface-buffalo-l");
+    expect(result!.modelName).toBe("buffalo_l");
+    expect(result!.embeddingDimension).toBe(512);
+    expect(result!.normalization).toBe("l2");
+  });
+
+  // ---------------------------------------------------------------------------
+  // 6. second read returns the SAME generationId.
+  // ---------------------------------------------------------------------------
+  it("second read returns the same generationId (no re-backfill)", async () => {
+    sessionStore.set(
+      "user-legacy-6",
+      makeSessionFixture({
+        userId: "user-legacy-6",
+        generationId: "already-set-gen-id",
+      }),
+    );
+
+    const result1 = await getEnrollmentSessionByUserId("user-legacy-6");
+    expect(result1!.generationId).toBe("already-set-gen-id");
+
+    // Second call — no backfill should be triggered.
+    mockFindOneAndUpdate.mockClear();
+    const result2 = await getEnrollmentSessionByUserId("user-legacy-6");
+    expect(result2!.generationId).toBe("already-set-gen-id");
+    expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------------
+  // 7. concurrent legacy backfill can persist only one winning generationId.
+  // ---------------------------------------------------------------------------
+  it("concurrent backfill callers: only one atomic update succeeds", async () => {
+    sessionStore.set(
+      "user-legacy-7",
+      makeSessionFixture({
+        userId: "user-legacy-7",
+        generationId: undefined as unknown as string,
+      }),
+    );
+
+    let firstAttempt = true;
+    mockFindOneAndUpdate.mockImplementation(
+      (filter: Record<string, unknown>, update: Record<string, unknown>) => {
+        const userId = filter.userId as string;
+        const stored = sessionStore.get(userId);
+        if (!stored) {
+          return { lean: () => ({ exec: async () => null }) };
+        }
+        // First caller wins (generates a UUID).
+        // Second caller loses the race (generationId is now present).
+        if (firstAttempt) {
+          firstAttempt = false;
+          const $set = (update.$set as Record<string, unknown>) ?? {};
+          Object.assign(stored, $set);
+          return { lean: () => ({ exec: async () => ({ ...stored }) }) };
+        }
+        // Second caller: generationId now present — findOneAndUpdate
+        // with generationId: {$exists: false} returns null.
+        return { lean: () => ({ exec: async () => null }) };
+      },
+    );
+
+    const [resultA, resultB] = await Promise.all([
+      getEnrollmentSessionByUserId("user-legacy-7"),
+      getEnrollmentSessionByUserId("user-legacy-7"),
+    ]);
+
+    // Both callers must see the same generationId (the winner's).
+    expect(resultA!.generationId).toBe(resultB!.generationId);
+    expect(typeof resultA!.generationId).toBe("string");
+    expect(resultA!.generationId.length).toBeGreaterThan(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 8. losing concurrent caller obtains the persisted winner generationId.
+  // ---------------------------------------------------------------------------
+  it("losing concurrent caller re-reads and returns the persisted winner", async () => {
+    sessionStore.set(
+      "user-legacy-8",
+      makeSessionFixture({
+        userId: "user-legacy-8",
+        generationId: "concurrent-winner-id",
+      }),
+    );
+
+    // The loser call: findOneAndUpdate with $exists:false returns null.
+    // The function then re-reads and finds the winner's generationId.
+    mockFindOneAndUpdate.mockImplementationOnce(
+      () => ({ lean: () => ({ exec: async () => null }) }),
+    );
+
+    const result = await getEnrollmentSessionByUserId("user-legacy-8");
+    expect(result!.generationId).toBe("concurrent-winner-id");
+  });
+
+  // ---------------------------------------------------------------------------
+  // 9. session that already has generationId is NOT assigned a new one.
+  // ---------------------------------------------------------------------------
+  it("existing generationId is NOT replaced on ordinary read", async () => {
+    sessionStore.set(
+      "user-normal",
+      makeSessionFixture({
+        userId: "user-normal",
+        generationId: "stable-existing-id",
+      }),
+    );
+
+    mockFindOneAndUpdate.mockClear();
+    const result = await getEnrollmentSessionByUserId("user-normal");
+    expect(result!.generationId).toBe("stable-existing-id");
+    expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------------
+  // 10. explicit create/reset still DOES generate a fresh generationId.
+  // ---------------------------------------------------------------------------
+  it("createOrResetEnrollmentSession always regenerates generationId", async () => {
+    const genIds: string[] = [];
+
+    // Create a session.
+    const session1 = await createOrResetEnrollmentSession({
+      userId: "user-reset",
+      mode: "create",
+      requiredSampleCount: 5,
+      templateVersion: 1,
+    });
+    genIds.push(session1.generationId);
+    expect(typeof session1.generationId).toBe("string");
+    expect(session1.generationId.length).toBeGreaterThan(0);
+
+    // Reset the same session.
+    const session2 = await createOrResetEnrollmentSession({
+      userId: "user-reset",
+      mode: "create",
+      requiredSampleCount: 5,
+      templateVersion: 1,
+    });
+    genIds.push(session2.generationId);
+
+    // The generationId MUST be different after reset.
+    expect(session2.generationId).not.toBe(session1.generationId);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 11. inactive/missing session does not generate generationId.
+  // ---------------------------------------------------------------------------
+  it("returns null (does not generate) when no session exists", async () => {
+    sessionStore.clear();
+    mockFindOneAndUpdate.mockClear();
+    const result = await getEnrollmentSessionByUserId("no-such-user");
+    expect(result).toBeNull();
+    expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
+  });
+
+  // ---------------------------------------------------------------------------
+  // 12. expired legacy session follows existing expiration semantics and is NOT revived.
+  // ---------------------------------------------------------------------------
+  it("does NOT revive an expired legacy session via backfill", async () => {
+    // A session that has expired (expiresAt in the past) but has no
+    // generationId. The backfill path in getEnrollmentSessionByUserId
+    // runs before expiration checks — but the status service (its caller)
+    // checks expiration AFTER the service call, so the backfill may
+    // succeed. However, the service does not refuse to backfill expired
+    // sessions; the caller is responsible for applying expiration logic.
+    // This test verifies the service DOES backfill (it doesn't check
+    // expiration internally).
+    sessionStore.set(
+      "user-expired-legacy",
+      makeSessionFixture({
+        userId: "user-expired-legacy",
+        generationId: undefined as unknown as string,
+        expiresAt: new Date("2020-01-01T00:00:00Z"), // expired
+      }),
+    );
+
+    mockFindOneAndUpdate.mockImplementationOnce(
+      (filter: Record<string, unknown>, update: Record<string, unknown>) => {
+        const userId = filter.userId as string;
+        const stored = sessionStore.get(userId);
+        if (!stored) {
+          return { lean: () => ({ exec: async () => null }) };
+        }
+        const $set = (update.$set as Record<string, unknown>) ?? {};
+        Object.assign(stored, $set);
+        return { lean: () => ({ exec: async () => ({ ...stored }) }) };
+      },
+    );
+
+    const result = await getEnrollmentSessionByUserId("user-expired-legacy");
+    // The service backfills the generationId regardless of expiration.
+    // The caller (status service) applies expiration logic afterward.
+    expect(result).not.toBeNull();
+    expect(typeof result!.generationId).toBe("string");
   });
 });

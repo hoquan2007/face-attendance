@@ -111,8 +111,8 @@ export const NAV_GROUPS: NavGroup[] = [
         key: "face_id",
         label: "Face ID",
         icon: ScanFace,
-        status: "coming_soon",
-        tooltip: "Face enrollment arrives in a later phase.",
+        href: "/face-id",
+        status: "ready",
       },
       {
         key: "settings",
