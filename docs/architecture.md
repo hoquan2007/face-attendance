@@ -1,14 +1,17 @@
 # Architecture
 
-> Status: **Phase 4.2** — InsightFace Face Service is operational in
-> local development (Phase 3). PHASE 4.1 introduced AES-256-GCM
-> biometric encryption. PHASE 4.2 introduces the **MongoDB / Mongoose
-> persistence foundation** for face profiles (`face_profiles`) and
-> temporary enrollment sessions (`face_enrollment_sessions`).
-> **PHASE 4.2 is a database-only mini-phase.** It does NOT ship a real
-> enrollment flow yet — camera capture, Face Service calls, embedding
-> extraction, quality gate, sample upload, centroid calculation, and
-> enrollment finalization arrive in PHASE 4.3+.
+> Status: **Phase 4.4C** — PHASE 4.4A shipped the Next.js server-only
+> `FaceServiceClient`. PHASE 4.4B1 shipped the first Next.js Face ID
+> route — `POST /api/face-id/enrollment/start` — which safely starts
+> a temporary enrollment session for the authenticated user.
+> PHASE 4.4B2 added the read-only status route
+> `GET /api/face-id/enrollment/status`, which reports the safe current
+> state of the user's Face ID enrollment without exposing any
+> biometric data. PHASE 4.4C adds the sample upload route
+> `POST /api/face-id/enrollment/sample`, which accepts one image,
+> forwards it to the Face Service, encrypts accepted embeddings,
+> and stores them in the temporary enrollment session.
+> Camera UI, finalization, and re-enrollment belong to later phases.
 
 ## Goals
 
@@ -175,6 +178,91 @@ Stable codes include: `INVALID_IMAGE`, `IMAGE_TOO_LARGE`, `NO_FACE`,
 
 Stack traces are logged server-side and **never** returned to clients.
 
+## Next.js Face ID route architecture (PHASE 4.4B1 + 4.4B2)
+
+PHASE 4.4B1 ships the first Next.js Face ID route —
+`POST /api/face-id/enrollment/start`. PHASE 4.4B2 adds a second
+read-only route — `GET /api/face-id/enrollment/status`. Both are
+deliberately thin Route Handlers that delegate all persistence to
+the existing PHASE 4.2 service modules:
+
+```
+Route Handler (apps/web/src/app/api/face-id/enrollment/start/route.ts)
+  │
+  ├── getSession()                ── Better Auth server session
+  ├── isOnboardingComplete()      ── profile-service
+  ├── hasFaceProfile()            ── face-profile-service
+  └── createOrResetEnrollmentSession()
+                                   ── enrollment-session-service
+                                       (upsert keyed on userId,
+                                        unique-indexed Mongo doc,
+                                        15-minute TTL via the
+                                        existing PHASE 4.2 helper)
+
+Route Handler (apps/web/src/app/api/face-id/enrollment/status/route.ts)
+  │
+  ├── getSession()                ── Better Auth server session
+  ├── isOnboardingComplete()      ── profile-service
+  ├── getFaceProfileByUserId()    ── face-profile-service (read)
+  ├── getEnrollmentSessionByUserId()
+                                 ── enrollment-session-service (read)
+  ├── isEnrollmentSessionExpired()
+                                 ── enrollment-session-service (helper)
+  └── deleteEnrollmentSessionByUserId()
+                                 ── enrollment-session-service
+                                       (best-effort cleanup of an
+                                        expired session; failure is
+                                        internal-only)
+
+Route Handler (apps/web/src/app/api/face-id/enrollment/sample/route.ts)
+  │  (PHASE 4.4C)
+  │
+  ├── getSession()                ── Better Auth server session
+  ├── isOnboardingComplete()      ── profile-service
+  ├── getEnrollmentSessionByUserId()
+  │                              ── enrollment-session-service (read)
+  ├── isEnrollmentSessionExpired()
+  │                              ── enrollment-session-service (helper)
+  ├── analyzeEnrollmentSample()  ── face-service-client (server-only)
+  │                                   forwards to Face Service
+  │                                   POST /v1/faces/enrollment/sample
+  ├── encryptBiometricVector()   ── biometric encryption (server-only)
+  │                                   AES-256-GCM with AAD binding
+  └── appendAcceptedEnrollmentSample()
+                                 ── enrollment-session-service
+                                       atomic findOneAndUpdate with
+                                       filter conditions (user,
+                                       expiration, sample limit,
+                                       model compatibility)
+```
+
+Design rules that future Face ID routes should follow:
+
+- The Route Handler is thin. It does **not** touch Mongoose / MongoDB
+  directly — that lives in the service layer, which is unit-tested
+  separately.
+- Identity comes from `session.user.id` exclusively. The request body
+  is **never** trusted for `userId` or `email`. The status route
+  additionally ignores query parameters for identity.
+- Application-level errors are wrapped in
+  `EnrollmentRouteError` (in `apps/web/src/lib/biometrics/enrollment-route-errors.ts`).
+  Mongoose / MongoDB / Better Auth internals never leave the route.
+- The status route never calls the Face Service in PHASE 4.4B2 —
+  status is purely a database read. The status route also never
+  decrypts anything; `BIOMETRIC_ENCRYPTION_KEY` is not required to
+  read status.
+- Constants are centralized in
+  `apps/web/src/lib/biometrics/biometric-constants.ts`
+  (`DEFAULT_FACE_ENROLLMENT_REQUIRED_SAMPLES = 5`,
+  `DEFAULT_FACE_ENROLLMENT_TEMPLATE_VERSION = 1`). Call sites must
+  not hard-code literals.
+- The routes return only safe, non-biometric fields. They never
+  include `userId`, `email`, encrypted samples, ciphertext / IV /
+  authTag, model metadata, or embeddings in the response.
+
+The routes are fully server-only; no Client Component or fetch hook
+is introduced in PHASE 4.4B1 or 4.4B2.
+
 ## Data flow: a recognition call (PHASE 3)
 
 ```mermaid
@@ -208,6 +296,12 @@ sequenceDiagram
 | 4 | Face enrollment (`/face-enrollment`). |
 | 4.1 | AES-256-GCM biometric encryption foundation. |
 | **4.2** | **FaceProfile + FaceEnrollmentSession Mongoose persistence (database-only).** |
+| **4.3** | **Protected Face Service enrollment sample endpoint (`POST /v1/faces/enrollment/sample`).** |
+| **4.4A** | **Next.js server-only FaceServiceClient (typed HTTP client).** |
+| **4.4B1** | **`POST /api/face-id/enrollment/start` (start / reset temporary enrollment session, no biometric data).** |
+| **4.4B2** | **`GET /api/face-id/enrollment/status` (read-only safe status of permanent Face ID + temporary enrollment, no biometric data, no Face Service call, no crypto).** |
+| **4.4C** | **`POST /api/face-id/enrollment/sample` (single-image sample upload: server-only Face Service call, AES-256-GCM encryption, atomic append to temporary session, no finalization).** |
+| 4.4B | Next.js Face ID API routes + enrollment session orchestration. |
 | 5 | Classroom creation and join-by-code+password. |
 | 6 | Attendance session lifecycle. |
 | 7 | Multi-face recognition + temporal confirmation. |

@@ -1,17 +1,16 @@
 # Privacy & Security
 
-> Status: **Phase 4.3** — Face Service operational in local
-> development. PHASE 4.1 introduced AES-256-GCM encryption for biometric
-> vectors. PHASE 4.2 introduced the Mongoose persistence foundation for
-> `face_profiles` and `face_enrollment_sessions`. **PHASE 4.3 adds the
-> protected Face Service enrollment-sample endpoint
-> (`POST /v1/faces/enrollment/sample`)** — server-to-server only, never
-> called from the browser. **No biometric data has been persisted to
-> the production database yet** — PHASE 4.3 ships the endpoint and
-> quality gate only; the Next.js-side enrollment orchestration
-> (sample upload, session finalisation, centroid calculation, re-
-> enrollment, delete Face ID) arrives in PHASE 4.4+. The privacy
-> posture documented here still applies.
+> Status: **Phase 4.4C** — PHASE 4.4A shipped the Next.js server-only
+> `FaceServiceClient`. PHASE 4.4B1 shipped the first Next.js Face ID
+> route — `POST /api/face-id/enrollment/start` — which safely starts a
+> temporary enrollment session for the authenticated user.
+> PHASE 4.4B2 added the read-only status route
+> `GET /api/face-id/enrollment/status`. PHASE 4.4C adds the sample
+> upload route `POST /api/face-id/enrollment/sample`, which accepts
+> one image, forwards it to the Face Service, encrypts accepted
+> embeddings, and persists them encrypted in the temporary enrollment
+> session. **The browser never receives embeddings.** Camera UI,
+> finalization, and re-enrollment belong to later phases.
 
 ## Biometric handling principles
 
@@ -394,6 +393,523 @@ embedding. The existing endpoints remain unchanged:
 These invariants are guarded by unit tests (`/v1/faces/analyze` still
 never contains the string `embedding` in its JSON body).
 
+## Phase 4.4B1 enrollment start route
+
+PHASE 4.4B1 ships the first Next.js Face ID route —
+`POST /api/face-id/enrollment/start`. The route's only job is to
+safely start (or reset) a temporary biometric enrollment session
+for the authenticated user.
+
+### Server-only and biometric-free
+
+The route:
+
+- Lives under `apps/web/src/app/api/face-id/enrollment/start/route.ts`.
+  It is a Next.js Route Handler, run server-side. No Client Component
+  or browser fetch hook is introduced in this mini-phase.
+- Accepts **no** biometric payload. The request body is ignored. No
+  image, no embedding, no encrypted vector enters or leaves this
+  endpoint.
+- Does **not** call the Face Service. Neither
+  `getFaceServiceHealth()` nor `analyzeEnrollmentSample()` is invoked.
+- Does **not** create, replace, or delete a `FaceProfile`.
+
+### Authentication and ownership
+
+- Identity comes exclusively from `session.user.id` (Better Auth
+  server session). The request body's `userId` / `email` fields are
+  ignored.
+- If no session exists → `401 UNAUTHENTICATED`.
+- A malicious body such as `{ "userId": "another-user" }` cannot
+  cause creation of an enrollment session for another account. This
+  invariant is covered by an explicit unit test.
+- If the authenticated user has no Profile, or `onboardingCompleted`
+  is false → `409 PROFILE_INCOMPLETE`. The route never auto-creates a
+  Profile — onboarding is a separate flow.
+- If an active `FaceProfile` already exists → `409
+  FACE_PROFILE_ALREADY_EXISTS`. The existing profile is left
+  untouched. Explicit re-enrollment is implemented in a later
+  mini-phase.
+
+### Session lifetime and reset semantics
+
+- The temporary enrollment session has a server-generated `expiresAt`
+  of `now + 15 minutes`, using the existing PHASE 4.2 helper
+  `DEFAULT_ENROLLMENT_SESSION_TTL_MS` in
+  `apps/web/src/lib/biometrics/enrollment-session-ttl.ts`. The
+  browser cannot choose the expiry.
+- The required sample count is centralized in
+  `apps/web/src/lib/biometrics/biometric-constants.ts` as
+  `DEFAULT_FACE_ENROLLMENT_REQUIRED_SAMPLES = 5`. The literal `5`
+  must not be repeated across call sites.
+- Calling `start` again for a user who already has an unfinished
+  CREATE session **resets** that session in place: `acceptedSamples`
+  is cleared, `expiresAt` is refreshed, model metadata is reset to
+  `undefined`. The unique index on `userId` guarantees at most one
+  enrollment-session document per user at the database layer.
+
+### Response privacy
+
+The route's success body is intentionally minimal:
+
+```json
+{
+  "status": "started",
+  "mode": "create",
+  "acceptedSamples": 0,
+  "requiredSamples": 5,
+  "expiresAt": "2026-09-10T14:30:00.000Z"
+}
+```
+
+It deliberately does **not** include:
+
+- `userId`, `email`, or any other identity-bearing field.
+- encrypted sample vectors (`ciphertext`, `iv`, `authTag`,
+  `keyVersion`).
+- model metadata (`modelIdentity`, `modelName`, `embeddingDimension`,
+  `normalization`).
+- embeddings.
+- any object taken directly from the database row.
+
+A failing response uses the standard project envelope:
+
+```json
+{ "error": { "code": "STRING_CODE", "message": "Human readable." } }
+```
+
+Stable codes include `UNAUTHENTICATED`, `PROFILE_INCOMPLETE`,
+`FACE_PROFILE_ALREADY_EXISTS`, and `ENROLLMENT_START_FAILED`.
+Mongoose / MongoDB / Better Auth internals are never returned.
+
+### What is NOT yet implemented
+
+PHASE 4.4B1 deliberately does NOT implement:
+
+- Sample upload (`POST /api/face-id/enrollment/sample`).
+- Camera access or `getUserMedia`.
+- Embedding extraction, encryption, or persistence.
+- Face Service calls (`/health` or `/v1/faces/enrollment/sample`).
+- Enrollment finalization or `FaceProfile` creation.
+- Re-enrollment / replacement flow.
+- Status endpoint (`GET /api/face-id/enrollment`).
+- Frontend pages, dashboard changes, attendance workflows.
+
+PHASE 4.4B1 ships only the start route and its dedicated tests.
+
+## Phase 4.4B2 enrollment status route
+
+PHASE 4.4B2 adds the read-only status route
+`GET /api/face-id/enrollment/status`. The route's only job is to
+report the safe current state of the authenticated user's Face ID
+enrollment.
+
+### Server-only and biometric-free
+
+The route:
+
+- Lives under `apps/web/src/app/api/face-id/enrollment/status/route.ts`.
+  It is a Next.js Route Handler, run server-side. No Client
+  Component or browser fetch hook is introduced in this
+  mini-phase.
+- Accepts **no** biometric payload. No image, no embedding, no
+  encrypted vector enters or leaves this endpoint.
+- Does **not** call the Face Service. Neither
+  `getFaceServiceHealth()` nor `analyzeEnrollmentSample()` is
+  invoked.
+- Does **not** call the encryption module. The route never
+  decrypts anything; reading status does not require
+  `BIOMETRIC_ENCRYPTION_KEY`.
+- Does **not** create, replace, or delete a `FaceProfile`.
+- May attempt a best-effort cleanup of an expired
+  `FaceEnrollmentSession` document; cleanup failure never
+  surfaces to the browser.
+
+### Authentication and ownership
+
+- Identity comes exclusively from `session.user.id` (Better Auth
+  server session). Query parameters such as `?userId=...` are
+  **ignored** — they cannot influence ownership, response
+  content, or service calls. This invariant is covered by an
+  explicit unit test.
+- If no session exists → `401 UNAUTHENTICATED`.
+- If the authenticated user has no Profile, or
+  `onboardingCompleted` is false → `409 PROFILE_INCOMPLETE`. The
+  route never auto-creates a Profile — onboarding is a separate
+  flow.
+
+### Expired session handling
+
+- The route checks `isEnrollmentSessionExpired(session)` rather
+  than relying on MongoDB TTL deletion. A document with
+  `expiresAt` already in the past may still be present in the
+  collection; the route treats it as expired regardless.
+- On a known-expired session the route attempts a best-effort
+  `deleteEnrollmentSessionByUserId(...)` cleanup. A cleanup
+  failure is **internal-only** — the response still safely
+  reports `enrollment.active = false` and never includes a 5xx
+  error. The route does not log biometric sample contents.
+
+### Response privacy
+
+The route's success body is intentionally minimal:
+
+```json
+{
+  "configured": false,
+  "faceId": null,
+  "enrollment": {
+    "active": false,
+    "mode": null,
+    "acceptedSamples": 0,
+    "requiredSamples": 0,
+    "expiresAt": null
+  }
+}
+```
+
+When the user has a permanent Face ID enrollment, `configured`
+is `true` and a `faceId` block is present:
+
+```json
+{
+  "configured": true,
+  "faceId": {
+    "enrolledAt": "2026-09-01T10:00:00.000Z",
+    "sampleCount": 5
+  },
+  "enrollment": { "...": "..." }
+}
+```
+
+When a temporary enrollment session is in progress
+(`mode` is `"create"` or `"replace"`), the `enrollment` block
+reports:
+
+- `active: true`
+- `mode` — the stored value (`"create"` or `"replace"`)
+- `acceptedSamples` — the LENGTH of the stored
+  `acceptedSamples` array
+- `requiredSamples` — the stored `requiredSampleCount`
+- `expiresAt` — the stored expiry, serialized to ISO 8601
+
+It deliberately does **not** include:
+
+- `userId`, `email`, or any other identity-bearing field.
+- encrypted sample vectors (`ciphertext`, `iv`, `authTag`,
+  `keyVersion`).
+- model metadata (`modelIdentity`, `modelName`,
+  `embeddingDimension`, `normalization`).
+- embeddings.
+- centroids.
+- quality summaries.
+- the actual `acceptedSamples` array (only its length is
+  returned).
+- any object taken directly from the database row.
+
+A failing response uses the standard project envelope:
+
+```json
+{ "error": { "code": "STRING_CODE", "message": "Human readable." } }
+```
+
+Stable codes include `UNAUTHENTICATED`, `PROFILE_INCOMPLETE`,
+and `ENROLLMENT_STATUS_FAILED`. Mongoose / MongoDB / Better Auth
+internals are never returned.
+
+### What is NOT yet implemented
+
+PHASE 4.4B2 deliberately does NOT implement:
+
+- Sample upload (`POST /api/face-id/enrollment/sample`).
+- Camera access or `getUserMedia`.
+- Embedding extraction, encryption, or persistence.
+- Face Service calls (`/health` or `/v1/faces/enrollment/sample`).
+- Encryption / decryption calls (the route never imports the
+  encryption module).
+- Enrollment finalization or `FaceProfile` creation.
+- Re-enrollment / replacement flow.
+- Frontend pages, dashboard changes, attendance workflows.
+
+PHASE 4.4B2 ships only the status route and its dedicated tests.
+
+## Phase 4.4C enrollment sample route
+
+PHASE 4.4C adds the sample upload route
+`POST /api/face-id/enrollment/sample`. The route accepts ONE image
+from the authenticated web client, forwards it to the trusted Face
+Service, and on accepted samples encrypts the embedding with
+AES-256-GCM before persisting it inside the temporary enrollment
+session.
+
+### Server-only and transient
+
+The route:
+
+- Lives under
+  `apps/web/src/app/api/face-id/enrollment/sample/route.ts`. It is a
+  Next.js Route Handler, run server-side. No Client Component or
+  browser fetch hook is introduced in this mini-phase.
+- Does **not** write the uploaded image to disk, MongoDB, Blob
+  storage, `localStorage`, or any public folder. The image stays in
+  request-scoped memory.
+- Accepts **only** `multipart/form-data` with a single `image` field
+  (JPEG, PNG, or WebP; max 1.5 MB). JSON base64, multiple files, and
+  continuous video are not accepted.
+- Uses existing `analyzeEnrollmentSample(...)` through
+  `face-service-client.ts` (server-only). Direct fetch is forbidden.
+- Does **not** create or modify any `FaceProfile`. It only appends
+  encrypted samples to the existing temporary
+  `FaceEnrollmentSession`.
+
+### Authentication and ownership
+
+- Identity comes exclusively from `session.user.id` (Better Auth
+  server session). The request body — including any client-supplied
+  `userId` field — is ignored for identity decisions. This invariant
+  is covered by an explicit unit test.
+- If no session exists → `401 UNAUTHENTICATED`.
+- If the authenticated user has no Profile, or
+  `onboardingCompleted` is false → `409 PROFILE_INCOMPLETE`. The
+  route never auto-creates a Profile.
+- If no active enrollment session exists → `409
+  ENROLLMENT_NOT_STARTED`. The user must call
+  `POST /api/face-id/enrollment/start` explicitly.
+- If the existing session has `expiresAt <= now` → `409
+  ENROLLMENT_EXPIRED`. The route does not auto-create a new session;
+  the user must explicitly call `start` again.
+- If the session mode is not `"create"` → the route rejects the
+  request (replace-mode sessions are not yet implemented in this
+  mini-phase).
+
+### Image validation at the boundary
+
+- File must exist, `size > 0`, `size <= FACE_ENROLLMENT_MAX_SAMPLE_BYTES`
+  (centralized constant set to 1.5 MB).
+- MIME type must be `image/jpeg`, `image/png`, or `image/webp`. Filename
+  extension is not trusted; only the validated `Blob.type` is used.
+- Invalid file / oversized / invalid MIME → `400 INVALID_IMAGE` or
+  `400 IMAGE_TOO_LARGE`. No oversized payload is ever forwarded to the
+  Face Service.
+- Face Service remains authoritative for real image decoding.
+
+### Face Service call
+
+- The route calls existing `analyzeEnrollmentSample(...)` through the
+  PHASE 4.4A server-only `face-service-client.ts`. The
+  `X-Service-Token` is set by the client, never duplicated in the
+  route.
+- No automatic retry. Each request fires exactly one Face Service
+  call. The secret token never appears in responses.
+
+### Face Service error mapping
+
+`FaceServiceClientError` is mapped to safe, stable web-level codes
+without exposing raw fetch/FastAPI errors:
+
+| Face Service domain error | Mapped route code | HTTP |
+| --- | --- | --- |
+| `NO_FACE` | `NO_FACE` (preserved) | 422 |
+| `MULTIPLE_FACES` | `MULTIPLE_FACES` (preserved) | 422 |
+| `FACE_SERVICE_NOT_CONFIGURED` | `FACE_SERVICE_NOT_CONFIGURED` | 502 |
+| `FACE_SERVICE_UNAVAILABLE` | `FACE_SERVICE_UNAVAILABLE` | 502 |
+| `FACE_SERVICE_TIMEOUT` | `FACE_SERVICE_TIMEOUT` | 502 |
+| `FACE_SERVICE_UNAUTHORIZED` | `FACE_SERVICE_UNAUTHORIZED` | 502 |
+| `FACE_SERVICE_INVALID_RESPONSE` | `FACE_SERVICE_INVALID_RESPONSE` | 502 |
+| any other | `FACE_SERVICE_UNAVAILABLE` | 502 |
+
+### Quality rejection handling
+
+- Face Service may return `accepted=false` with one or more
+  rejection codes (`LOW_DETECTION_CONFIDENCE`, `FACE_TOO_SMALL`,
+  `FACE_TOO_LARGE`, `TOO_BLURRY`, `TOO_DARK`, `TOO_BRIGHT`,
+  `FACE_NEAR_EDGE`).
+- This is a normal domain outcome, **not** a server failure.
+- **Nothing is persisted.** No encrypted sample is appended. The
+  accepted-sample count is not incremented.
+- The route returns a safe progress DTO:
+
+  ```json
+  {
+    "accepted": false,
+    "rejectionReasons": ["FACE_TOO_SMALL"],
+    "progress": {
+      "acceptedSamples": 2,
+      "requiredSamples": 5,
+      "complete": false
+    }
+  }
+  ```
+
+- Quality threshold numbers are not returned to the browser.
+
+### Accepted sample handling
+
+For an accepted sample the route:
+
+1. Re-validates the session is still active and below the sample
+   limit.
+2. Determines the deterministic 0-based `sampleIndex = currentCount`.
+3. Validates model compatibility (for samples after the first).
+4. Encrypts the embedding using PHASE 4.1 AES-256-GCM with AAD
+   binding:
+
+   ```ts
+   {
+     userId: session.user.id,
+     modelIdentity: <from Face Service response>,
+     templateVersion: session.templateVersion,
+     vectorType: "sample",
+     sampleIndex
+   }
+   ```
+
+5. Atomically appends the encrypted sample to the session using
+   `appendAcceptedEnrollmentSample(...)`, which uses MongoDB
+   `findOneAndUpdate` with filter conditions to prevent race
+   conditions.
+
+For the **first** accepted sample, model metadata
+(`modelIdentity`, `modelName`, `embeddingDimension`,
+`normalization`) is established at the same time. Subsequent samples
+must match exactly; mismatches return `MODEL_MISMATCH` without
+modifying existing accepted samples.
+
+### Sample limit
+
+- Maximum `requiredSampleCount = 5` samples per session (centralized
+  constant `DEFAULT_FACE_ENROLLMENT_REQUIRED_SAMPLES`).
+- When `currentCount >= requiredSampleCount`, the route returns
+  `ENROLLMENT_SAMPLE_LIMIT_REACHED` without calling the Face Service.
+
+### Concurrency
+
+`appendAcceptedEnrollmentSample(...)` uses MongoDB atomic
+`findOneAndUpdate` with a filter that includes all of the following
+conditions, evaluated atomically by MongoDB:
+
+- `userId` matches the authenticated user.
+- `expiresAt > now` (defense-in-depth — the route already checks
+  this before calling).
+- The session's current `acceptedSamples` length is EXACTLY equal to
+  the caller's `expectedSampleIndex` (enforced via `$expr` + `$eq` +
+  `$size`). This is the **PHASE 4.4C.1** atomic-exact-length guard
+  that prevents duplicate `sampleIndex` values from being persisted
+  when two simultaneous requests both read the same starting state.
+- The session's current `acceptedSamples` length is less than
+  `requiredSampleCount` (enforced via `$expr` + `$lt` + `$size`).
+- For the FIRST sample (caller's `expectedSampleIndex === 0`):
+  `modelIdentity`, `modelName`, `embeddingDimension`, and
+  `normalization` are absent (`$exists: false`), so the FIRST atomic
+  update both initializes model metadata AND appends the encrypted
+  sample.
+- For non-first samples: `modelIdentity`, `modelName`,
+  `embeddingDimension`, and `normalization` match the incoming
+  values exactly.
+
+Two simultaneous accepted-sample requests therefore CANNOT both assign
+the same `sampleIndex` or both exceed the required count. The losing
+request receives a safe `ENROLLMENT_SAMPLE_CONFLICT` (HTTP 409) — a
+stable application-level conflict that the user/browser may
+explicitly retry. The route deliberately does NOT auto-retry, does
+NOT call Face Service again, and does NOT re-encrypt under a
+different `sampleIndex`.
+
+For the first sample, the same atomic `findOneAndUpdate` initializes
+model metadata and appends the encrypted sample in one operation, so
+two simultaneous first-samples cannot establish conflicting model
+identities. The losing first-sample request also returns
+`ENROLLMENT_SAMPLE_CONFLICT`.
+
+The three `sampleIndex` values — the route's AAD field, the
+caller's `expectedSampleIndex` argument, and the persisted
+`acceptedSamples[i].sampleIndex` field — are guaranteed to be
+identical by construction (the route threads one local variable
+through both calls).
+
+### No plaintext embedding persistence
+
+The route may temporarily hold the embedding in server memory while
+calling `encryptBiometricVector(...)`. Before MongoDB persistence it
+is encrypted, and only the encrypted value
+(`ciphertext`/`iv`/`authTag`/`keyVersion`) is passed to the
+persistence layer. A plaintext `number[]` is NEVER passed to
+`appendAcceptedEnrollmentSample(...)`. An explicit unit test asserts
+this against a recognizable fake embedding (`0.123456`).
+
+### Biometric key failure handling
+
+If the encryption key is missing or invalid, the route returns a safe
+`503 BIOMETRIC_ENCRYPTION_UNAVAILABLE` and never persists the sample
+(plaintext or otherwise).
+
+### Response privacy
+
+Success body — accepted sample:
+
+```json
+{
+  "accepted": true,
+  "rejectionReasons": [],
+  "progress": {
+    "acceptedSamples": 1,
+    "requiredSamples": 5,
+    "complete": false
+  }
+}
+```
+
+`complete: true` is reported only when `acceptedSamples >=
+requiredSamples`. It means "enough temporary samples collected"; it
+does NOT mean a `FaceProfile` exists. FaceProfile creation belongs to
+a later phase.
+
+Success body — rejected quality:
+
+```json
+{
+  "accepted": false,
+  "rejectionReasons": ["TOO_BLURRY"],
+  "progress": {
+    "acceptedSamples": 3,
+    "requiredSamples": 5,
+    "complete": false
+  }
+}
+```
+
+These responses deliberately do **not** include:
+
+- `userId`, `email`, or any other identity-bearing field.
+- `embedding`.
+- `ciphertext`, `iv`, `authTag`, `keyVersion`.
+- `modelIdentity`, `modelName`, `embeddingDimension`,
+  `normalization`.
+- The Face Service response is NEVER spread directly into JSON;
+  every field that reaches the wire is explicitly constructed by the
+  route.
+
+Stable codes for this endpoint include `UNAUTHENTICATED`,
+`PROFILE_INCOMPLETE`, `ENROLLMENT_NOT_STARTED`, `ENROLLMENT_EXPIRED`,
+`INVALID_IMAGE`, `IMAGE_TOO_LARGE`, `NO_FACE`, `MULTIPLE_FACES`,
+`FACE_SERVICE_UNAVAILABLE`, `FACE_SERVICE_TIMEOUT`,
+`FACE_SERVICE_NOT_CONFIGURED`, `MODEL_MISMATCH`,
+`ENROLLMENT_SAMPLE_LIMIT_REACHED`, `BIOMETRIC_ENCRYPTION_UNAVAILABLE`,
+and `ENROLLMENT_SAMPLE_FAILED`.
+
+### What is NOT yet implemented
+
+PHASE 4.4C deliberately does NOT implement:
+
+- Camera access or `getUserMedia`.
+- Frontend UI for capturing photos.
+- Embedding-storage on the `FaceProfile` collection.
+- Centroid calculation, finalization, or replacement.
+- Re-enrollment / FaceProfile deletion flows.
+- Attendance workflows.
+
+PHASE 4.4C ships only the sample route and its dedicated tests.
+
 ## Secrets
 
 - All secrets live in environment variables. `.env.example` exists at the
@@ -421,7 +937,7 @@ never contains the string `embedding` in its JSON body).
 | `FACE_SERVICE_URL` | optional (Phase 3+ required) | server |
 | `BIOMETRIC_ENCRYPTION_KEY` | optional (Phase 4.1); required from Phase 4.2 | server |
 
-## Face Service authentication (Phase 3)
+## Face Service authentication (Phase 3 / 4.4A)
 
 - `GET /health` is public — liveness probes do not require credentials.
 - All other endpoints (`/v1/*`) require `X-Service-Token:
@@ -460,6 +976,8 @@ never contains the string `embedding` in its JSON body).
 | Export attendance | Role = `teacher` AND owns the class |
 | Join a class | Role = `student` AND not already a member AND correct class password |
 | Submit enrollment frames | Authenticated AND `user._id = currentUser._id` |
+| Call `POST /api/face-id/enrollment/start` | Authenticated AND completed Profile AND no active `FaceProfile` |
+| Call `GET /api/face-id/enrollment/status` | Authenticated AND completed Profile |
 | Call Face Service `/v1/faces/*` | `X-Service-Token` matches `FACE_SERVICE_SECRET` |
 
 The frontend may hide buttons for clarity, but it is **not** a security

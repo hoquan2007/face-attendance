@@ -26,9 +26,7 @@
  *     MongoDB TTL deletion is asynchronous.
  *
  * This service intentionally does NOT implement:
- *   - adding a face sample
  *   - quality checking
- *   - embedding encryption
  *   - Face Service calls
  *   - finalization
  *
@@ -39,6 +37,7 @@ import { getMongooseConnection } from "@/lib/mongoose";
 import {
   FaceEnrollmentSessionModel,
   type FaceEnrollmentSessionAttrs,
+  type FaceEnrollmentAcceptedSampleDoc,
 } from "@/lib/biometrics/enrollment-session-model";
 import { DEFAULT_ENROLLMENT_SESSION_TTL_MS } from "@/lib/biometrics/enrollment-session-ttl";
 import {
@@ -46,7 +45,8 @@ import {
   BIOMETRIC_PERSISTENCE_ERROR_CODES,
   mapMongoDuplicateKeyErrorForBiometrics,
 } from "@/lib/biometrics/biometric-errors";
-import type { EnrollmentMode } from "@/lib/biometrics/biometric-schema";
+import type { EnrollmentMode, Normalization } from "@/lib/biometrics/biometric-schema";
+import type { EncryptedBiometricValueDoc } from "@/lib/biometrics/biometric-schema";
 
 /**
  * Lazily ensures the Mongoose connection is ready before any model
@@ -186,6 +186,400 @@ export async function deleteEnrollmentSessionByUserId(
   await ensureConnection();
   const result = await FaceEnrollmentSessionModel.deleteOne({ userId }).exec();
   return Boolean(result.deletedCount && result.deletedCount > 0);
+}
+
+/**
+ * Result of an atomic append operation.
+ */
+export interface AppendSampleResult {
+  /** Whether the append was successful */
+  success: boolean;
+  /** New count of accepted samples after the append */
+  newAcceptedCount: number;
+  /** Required sample count from the session */
+  requiredSampleCount: number;
+  /** Whether the enrollment is now complete (accepted >= required) */
+  complete: boolean;
+  /**
+   * Why the operation failed (present when `success` is false).
+   * Enables callers to map to the correct application error code.
+   */
+  reason?: AppendSampleFailureReason;
+}
+
+/**
+ * Failure reason codes for atomic append operations.
+ * These are internal service-layer codes that callers map to
+ * safe application-level error codes.
+ */
+export const APPEND_SAMPLE_FAILURE_REASONS = {
+  SESSION_EXPIRED: "SESSION_EXPIRED",
+  SESSION_NOT_FOUND: "SESSION_NOT_FOUND",
+  SAMPLE_LIMIT_REACHED: "SAMPLE_LIMIT_REACHED",
+  MODEL_MISMATCH: "MODEL_MISMATCH",
+  /** Atomic update failed because another request won the race. */
+  CONFLICT: "CONFLICT",
+} as const;
+
+export type AppendSampleFailureReason =
+  (typeof APPEND_SAMPLE_FAILURE_REASONS)[keyof typeof APPEND_SAMPLE_FAILURE_REASONS];
+
+/**
+ * Input for appending an accepted enrollment sample.
+ *
+ * The caller (route handler) computes `expectedSampleIndex` as the
+ * current `acceptedSamples.length`. The service atomically verifies
+ * that MongoDB's `acceptedSamples` array still has exactly that many
+ * elements before appending, preventing concurrent requests from
+ * assigning the same index.
+ */
+export interface AppendAcceptedEnrollmentSampleInput {
+  /** The user whose session to update */
+  userId: string;
+  /** The encrypted biometric vector to store */
+  encryptedVector: EncryptedBiometricValueDoc;
+  /**
+   * The index the caller expects to be assigned to this sample.
+   * Must equal the current `acceptedSamples.length` at call time.
+   * The atomic update verifies this is still true before appending.
+   */
+  expectedSampleIndex: number;
+  /** Quality metrics (optional) */
+  quality?: FaceSampleQualityDoc;
+  /** Model identity for the first sample (establishes session model) */
+  modelIdentity?: string;
+  /** Model name for the first sample */
+  modelName?: string;
+  /** Embedding dimension for the first sample */
+  embeddingDimension?: number;
+  /** Normalization for the first sample */
+  normalization?: Normalization;
+}
+
+/**
+ * Quality metrics for a face sample.
+ */
+interface FaceSampleQualityDoc {
+  detectionScore?: number;
+  blurScore?: number;
+  brightness?: number;
+  relativeFaceArea?: number;
+}
+
+/**
+ * Atomically appends an accepted enrollment sample to the user's session.
+ *
+ * Concurrency guarantee:
+ *   The atomic filter includes `acceptedSamples.length == expectedSampleIndex`
+ *   as a MongoDB `$expr` condition alongside the existing
+ *   `acceptedSamples.length < requiredSampleCount` upper bound.
+ *
+ *   This means:
+ *   - If request A reads acceptedSamples.length = 0 and request B races,
+ *     B's atomic update will only succeed if MongoDB still has exactly
+ *     0 samples at update time. If A won the race and persisted index 0,
+ *     B's filter fails and the function returns `CONFLICT`.
+ *   - No two concurrent requests can persist the same `sampleIndex`.
+ *   - The index stored in the persisted document is ALWAYS equal to
+ *     `expectedSampleIndex` (not from caller input — enforced by the
+ *     service, not by trusting the input).
+ *
+ * Failure cases:
+ *   - Session not found → SESSION_NOT_FOUND
+ *   - Session expired → SESSION_EXPIRED
+ *   - Sample limit reached → SAMPLE_LIMIT_REACHED
+ *   - Model mismatch (later sample) → MODEL_MISMATCH
+ *   - Atomic filter failed (stale index) → CONFLICT
+ *
+ * The function deliberately does NOT retry after a CONFLICT. The
+ * caller (route handler) returns a safe HTTP 409 response so the
+ * browser/client can decide whether and when to submit a fresh sample.
+ *
+ * @param input The sample data, session identity, and expected index.
+ * @returns Result indicating success/failure and updated counts.
+ * @throws BiometricPersistenceError on unexpected database errors.
+ */
+export async function appendAcceptedEnrollmentSample(
+  input: AppendAcceptedEnrollmentSampleInput,
+): Promise<AppendSampleResult> {
+  await ensureConnection();
+
+  const now = new Date();
+  const { expectedSampleIndex } = input;
+
+  // Defensive pre-check: if the caller computed an obviously wrong index,
+  // reject immediately without hitting the database. This is a sanity
+  // check only — the atomic filter below is the real safety guard.
+  if (expectedSampleIndex < 0) {
+    return {
+      success: false,
+      newAcceptedCount: 0,
+      requiredSampleCount: 5,
+      complete: false,
+      reason: APPEND_SAMPLE_FAILURE_REASONS.CONFLICT,
+    };
+  }
+
+  // Load the session for pre-validation checks.
+  // These are pre-checks only; the atomic filter is the definitive guard.
+  const session = await FaceEnrollmentSessionModel.findOne({ userId: input.userId })
+    .lean<FaceEnrollmentSessionAttrs>()
+    .exec();
+
+  if (!session) {
+    return {
+      success: false,
+      newAcceptedCount: 0,
+      requiredSampleCount: 5,
+      complete: false,
+      reason: APPEND_SAMPLE_FAILURE_REASONS.SESSION_NOT_FOUND,
+    };
+  }
+
+  // Defensive expiration check (MongoDB TTL is asynchronous).
+  if (session.expiresAt.getTime() <= now.getTime()) {
+    return {
+      success: false,
+      newAcceptedCount: session.acceptedSamples.length,
+      requiredSampleCount: session.requiredSampleCount,
+      complete: false,
+      reason: APPEND_SAMPLE_FAILURE_REASONS.SESSION_EXPIRED,
+    };
+  }
+
+  // Pre-check sample limit.
+  const currentCount = session.acceptedSamples.length;
+  if (currentCount >= session.requiredSampleCount) {
+    return {
+      success: false,
+      newAcceptedCount: currentCount,
+      requiredSampleCount: session.requiredSampleCount,
+      complete: true,
+      reason: APPEND_SAMPLE_FAILURE_REASONS.SAMPLE_LIMIT_REACHED,
+    };
+  }
+
+  // Pre-check for stale expected index.
+  // If the caller's expected index is already behind the current count,
+  // another request has already won the race.
+  if (expectedSampleIndex !== currentCount) {
+    return {
+      success: false,
+      newAcceptedCount: currentCount,
+      requiredSampleCount: session.requiredSampleCount,
+      complete: currentCount >= session.requiredSampleCount,
+      reason: APPEND_SAMPLE_FAILURE_REASONS.CONFLICT,
+    };
+  }
+
+  // Detect first sample based on session model metadata absence.
+  const sessionHasModelMetadata = Boolean(
+    session.modelIdentity &&
+      session.modelName &&
+      typeof session.embeddingDimension === "number" &&
+      session.normalization,
+  );
+  const isFirstSample = !sessionHasModelMetadata;
+
+  // For non-first samples, enforce model compatibility before the
+  // atomic update so we can return a stable MODEL_MISMATCH instead
+  // of CONFLICT.
+  if (!isFirstSample) {
+    if (
+      session.modelIdentity !== input.modelIdentity ||
+      session.modelName !== input.modelName ||
+      session.embeddingDimension !== input.embeddingDimension ||
+      session.normalization !== input.normalization
+    ) {
+      return {
+        success: false,
+        newAcceptedCount: currentCount,
+        requiredSampleCount: session.requiredSampleCount,
+        complete: false,
+        reason: APPEND_SAMPLE_FAILURE_REASONS.MODEL_MISMATCH,
+      };
+    }
+  }
+
+  // Build the new sample document.
+  // The sampleIndex stored is ALWAYS expectedSampleIndex — we do NOT
+  // trust the caller to supply a correct index; we derive it from the
+  // atomic filter's length condition.
+  const newSample: FaceEnrollmentAcceptedSampleDoc = {
+    encryptedVector: input.encryptedVector,
+    sampleIndex: expectedSampleIndex,
+    acceptedAt: now,
+  };
+
+  if (input.quality) {
+    newSample.quality = {
+      detectionScore: input.quality.detectionScore,
+      blurScore: input.quality.blurScore,
+      brightness: input.quality.brightness,
+      relativeFaceArea: input.quality.relativeFaceArea,
+    };
+  }
+
+  // Build the update operation.
+  const updateDoc: Record<string, unknown> = {
+    $push: {
+      acceptedSamples: newSample,
+    },
+  };
+
+  // For the first sample, also initialize model metadata in the same
+  // atomic operation.
+  if (isFirstSample) {
+    (updateDoc as Record<string, unknown>).$set = {
+      modelIdentity: input.modelIdentity,
+      modelName: input.modelName,
+      embeddingDimension: input.embeddingDimension,
+      normalization: input.normalization,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // THE ATOMIC FILTER
+  //
+  // Must satisfy ALL of the following conditions atomically:
+  //   1. userId matches
+  //   2. expiresAt is in the future
+  //   3. acceptedSamples.length == expectedSampleIndex  ← prevents duplicate index
+  //   4. acceptedSamples.length < requiredSampleCount   ← enforces sample limit
+  //   5. For first sample: modelIdentity does NOT exist (prevents two
+  //      concurrent first-sample requests from racing)
+  //   6. For later sample: model metadata matches exactly
+  // ---------------------------------------------------------------------------
+  const atomicFilter: Record<string, unknown> = {
+    userId: input.userId,
+    expiresAt: { $gt: now },
+    // THE KEY CONCURRENCY GUARD: both conditions in one $expr.
+    // $expr uses aggregation expressions evaluated at update time, so
+    // MongoDB compares the CURRENT array size against expectedSampleIndex.
+    $expr: {
+      $and: [
+        { $eq: [{ $size: "$acceptedSamples" }, expectedSampleIndex] },
+        { $lt: [{ $size: "$acceptedSamples" }, "$requiredSampleCount"] },
+      ],
+    },
+  };
+
+  if (isFirstSample) {
+    // First sample: require model metadata fields to be absent.
+    // Combined with the $eq condition above, only one request can win
+    // (the one that finds acceptedSamples.length == 0 and no model metadata).
+    atomicFilter.modelIdentity = { $exists: false };
+    atomicFilter.modelName = { $exists: false };
+    atomicFilter.embeddingDimension = { $exists: false };
+    atomicFilter.normalization = { $exists: false };
+  } else {
+    // Later sample: require exact model compatibility.
+    atomicFilter.modelIdentity = input.modelIdentity;
+    atomicFilter.modelName = input.modelName;
+    atomicFilter.embeddingDimension = input.embeddingDimension;
+    atomicFilter.normalization = input.normalization;
+  }
+
+  try {
+    const result = await FaceEnrollmentSessionModel.findOneAndUpdate(
+      atomicFilter,
+      updateDoc,
+      { new: true },
+    )
+      .lean<FaceEnrollmentSessionAttrs>()
+      .exec();
+
+    if (!result) {
+      // Atomic update failed — fetch fresh session to diagnose.
+      const freshSession = await FaceEnrollmentSessionModel.findOne({ userId: input.userId })
+        .lean<FaceEnrollmentSessionAttrs>()
+        .exec();
+
+      if (!freshSession) {
+        return {
+          success: false,
+          newAcceptedCount: 0,
+          requiredSampleCount: 5,
+          complete: false,
+          reason: APPEND_SAMPLE_FAILURE_REASONS.SESSION_NOT_FOUND,
+        };
+      }
+
+      if (freshSession.expiresAt.getTime() <= now.getTime()) {
+        return {
+          success: false,
+          newAcceptedCount: freshSession.acceptedSamples.length,
+          requiredSampleCount: freshSession.requiredSampleCount,
+          complete: false,
+          reason: APPEND_SAMPLE_FAILURE_REASONS.SESSION_EXPIRED,
+        };
+      }
+
+      if (freshSession.acceptedSamples.length >= freshSession.requiredSampleCount) {
+        return {
+          success: false,
+          newAcceptedCount: freshSession.acceptedSamples.length,
+          requiredSampleCount: freshSession.requiredSampleCount,
+          complete: true,
+          reason: APPEND_SAMPLE_FAILURE_REASONS.SAMPLE_LIMIT_REACHED,
+        };
+      }
+
+      if (!isFirstSample) {
+        const freshHasMetadata = Boolean(
+          freshSession.modelIdentity &&
+            freshSession.modelName &&
+            typeof freshSession.embeddingDimension === "number" &&
+            freshSession.normalization,
+        );
+        if (!freshHasMetadata) {
+          // Another request won the first-sample race.
+          return {
+            success: false,
+            newAcceptedCount: freshSession.acceptedSamples.length,
+            requiredSampleCount: freshSession.requiredSampleCount,
+            complete: false,
+            reason: APPEND_SAMPLE_FAILURE_REASONS.CONFLICT,
+          };
+        }
+        // Check if it's a model mismatch.
+        if (
+          freshSession.modelIdentity !== input.modelIdentity ||
+          freshSession.modelName !== input.modelName ||
+          freshSession.embeddingDimension !== input.embeddingDimension ||
+          freshSession.normalization !== input.normalization
+        ) {
+          return {
+            success: false,
+            newAcceptedCount: freshSession.acceptedSamples.length,
+            requiredSampleCount: freshSession.requiredSampleCount,
+            complete: false,
+            reason: APPEND_SAMPLE_FAILURE_REASONS.MODEL_MISMATCH,
+          };
+        }
+      }
+
+      // Stale index — another request appended while this one was pending.
+      return {
+        success: false,
+        newAcceptedCount: freshSession.acceptedSamples.length,
+        requiredSampleCount: freshSession.requiredSampleCount,
+        complete: freshSession.acceptedSamples.length >= freshSession.requiredSampleCount,
+        reason: APPEND_SAMPLE_FAILURE_REASONS.CONFLICT,
+      };
+    }
+
+    const newCount = result.acceptedSamples.length;
+    return {
+      success: true,
+      newAcceptedCount: newCount,
+      requiredSampleCount: result.requiredSampleCount,
+      complete: newCount >= result.requiredSampleCount,
+    };
+  } catch (err) {
+    if (err instanceof BiometricPersistenceError) throw err;
+    throw mapMongoDuplicateKeyErrorForBiometrics(err);
+  }
 }
 
 /**

@@ -43,6 +43,16 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
+      // `import "server-only"` in face-service-client.ts (and other
+      // server-only modules) throws in the real package's default export
+      // when imported from a Client Component. Vitest doesn't understand
+      // the `react-server` export condition that Next.js uses, so we
+      // alias the bare `server-only` specifier to a tiny no-op stub
+      // inside the test runner ONLY. Production `next build` is
+      // unaffected — it resolves the real package via its exports map.
+      "server-only": fileURLToPath(
+        new URL("./tests/stubs/server-only.ts", import.meta.url),
+      ),
     },
   },
   test: {

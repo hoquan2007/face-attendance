@@ -1,12 +1,17 @@
 # Database
 
-> Status: **Phase 4.2** — Better Auth collections are live in MongoDB
+> Status: **Phase 4.4C** — Better Auth collections are live in MongoDB
 > Atlas under the `face_attendance` database. The application `profiles`
-> collection (Phase 2) is managed by Mongoose. PHASE 4.2 introduces the
-> **`face_profiles`** and **`face_enrollment_sessions`** collections as
-> the persistence foundation for face enrollment. **No real biometric
-> enrollment flow exists yet**; PHASE 4.3+ will wire the camera capture,
-> quality gate, embedding extraction, and enrollment finalization.
+> collection (Phase 2) is managed by Mongoose. PHASE 4.2 introduced
+> the **`face_profiles`** and **`face_enrollment_sessions`** collections
+> as the persistence foundation for face enrollment. PHASE 4.4C
+> extends `face_enrollment_sessions` with an atomic
+> `appendAcceptedEnrollmentSample(...)` operation that stores
+> encrypted samples received from the sample upload route.
+> No real biometric flow exists yet at the camera level — PHASE 4.4C
+> only adds the server-side orchestration for accepting one image at a
+> time. FaceProfile creation, finalization, and re-enrollment belong to
+> later phases.
 
 The web app talks to **MongoDB Atlas**. Authentication data is owned
 entirely by Better Auth; business data is modeled with **Mongoose** starting
