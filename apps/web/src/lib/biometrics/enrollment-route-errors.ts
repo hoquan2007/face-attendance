@@ -94,6 +94,13 @@ export const ENROLLMENT_ROUTE_ERROR_CODES = {
   ENROLLMENT_START_FAILED: "ENROLLMENT_START_FAILED",
   ENROLLMENT_STATUS_FAILED: "ENROLLMENT_STATUS_FAILED",
   ENROLLMENT_SAMPLE_FAILED: "ENROLLMENT_SAMPLE_FAILED",
+
+  // PHASE 4.6B2A — atomic finalization claim protection. Surfaced
+  // to the browser as a safe, transient, non-biometric error. The
+  // friendly copy later is "Face setup is finishing. Try again
+  // shortly."
+  ENROLLMENT_FINALIZATION_IN_PROGRESS:
+    "ENROLLMENT_FINALIZATION_IN_PROGRESS",
 } as const;
 
 export type EnrollmentRouteErrorCode =
@@ -157,6 +164,20 @@ export function mapEnrollmentStartError(err: unknown): EnrollmentRouteError {
         code: ENROLLMENT_ROUTE_ERROR_CODES.FACE_PROFILE_ALREADY_EXISTS,
         message:
           "A face profile already exists for this account. Re-enrollment is not supported yet.",
+      });
+    }
+    // PHASE 4.6B2A — claim protection. The server MUST NOT replace
+    // an active finalization generation. Surface a safe
+    // transient-state error so the browser can retry shortly.
+    if (
+      err.code ===
+      BIOMETRIC_PERSISTENCE_ERROR_CODES.ENROLLMENT_FINALIZATION_IN_PROGRESS
+    ) {
+      return new EnrollmentRouteError({
+        code: ENROLLMENT_ROUTE_ERROR_CODES
+          .ENROLLMENT_FINALIZATION_IN_PROGRESS,
+        message:
+          "Face setup is finishing. Try again shortly.",
       });
     }
     return new EnrollmentRouteError({

@@ -166,6 +166,7 @@ Stable codes for this endpoint:
 | `UNAUTHENTICATED` | 401 | No valid Better Auth server session. |
 | `PROFILE_INCOMPLETE` | 409 | Authenticated user has no Profile, or `onboardingCompleted` is false. The route does not auto-create a Profile. |
 | `FACE_PROFILE_ALREADY_EXISTS` | 409 | Authenticated user already has an active `FaceProfile`. PHASE 4.4B1 blocks new enrollments in this state. |
+| `ENROLLMENT_FINALIZATION_IN_PROGRESS` | 409 | PHASE 4.6B2A — an active finalization claim is held by the in-progress B2B orchestrator. The route refuses to replace the claimed generation. The browser may retry shortly. The response never includes the claim token, generationId, or any Mongo detail. |
 | `ENROLLMENT_START_FAILED` | 500 | Persistence failure during create-or-reset. Mongoose / MongoDB internals are never returned. |
 
 ### `GET /api/face-id/enrollment/status` (PHASE 4.4B2)

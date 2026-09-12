@@ -52,6 +52,15 @@ import {
  * backfilled lazily (atomically) for legacy documents created by
  * earlier PHASE 4.x code that pre-dates this field. See
  * `enrollment-session-service.ts` for the backfill contract.
+ *
+ * `finalizationClaim` is the PHASE 4.6B2A atomic completion claim.
+ * It is OPTIONAL — existing sessions without the field remain
+ * valid. When present it ties a B1B-finalized snapshot to an exact
+ * (userId, generationId) pair so future PHASE 4.6B2B persistence
+ * can only proceed while the generation is still the generation
+ * that was finalized. The claim is server-only; it is never
+ * exposed to the browser, never persisted outside the temporary
+ * `FaceRegistrationSession`, and never logged.
  */
 export interface FaceEnrollmentSessionAttrs {
   userId: string;
@@ -65,8 +74,37 @@ export interface FaceEnrollmentSessionAttrs {
   acceptedSamples: FaceEnrollmentAcceptedSampleDoc[];
   expiresAt: Date;
   generationId: string;
+  finalizationClaim?: FaceEnrollmentFinalizationClaimDoc;
   createdAt: Date;
   updatedAt: Date;
+}
+
+/**
+ * Atomic completion claim (PHASE 4.6B2A).
+ *
+ * The claim is the single piece of state that lets future PHASE
+ * 4.6B2B persistence safely encrypt and write a `FaceProfile` for
+ * exactly the generation that B1B finalized.
+ *
+ * Properties:
+ *   - `token` is server-generated, opaque, and cryptographically
+ *     random (`node:crypto` `randomUUID()`). The browser MUST NOT
+ *     supply it.
+ *   - `generationId` is the generation the claim is bound to. It
+ *     MUST equal the active session's `generationId`. Resetting the
+ *     session invalidates any active claim.
+ *   - `claimedAt` is the wall-clock time the claim was installed.
+ *
+ * The claim is OPTIONAL on the document. There is intentionally NO
+ * unique index on `token`, no independent claim timeout, no lease,
+ * no heartbeat, and no background cleanup. The claim lives only on
+ * the temporary `FaceRegistrationSession`; the session's existing
+ * `expiresAt` TTL remains the lifecycle boundary.
+ */
+export interface FaceEnrollmentFinalizationClaimDoc {
+  token: string;
+  generationId: string;
+  claimedAt: Date;
 }
 
 /**
@@ -193,6 +231,36 @@ const FaceEnrollmentSessionSchema = new Schema<FaceEnrollmentSessionAttrs>(
       // remains the unique ownership index, and a generationId is
       // only meaningful in the context of a specific user's session.
       minlength: [1, "generationId must be a non-empty string."],
+    },
+    // PHASE 4.6B2A — atomic completion claim. OPTIONAL on the
+    // document so legacy / pre-B2A sessions remain valid. The
+    // claim is server-only; it is never returned through any
+    // browser-visible DTO. There is intentionally NO unique index
+    // on `token`, no independent expiry, and no background lease.
+    finalizationClaim: {
+      type: new Schema<FaceEnrollmentFinalizationClaimDoc>(
+        {
+          token: {
+            type: String,
+            required: true,
+            minlength: [1, "finalizationClaim.token must be a non-empty string."],
+          },
+          generationId: {
+            type: String,
+            required: true,
+            minlength: [1, "finalizationClaim.generationId must be a non-empty string."],
+          },
+          claimedAt: {
+            type: Date,
+            required: true,
+          },
+        },
+        {
+          _id: false,
+        },
+      ),
+      required: false,
+      default: undefined,
     },
   },
   {

@@ -99,12 +99,22 @@ interface EnrollmentStartErrorBody {
  * - FACE_PROFILE_ALREADY_EXISTS → 409 (resource-state conflict — the
  *                                server refuses to start a new
  *                                enrollment while one is active)
+ * - ENROLLMENT_FINALIZATION_IN_PROGRESS → 409 (resource-state
+ *                                conflict — PHASE 4.6B2A atomic
+ *                                claim protection; the browser
+ *                                should retry shortly)
  * - any other code             → 500
  */
 function httpStatusForCode(code: string): number {
   if (code === ENROLLMENT_ROUTE_ERROR_CODES.UNAUTHENTICATED) return 401;
   if (code === ENROLLMENT_ROUTE_ERROR_CODES.PROFILE_INCOMPLETE) return 409;
   if (code === ENROLLMENT_ROUTE_ERROR_CODES.FACE_PROFILE_ALREADY_EXISTS) {
+    return 409;
+  }
+  if (
+    code ===
+    ENROLLMENT_ROUTE_ERROR_CODES.ENROLLMENT_FINALIZATION_IN_PROGRESS
+  ) {
     return 409;
   }
   return 500;

@@ -190,7 +190,7 @@ export interface CreateOrResetEnrollmentSessionInput {
  * Atomically creates (or resets) the enrollment session for the given
  * Better Auth user.
  *
- * Reset semantics:
+ * Reset semantics (PHASE 4.6B2A):
  *   - `acceptedSamples` is cleared to `[]`.
  *   - `mode`, `requiredSampleCount`, `templateVersion`, `expiresAt`
  *     are refreshed to the supplied values.
@@ -198,6 +198,17 @@ export interface CreateOrResetEnrollmentSessionInput {
  *     `normalization` are reset to `undefined` because no sample has
  *     been processed yet.
  *   - `generationId` is freshly regenerated (a new server-side UUID).
+ *   - `finalizationClaim` is cleared (PHASE 4.6B2A).
+ *
+ * Claim protection (PHASE 4.6B2A):
+ *   - While an ACTIVE unexpired session carries a `finalizationClaim`,
+ *     `createOrResetEnrollmentSession` MUST NOT replace the
+ *     generation, samples, expiry, model metadata, or claim. It
+ *     rejects with `ENROLLMENT_FINALIZATION_IN_PROGRESS`.
+ *   - The check is enforced atomically by the conditional MongoDB
+ *     filter; an unprotected read → check → write path is NOT used.
+ *   - An expired session is treated as inactive — the claim does
+ *     NOT extend the session TTL.
  *
  * This function deliberately does NOT touch any existing FaceProfile.
  * Replacement behavior (revoking the previous FaceProfile) belongs to
@@ -222,8 +233,27 @@ export async function createOrResetEnrollmentSession(
   )();
 
   try {
+    // -------------------------------------------------------------------------
+    // PHASE 4.6B2A — atomic claim protection.
+    //
+    // The filter proves that the existing session, if any, is NOT
+    // currently locked by an active finalization claim. MongoDB
+    // evaluates this condition atomically — no read → check → write.
+    //
+    //   - Document missing → upsert path proceeds (no existing claim).
+    //   - Document present, claim absent → reset proceeds.
+    //   - Document present, claim present → CAS misses, returns null,
+    //     and we surface ENROLLMENT_FINALIZATION_IN_PROGRESS below.
+    //
+    // `finalizationClaim: { $exists: false }` matches BOTH documents
+    // without the field AND documents where it has been explicitly
+    // cleared.
+    // -------------------------------------------------------------------------
     const doc = await FaceEnrollmentSessionModel.findOneAndUpdate(
-      { userId: input.userId },
+      {
+        userId: input.userId,
+        finalizationClaim: { $exists: false },
+      },
       {
         $set: {
           mode: input.mode,
@@ -239,6 +269,10 @@ export async function createOrResetEnrollmentSession(
           modelName: undefined,
           embeddingDimension: undefined,
           normalization: undefined,
+          // PHASE 4.6B2A — explicitly clear any previous claim. The
+          // filter above already guarantees no claim was present, but
+          // $set ensures the field is omitted from the persisted doc.
+          finalizationClaim: undefined,
         },
         $setOnInsert: {
           userId: input.userId,
@@ -256,6 +290,21 @@ export async function createOrResetEnrollmentSession(
       .exec();
 
     if (!doc) {
+      // Either an unexpected infrastructure failure OR the session
+      // held an active claim. We do a controlled, server-side
+      // diagnostic re-read to distinguish the two.
+      const fresh = await FaceEnrollmentSessionModel.findOne({
+        userId: input.userId,
+      })
+        .lean<FaceEnrollmentSessionAttrs>()
+        .exec();
+      if (fresh && fresh.finalizationClaim) {
+        throw new BiometricPersistenceError({
+          code: BIOMETRIC_PERSISTENCE_ERROR_CODES.ENROLLMENT_FINALIZATION_IN_PROGRESS,
+          message:
+            "Enrollment finalization is in progress; the session cannot be reset.",
+        });
+      }
       throw new BiometricPersistenceError({
         code: BIOMETRIC_PERSISTENCE_ERROR_CODES.UNKNOWN_ERROR,
         message: "Failed to create enrollment session.",

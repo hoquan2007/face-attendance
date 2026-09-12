@@ -1,6 +1,6 @@
 # Database
 
-> Status: **Phase 4.4C** — Better Auth collections are live in MongoDB
+> Status: **Phase 4.6B2A** — Better Auth collections are live in MongoDB
 > Atlas under the `face_attendance` database. The application `profiles`
 > collection (Phase 2) is managed by Mongoose. PHASE 4.2 introduced
 > the **`face_profiles`** and **`face_enrollment_sessions`** collections
@@ -8,10 +8,13 @@
 > extends `face_enrollment_sessions` with an atomic
 > `appendAcceptedEnrollmentSample(...)` operation that stores
 > encrypted samples received from the sample upload route.
-> No real biometric flow exists yet at the camera level — PHASE 4.4C
-> only adds the server-side orchestration for accepting one image at a
-> time. FaceProfile creation, finalization, and re-enrollment belong to
-> later phases.
+> PHASE 4.6B2A extends `face_enrollment_sessions` with an OPTIONAL
+> `finalizationClaim` embedded field (`token`, `generationId`,
+> `claimedAt`) — the atomic completion claim that ties the B1B
+> finalized snapshot to an exact enrollment generation. The claim is
+> server-only, has no independent expiry, and does NOT change the
+> existing session TTL. `FaceProfile` is still NOT persisted in B2A.
+> No real biometric flow exists yet at the camera level.
 
 The web app talks to **MongoDB Atlas**. Authentication data is owned
 entirely by Better Auth; business data is modeled with **Mongoose** starting
@@ -203,11 +206,56 @@ memory between camera captures.
 
 - Same as `face_profiles`: only encrypted vectors and non-identifying
   quality metadata are stored.
+- PHASE 4.6B2A adds an OPTIONAL embedded `finalizationClaim`
+  block (see below). The claim is server-only — it is NEVER
+  serialized into any browser-facing DTO.
 
 `face_profiles` will carry an `engineMetadata` block per enrollment
 (engine name, library version, model name, model identity, provider,
 embedding dimension) so that the web app can guarantee the matcher
 never compares embeddings produced by incompatible models.
+
+### `face_enrollment_sessions.finalizationClaim` (PHASE 4.6B2A)
+
+OPTIONAL embedded sub-document. Present only while a B2B
+finalizer holds an active atomic completion claim. Absent means
+the session is free to be reset or to be claimed by a future
+finalizer.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `token` | string | Server-generated v4 UUID (`node:crypto` `randomUUID()`). Opaque, server-only, never logged, never sent to the browser, never sent to the Face Service. |
+| `generationId` | string | Echoes the active session's `generationId`. |
+| `claimedAt` | Date | Wall-clock install time. |
+
+**Indexes**
+
+- No index is added on `token` — the unique ownership index
+  remains `userId`. Adding a global unique index on a token that
+  is only consumed locally by B2B would be a global write
+  bottleneck.
+
+**Atomic guarantees**
+
+- `claimEnrollmentSessionForFinalization(...)` performs a single
+  `findOneAndUpdate` that succeeds ONLY when the document's
+  `userId`, `generationId`, `expiresAt > now`, `mode`,
+  `templateVersion`, `normalization`, `$size(acceptedSamples)
+  == requiredSampleCount`, AND `finalizationClaim` is absent all
+  match.
+- `releaseEnrollmentFinalizationClaim(...)` performs a single
+  `findOneAndUpdate` that succeeds ONLY when `userId`,
+  `generationId`, AND `finalizationClaim.token` all match.
+- `createOrResetEnrollmentSession(...)` is guarded atomically —
+  the conditional filter requires `finalizationClaim: { $exists:
+  false }`. While a claim is present, the reset rejects with
+  `ENROLLMENT_FINALIZATION_IN_PROGRESS`.
+
+**No claim expiry in B2A**
+
+There is intentionally NO `claimExpiresAt`, NO automatic release,
+NO `setTimeout`, NO background cleanup job. The existing session
+`expiresAt` TTL remains the lifecycle boundary.
 
 ## Separation of concerns
 

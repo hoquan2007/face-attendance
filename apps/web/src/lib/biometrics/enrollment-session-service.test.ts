@@ -87,7 +87,7 @@ const mockFindOne = vi.fn((filter: { userId: string }) => ({
 
 const mockFindOneAndUpdate = vi.fn(
   (
-    filter: { userId: string },
+    filter: { userId: string; [k: string]: unknown },
     update: {
       $set?: Partial<FaceEnrollmentSessionAttrs>;
       $setOnInsert?: Partial<FaceEnrollmentSessionAttrs>;
@@ -95,8 +95,31 @@ const mockFindOneAndUpdate = vi.fn(
     },
     options: { upsert?: boolean; new?: boolean } = {},
   ) => {
-    const existing = sessionStore.get(filter.userId);
+    const existing = sessionStore.get(filter.userId) as
+      | (FaceEnrollmentSessionAttrs & { finalizationClaim?: unknown })
+      | undefined;
     const now = new Date();
+
+    // PHASE 4.6B2A — honor atomic claim-protection filter.
+    // If the filter requires finalizationClaim absent AND the existing
+    // session carries a claim, the CAS must miss. Returning null forces
+    // the service to perform its diagnostic re-read and surface
+    // ENROLLMENT_FINALIZATION_IN_PROGRESS.
+    const claimMustBeAbsent =
+      filter.finalizationClaim &&
+      typeof filter.finalizationClaim === "object" &&
+      "$exists" in (filter.finalizationClaim as Record<string, unknown>) &&
+      (filter.finalizationClaim as { $exists?: unknown }).$exists === false;
+    const sessionHasClaim =
+      existing !== undefined && existing.finalizationClaim !== undefined;
+    if (claimMustBeAbsent && sessionHasClaim) {
+      return {
+        lean: () => ({
+          exec: async () => null,
+        }),
+      };
+    }
+
     if (existing) {
       // $set fields
       if (update.$set) {
@@ -490,7 +513,9 @@ describe("enrollment-session-service / appendAcceptedEnrollmentSample", () => {
       (filter: { userId: string }) => ({
         lean: () => ({
           exec: async () => {
-            const existing = sessionStore.get(filter.userId);
+            const existing = sessionStore.get(filter.userId) as
+              | (FaceEnrollmentSessionAttrs & { finalizationClaim?: unknown })
+              | undefined;
             return existing ? { ...existing } : null;
           },
         }),
@@ -498,7 +523,7 @@ describe("enrollment-session-service / appendAcceptedEnrollmentSample", () => {
     );
     mockFindOneAndUpdate.mockImplementation(
       (
-        filter: { userId: string },
+        filter: { userId: string; [k: string]: unknown },
         update: {
           $set?: Partial<FaceEnrollmentSessionAttrs>;
           $setOnInsert?: Partial<FaceEnrollmentSessionAttrs>;
@@ -506,8 +531,27 @@ describe("enrollment-session-service / appendAcceptedEnrollmentSample", () => {
         },
         options: { upsert?: boolean; new?: boolean } = {},
       ) => {
-        const existing = sessionStore.get(filter.userId);
+        const existing = sessionStore.get(filter.userId) as
+          | (FaceEnrollmentSessionAttrs & { finalizationClaim?: unknown })
+          | undefined;
         const now = new Date();
+
+        // PHASE 4.6B2A — honor atomic claim-protection filter.
+        const claimMustBeAbsent =
+          filter.finalizationClaim &&
+          typeof filter.finalizationClaim === "object" &&
+          "$exists" in (filter.finalizationClaim as Record<string, unknown>) &&
+          (filter.finalizationClaim as { $exists?: unknown }).$exists === false;
+        const sessionHasClaim =
+          existing !== undefined && existing.finalizationClaim !== undefined;
+        if (claimMustBeAbsent && sessionHasClaim) {
+          return {
+            lean: () => ({
+              exec: async () => null,
+            }),
+          };
+        }
+
         if (existing) {
           if (update.$set) {
             Object.assign(existing, update.$set);
@@ -1627,7 +1671,7 @@ describe("enrollment-session-service / getEnrollmentSessionByUserId — legacy b
     );
     mockFindOneAndUpdate.mockImplementation(
       (
-        filter: { userId: string },
+        filter: { userId: string; [k: string]: unknown },
         update: {
           $set?: Partial<FaceEnrollmentSessionAttrs>;
           $setOnInsert?: Partial<FaceEnrollmentSessionAttrs>;
@@ -1635,8 +1679,27 @@ describe("enrollment-session-service / getEnrollmentSessionByUserId — legacy b
         },
         options: { upsert?: boolean; new?: boolean } = {},
       ) => {
-        const existing = sessionStore.get(filter.userId);
+        const existing = sessionStore.get(filter.userId) as
+          | (FaceEnrollmentSessionAttrs & { finalizationClaim?: unknown })
+          | undefined;
         const now = new Date();
+
+        // PHASE 4.6B2A — honor atomic claim-protection filter.
+        const claimMustBeAbsent =
+          filter.finalizationClaim &&
+          typeof filter.finalizationClaim === "object" &&
+          "$exists" in (filter.finalizationClaim as Record<string, unknown>) &&
+          (filter.finalizationClaim as { $exists?: unknown }).$exists === false;
+        const sessionHasClaim =
+          existing !== undefined && existing.finalizationClaim !== undefined;
+        if (claimMustBeAbsent && sessionHasClaim) {
+          return {
+            lean: () => ({
+              exec: async () => null,
+            }),
+          };
+        }
+
         if (existing) {
           if (update.$set) {
             Object.assign(existing, update.$set);

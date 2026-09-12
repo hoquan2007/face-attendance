@@ -1781,6 +1781,114 @@ the lifetime of the call; a best-effort wipe happens in a
 - No `console.log` of biometric data
 - No filesystem write of biometric data
 
+## Phase 4.6B2A atomic finalization claim (server-only)
+
+PHASE 4.6B2A ships a single, focused persistence primitive that
+closes the small race between PHASE 4.6B1B's post-finalize recheck
+and the future PHASE 4.6B2B FaceProfile persistence. The race
+exists because B1B performs:
+
+```
+load generation A → decrypt → Face Service finalize → re-read → return centroid
+```
+
+but a reset could theoretically occur AFTER the re-read and BEFORE
+future persistence. The atomic claim ties future B2B persistence
+to the exact (userId, generationId) pair that B1B just finalized.
+
+### What the claim is
+
+The temporary `FaceEnrollmentSession` document gains an OPTIONAL
+embedded field:
+
+```ts
+finalizationClaim?: {
+  token: string         // server-generated UUID
+  generationId: string  // the active session's generationId
+  claimedAt: Date        // wall-clock install time
+}
+```
+
+The field is OPTIONAL so legacy / pre-B2A sessions remain valid
+without it. There is intentionally **no** unique index on `token`,
+no independent expiry, no lease, no heartbeat, no background
+cleanup job, no `setTimeout` release. The claim lives only on the
+temporary `FaceEnrollmentSession`; the session's existing
+`expiresAt` TTL remains the lifecycle boundary.
+
+### Atomic claim acquisition
+
+A single new server-only service operation,
+`claimEnrollmentSessionForFinalization(...)`, lives in
+`apps/web/src/lib/biometrics/enrollment-finalization-claim-service.ts`.
+
+```
+input:  { userId, generationId }
+output: { userId, generationId, claimToken, claimedAt }
+```
+
+The MongoDB filter is a **single** atomic `findOneAndUpdate`
+that requires ALL of:
+
+- `userId === input.userId`
+- `generationId === input.generationId`
+- `expiresAt > now` — defense-in-depth expiration guard
+- `mode` is in the supported set (today only `create`)
+- `templateVersion` is in the supported set
+- `normalization` is in the supported set (today only `l2`)
+- `finalizationClaim` is absent
+- `$expr: { $eq: [ { $size: "$acceptedSamples" }, "$requiredSampleCount" ] }`
+
+No read → check → write path. No in-memory lock. The CAS is the
+ONLY claim acquisition path.
+
+### Conditional release
+
+A second operation,
+`releaseEnrollmentFinalizationClaim(...)`, atomically clears the
+claim ONLY when ALL of `userId`, `generationId`, and `claimToken`
+match. A wrong token / wrong generation / wrong userId never clears
+another finalizer's claim. The function is idempotent and never
+throws raw Mongo errors.
+
+### Reset / start protection
+
+While an ACTIVE unexpired session carries a `finalizationClaim`,
+`createOrResetEnrollmentSession(...)` MUST NOT replace the
+generation, samples, expiry, model metadata, or claim. It rejects
+with `ENROLLMENT_FINALIZATION_IN_PROGRESS`. The check is enforced
+atomically by the conditional `findOneAndUpdate` filter — no
+read → check → write fallback is used. The minimal start-route /
+start-action mapping surfaces the safe code as
+`ENROLLMENT_FINALIZATION_IN_PROGRESS` (HTTP 409) with friendly
+"Face setup is finishing. Try again shortly." copy. No `claimToken`,
+`generationId`, or Mongo detail is exposed.
+
+### Privacy posture
+
+The claim token is server-only. It is NEVER:
+
+- logged,
+- sent to the Face Service,
+- sent to the browser,
+- persisted anywhere except the temporary session claim,
+- placed in cookies,
+- put in URLs,
+- written to `localStorage` / `sessionStorage` / IndexedDB.
+
+The browser-visible status DTO, `/face-id`, `/face-id/setup`, and
+start responses never include `finalizationClaim` or `claimToken`.
+
+### What B2A does NOT do
+
+- No `FaceProfile` persistence.
+- No centroid encryption.
+- No deletion of successful enrollment sessions.
+- No finalize API route or UI.
+- No claim expiry / lease / heartbeat / background job.
+- No automatic retry on a CAS loss.
+- No reset while a claim is active.
+
 ## Phase plan
 
 | Phase | Goal |
@@ -1809,6 +1917,7 @@ the lifetime of the call; a best-effort wipe happens in a
 | **4.6A2** | **Protected finalization endpoint (`POST /v1/faces/enrollment/finalize`): receives already-decrypted, already-L2-normalized embeddings from trusted Next.js server, validates model compatibility, runs pairwise consistency check, returns centroid on success. X-Service-Token protected. No MongoDB, no decryption, no persistence.** |
 | **4.6B1A** | **Server-only Next.js finalization client (`finalizeFaceEnrollment` in `face-service-client.ts`): one focused function extending the existing PHASE 4.4A server-only client. Calls `POST /v1/faces/enrollment/finalize`, validates request shape and returned centroid, preserves upstream domain codes. Server-only, no MongoDB, no decryption, no persistence. Stops at the client abstraction.** |
 | **4.6B1B** | **Server-only Next.js finalization orchestration (`finalizeEnrollmentSessionForUser` in `enrollment-finalization-service.ts`): loads the current `FaceEnrollmentSession` through the existing PHASE 4.5B4.3 read service, validates the session, reconstructs the exact PHASE 4.1 AAD for each encrypted sample, decrypts server-side using the existing AES-256-GCM utility, validates plaintext vectors, calls the B1A client exactly once, re-checks the enrollment generation after the response. No `FaceProfile` persistence, no temporary-session deletion, no Next.js route / UI. Documents that PHASE 4.6B2 must still atomically verify generationId when persisting.** |
+| **4.6B2A** | **Atomic completion claim on `FaceEnrollmentSession`: OPTIONAL `finalizationClaim` field (`token`, `generationId`, `claimedAt`). Server-only `claimEnrollmentSessionForFinalization` and `releaseEnrollmentFinalizationClaim` service operations. Single atomic `findOneAndUpdate` per claim action — no read → check → write. Generation-bound (CAS verifies `generationId`). Complete-bound (CAS verifies `$size(acceptedSamples) == requiredSampleCount`). Expiry-bound (CAS verifies `expiresAt > now`). `createOrResetEnrollmentSession` is guarded atomically — start/reset while a claim is active returns `ENROLLMENT_FINALIZATION_IN_PROGRESS`. Claim token is `node:crypto randomUUID()`, server-only, never sent to browser or Face Service, never logged. No claim expiry / lease / heartbeat / setTimeout / background cleanup in B2A — the existing session TTL remains the lifecycle boundary. No `FaceProfile` persistence, no encryption of centroid, no finalize API/UI.** |
 | 4.4B | Next.js Face ID API routes + enrollment session orchestration. |
 | 5 | Classroom creation and join-by-code+password. |
 | 6 | Attendance session lifecycle. |
