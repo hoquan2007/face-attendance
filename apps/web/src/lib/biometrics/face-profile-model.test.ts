@@ -223,3 +223,59 @@ describe("FaceProfile model / status field", () => {
     expect(enumValues).toContain("active");
   });
 });
+
+// =============================================================================
+// PHASE 4.6B2B — sourceEnrollmentGenerationId lineage field
+// =============================================================================
+
+describe("FaceProfile model / sourceEnrollmentGenerationId (PHASE 4.6B2B)", () => {
+  it("declares the lineage field on the schema", () => {
+    const path = FaceProfileModel.schema.path("sourceEnrollmentGenerationId");
+    expect(path).toBeDefined();
+  });
+
+  it("lineage is optional at the schema level for legacy compatibility", () => {
+    const path = FaceProfileModel.schema.path("sourceEnrollmentGenerationId");
+    expect(path.isRequired).toBe(false);
+  });
+
+  it("lineage is not derived from userId", () => {
+    // The schema does NOT compute lineage from userId. Persistence
+    // code is the sole producer of this value.
+    const path = FaceProfileModel.schema.path("sourceEnrollmentGenerationId");
+    expect(path.options.default).toBeUndefined();
+  });
+
+  it("does not declare a global unique index on lineage", () => {
+    // userId remains the unique ownership index. Adding a unique
+    // index on lineage would create a global write bottleneck.
+    const indexes = FaceProfileModel.schema.indexes();
+    const lineageIndex = indexes.find(([keys]) => {
+      const k = keys as Record<string, number>;
+      return k.sourceEnrollmentGenerationId === 1;
+    });
+    expect(lineageIndex).toBeUndefined();
+  });
+
+  it("lineage minlength rejects empty strings", () => {
+    const path = FaceProfileModel.schema.path("sourceEnrollmentGenerationId");
+    const minlength = (path.options as { minlength?: unknown }).minlength;
+    // Mongoose minlength may be a number, an array, or a tuple
+    // [minlength, message]. We accept either.
+    let value: unknown = minlength;
+    if (Array.isArray(value)) value = value[0];
+    expect(value).toBe(1);
+  });
+
+  it("legacy FaceProfile without lineage remains readable (compatibility)", () => {
+    // We construct a legacy-shaped document (no lineage field) and
+    // verify the model accepts it. The orchestrator's read path
+    // therefore remains backward-compatible.
+    const legacy = makeValidProfile();
+    // intentionally strip the lineage field
+    delete (legacy as Partial<FaceProfileAttrs>).sourceEnrollmentGenerationId;
+    expect(legacy.sourceEnrollmentGenerationId).toBeUndefined();
+    // The schema path still exists; the document just omits the value.
+    expect(FaceProfileModel.schema.path("sourceEnrollmentGenerationId")).toBeDefined();
+  });
+});

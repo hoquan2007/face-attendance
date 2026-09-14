@@ -51,6 +51,21 @@ export type FaceProfileStatus = (typeof FACE_PROFILE_STATUSES)[number];
  *
  * Aggregated quality summary fields are optional because the enrollment
  * pipeline fills them in only when enough samples are available.
+ *
+ * PHASE 4.6B2B — `sourceEnrollmentGenerationId` records which temporary
+ * `FaceEnrollmentSession` generation created this FaceProfile. It is a
+ * server-internal lineage marker used for:
+ *   - idempotent persistence of the same finalization generation,
+ *   - safe recovery when the B2B process crashes between FaceProfile
+ *     persistence and the B2C session cleanup,
+ *   - preventing a different generation from silently overwriting a
+ *     profile created by an earlier finalize attempt.
+ *
+ * The field is OPTIONAL on the read shape so legacy FaceProfile
+ * documents (created before B2B) remain readable. New persistence
+ * writes always stamp a non-empty value.
+ *
+ * The field is NEVER serialized into any browser-visible DTO.
  */
 export interface FaceProfileAttrs {
   userId: string;
@@ -66,6 +81,12 @@ export interface FaceProfileAttrs {
   centroid: EncryptedBiometricValueDoc;
   qualitySummary?: FaceProfileQualitySummaryDoc;
   enrolledAt: Date;
+  /**
+   * PHASE 4.6B2B — server-only lineage field. Optional at the read
+   * layer for legacy compatibility; required on writes performed by
+   * the B2B persistence service.
+   */
+  sourceEnrollmentGenerationId?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -223,6 +244,29 @@ const FaceProfileSchema = new Schema<FaceProfileAttrs>(
     enrolledAt: {
       type: Date,
       required: true,
+    },
+    // PHASE 4.6B2B — server-only lineage marker.
+    //
+    // `required: false` at the schema level preserves read
+    // compatibility with legacy FaceProfile documents that pre-date
+    // PHASE 4.6B2B and therefore never received the field. New
+    // persistence writes (driven by `face-profile-finalization-service`)
+    // MUST stamp a non-empty value; the persistence service enforces
+    // that contract, not Mongoose.
+    //
+    // The field is intentionally NOT indexed. The unique ownership
+    // index remains `userId`. A `sourceEnrollmentGenerationId` is
+    // only meaningful in the context of a specific user's profile;
+    // a global unique index would create a write bottleneck for an
+    // identifier only consumed locally by the B2B / B2C pipeline.
+    sourceEnrollmentGenerationId: {
+      type: String,
+      required: false,
+      default: undefined,
+      minlength: [
+        1,
+        "sourceEnrollmentGenerationId must be a non-empty string.",
+      ],
     },
   },
   {

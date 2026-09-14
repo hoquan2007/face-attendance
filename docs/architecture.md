@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: **Phase 4.6B1B** — PHASE 4.6A1 shipped the pure enrollment finalization
+> Status: **Phase 4.6B2C** — PHASE 4.6A1 shipped the pure enrollment finalization
 > math foundation. PHASE 4.6A2 adds the protected internal finalization
 > endpoint (`POST /v1/faces/enrollment/finalize`) that receives
 > already-decrypted, already-L2-normalized embeddings from the trusted
@@ -15,6 +15,24 @@
 > after the Face Service response. PHASE 4.6B1B does NOT persist a
 > `FaceProfile`, does NOT delete the temporary session, and does NOT
 > expose a Next.js route — those belong to PHASE 4.6B2 and 4.6B3.
+> PHASE 4.6B2A ships the **atomic completion claim** on the temporary
+> `FaceEnrollmentSession` (server-only). PHASE 4.6B2B ships the
+> **claim-bound `FaceProfile` persistence** orchestrator
+> (`persistFinalizedFaceProfileForUser`). PHASE 4.6B2C ships the
+> **temporary-enrollment consumption + crash-recovery** orchestrator
+> (`completeFinalizedFaceEnrollmentForUser`). All three are server-internal
+> only — no Next.js route / Server Action / UI was added in 4.6B2.
+> PHASE 4.6B3A ships the first authenticated server-side entry point
+> that wraps the B2C orchestrator: a zero-argument Server Action
+> (`finishFaceEnrollment`) that derives the user id exclusively from
+> the Better Auth session, gates on a completed `Profile`, and
+> delegates to `completeFinalizedFaceEnrollmentForUser(session.user.id)`
+> exactly once. The action returns a small safe result and never
+> exposes `userId`, `generationId`, `claimToken`, `centroid`,
+> ciphertext, IV, authTag, keyVersion, or model metadata. PHASE
+> 4.6B3A deliberately does NOT add a Finish setup button, a public
+> `/api/face-id/enrollment/finalize` route, or any UI changes — UI
+> consumption belongs to PHASE 4.6B3B.
 > typed `CapturedVideoFrame`. PHASE 4.5B3 shipped the **capture + submit
 > + quality feedback loop**: a client helper posts one captured JPEG
 > Blob to `POST /api/face-id/enrollment/sample`, the server response
@@ -1788,6 +1806,8 @@ closes the small race between PHASE 4.6B1B's post-finalize recheck
 and the future PHASE 4.6B2B FaceProfile persistence. The race
 exists because B1B performs:
 
+
+
 ```
 load generation A → decrypt → Face Service finalize → re-read → return centroid
 ```
@@ -1888,6 +1908,395 @@ start responses never include `finalizationClaim` or `claimToken`.
 - No claim expiry / lease / heartbeat / background job.
 - No automatic retry on a CAS loss.
 - No reset while a claim is active.
+- No exposure of the claim token in any browser DTO.
+
+## Phase 4.6B2B claim-bound FaceProfile persistence (server-only)
+
+PHASE 4.6B2B closes the enrollment loop by persisting the
+finalized `FaceProfile` after the B2A atomic claim is held.
+The new orchestration lives in
+`apps/web/src/lib/biometrics/face-profile-finalization-service.ts`
+and is exposed only as the server-only function
+`persistFinalizedFaceProfileForUser(userId)`. There is **no**
+browser route, Server Action, or UI in this phase.
+
+**Order of operations**
+
+1. Run B1B (`finalizeEnrollmentSessionForUser`) to obtain the
+   canonical `sourceGenerationId` and B1B-validated metadata.
+2. Run B2A (`claimEnrollmentSessionForFinalization`) using that
+   `sourceGenerationId`. This keeps the reset-blocking window
+   short — the claim is acquired only AFTER expensive B1B work.
+3. Re-read the claimed session and verify the claim token still
+   matches the persisted `finalizationClaim.token`.
+4. Validate the claimed session's `mode`, `templateVersion`, and
+   `normalization`. Mismatch ⇒ release claim + reject.
+5. Cross-check B1B model metadata (`identity`, `name`, `embedding
+   dimension`, `normalization`) against the claimed session.
+6. Validate encrypted sample index set is exactly `0..N-1` once
+   each and sort deterministically by `sampleIndex`.
+7. Encrypt the centroid with `encryptBiometricVector` using the
+   EXACT AAD `(userId, modelIdentity, templateVersion,
+   vectorType="centroid")`.
+8. Forward encrypted sample envelopes **verbatim** — no decrypt /
+   re-encrypt. The sample AAD remains cryptographically valid
+   because the authoritative fields did not change.
+9. Build the deterministic quality summary from accepted-sample
+   quality data and call `saveFinalizedFaceProfile` for
+   idempotent persistence.
+10. On failure BEFORE successful persistence, release the
+    claim (best-effort, never masks the original error).
+11. On success, **keep** the claim and the temporary session in
+    place for PHASE 4.6B2C.
+
+**Idempotency**
+
+The first write for generation `A` creates the `FaceProfile`
+and records `sourceEnrollmentGenerationId = "A"`. A retry with
+generation `A` returns the same persisted profile with
+`created=false`; `enrolledAt` is preserved. A generation-`B`
+create attempt while generation `A` already exists is rejected
+with `FACE_PROFILE_ALREADY_EXISTS` — the existing profile is
+**never** overwritten. The `userId` unique index is the final
+safety net.
+
+**No multi-document transaction**
+
+B2B does NOT introduce a MongoDB transaction. The lineage-aware
+`findOneAndUpdate` in `saveFinalizedFaceProfile` is
+independently idempotent. Enrollment session cleanup belongs to
+PHASE 4.6B2C.
+
+**Session is NOT consumed in B2B**
+
+The temporary `FaceEnrollmentSession` is intentionally **not**
+deleted or reset by B2B. The `finalizationClaim` block remains
+in place so that PHASE 4.6B2C can atomically consume the
+matching generation without losing lineage.
+
+**Crash recovery**
+
+If B2B persists the `FaceProfile` but crashes before B2C, a
+retry of the same generation is recognized by
+`sourceEnrollmentGenerationId` and returns the existing profile
+as idempotent success. B2C will later consume the matching
+session safely.
+
+**Result type**
+
+`persistFinalizedFaceProfileForUser(userId)` returns a
+`PersistedFaceProfile` containing the persisted profile
+metadata, the `sourceGenerationId`, and the `claimToken`. The
+returned object is **server-only**. The claim token is for
+trusted-server continuation (B2C) only and MUST NOT appear in
+any browser-safe DTO.
+
+**Lineage privacy**
+
+`sourceEnrollmentGenerationId` is a server-only lineage field.
+It is **not** exposed in:
+
+- the browser-safe Face ID status DTO (`face-id-status-service`)
+- `/face-id` or `/face-id/setup` pages
+- any other browser-facing payload
+
+Legacy `FaceProfile` documents without this field remain
+readable for backward compatibility with PHASE 4.2 fixtures.
+New persistence requires the lineage marker.
+
+### What B2B does NOT do
+
+- No browser route / Server Action / UI.
+- No finalize API endpoint.
+- No enrollment session deletion.
+- No reset of the source generation.
+- No multi-document MongoDB transaction.
+- No plaintext centroid / embedding / claim token logging.
+- No direct `BIOMETRIC_ENCRYPTION_KEY` access — the encryption
+  utility owns key handling.
+- No manual AES — only the existing PHASE 4.1
+  `encryptBiometricVector` utility.
+- No new statuses beyond `"active"`.
+- No decrypt / re-encrypt of accepted samples.
+
+## Phase 4.6B2C temporary-enrollment consumption + crash recovery (server-only)
+
+PHASE 4.6B2C closes the enrollment loop by **consuming the
+temporary `FaceEnrollmentSession`** AFTER PHASE 4.6B2B has already
+persisted the finalized `FaceProfile`. The orchestration lives at
+`apps/web/src/lib/biometrics/face-enrollment-completion-service.ts`
+and is exposed **only** as the server-only function
+`completeFinalizedFaceEnrollmentForUser(userId)`.
+
+### Core principle — FaceProfile IS the commit point
+
+Once a valid `FaceProfile` has been persisted for
+`(userId, sourceEnrollmentGenerationId)`, the durable enrollment
+result exists. Deleting the temporary `FaceEnrollmentSession` is
+**CLEANUP**, not commit. Therefore:
+
+- Cleanup failure must **NOT** roll back `FaceProfile`.
+- A retry must **NOT** attempt to create a second `FaceProfile`.
+- A retry must **NOT** rerun B1B or call the Face Service.
+
+### Pre-flight: inspect the existing FaceProfile
+
+The orchestrator reads `getFaceProfileByUserId(userId)` BEFORE any
+write. Three branches:
+
+1. **No profile exists** → NORMAL path. Run B2B to persist the
+   profile, then atomically consume the matching session via the
+   strict-CAS primitive.
+2. **Profile exists with lineage** → CRASH-RECOVERY path. Use
+   `FaceProfile.sourceEnrollmentGenerationId` as the lineage proof.
+   Run the lineage-bound CAS-consume primitive. The original claim
+   token is NOT required.
+3. **Legacy profile (no lineage field)** → return a safe
+   `cleanup_pending` completion; never delete any temporary
+   session by inference.
+
+### Strict CAS consume primitive — NORMAL path
+
+`consumeEnrollmentSession({ userId, generationId, claimToken })`
+performs a single atomic `findOneAndDelete` whose filter requires
+ALL of:
+
+- `userId === input.userId`
+- `generationId === input.generationId`
+- `finalizationClaim.token === input.claimToken`
+- `finalizationClaim.generationId === input.generationId`
+
+There is **no** read → check → write path. The CAS IS the only
+deletion path. There is **no** delete-by-userId-only operation in
+B2C. The function is idempotent and never throws on a CAS miss.
+
+### Lineage-bound CAS consume primitive — CRASH-RECOVERY path
+
+`recoverAndConsumeEnrollmentSession({ userId, generationId })`
+performs a single atomic `findOneAndDelete` whose filter requires
+BOTH `userId` AND `generationId`. No claim token is required
+because the lineage proof already comes from the durable
+`FaceProfile.sourceEnrollmentGenerationId`. The primitive is
+server-internal ONLY and MUST NOT be exposed as a browser API.
+The filter is strict: a different generation is NEVER deleted.
+
+### Behavior matrix
+
+| Existing `FaceProfile` | Existing temp session | Action | `cleanupStatus` |
+| --- | --- | --- | --- |
+| none | none | NORMAL → B2B → consume (strict CAS against absent session) | `already_consumed` |
+| none | matching gen + claim | NORMAL → B2B → consume (strict CAS) | `consumed` |
+| same lineage | matching gen | RECOVERY → consume (lineage-bound CAS) | `consumed` |
+| same lineage | absent / TTL-removed | RECOVERY re-read → idempotent | `already_consumed` |
+| same lineage | different gen | RECOVERY re-read; left untouched | `cleanup_pending` |
+| legacy | any | Safe existing-profile; left untouched | `cleanup_pending` or `already_consumed` |
+
+### Result shape (server-only)
+
+`FinalizedEnrollmentCompletion` carries only:
+
+```ts
+{
+  configured: boolean;
+  enrolledAt: Date | null;
+  sampleCount: number | null;
+  cleanupStatus: "consumed" | "already_consumed" | "cleanup_pending";
+}
+```
+
+NEVER included: `userId`, `sourceEnrollmentGenerationId`,
+`claimToken`, `centroid`, embeddings, ciphertext, IV, authTag,
+keyVersion, model metadata, encrypted samples.
+
+### What B2C does NOT do
+
+- No browser route / Server Action / UI.
+- No finalize API endpoint yet (public finalize belongs to 4.6B3).
+- No re-enrollment.
+- No `FaceProfile` deletion — `FaceProfile` is the commit point.
+- No MongoDB multi-document transaction.
+- No B1B rerun / no Face Service call.
+- No biometric decryption / encryption / re-encryption.
+- No claim release on the success path (`releaseEnrollmentFinalizationClaim`
+  belongs to B2B's failure path; B2C either atomically consumes
+  the session via strict CAS or leaves it alone).
+- No delete-by-userId-only operation.
+- No plaintext biometric data in the result.
+- No browser storage (`localStorage` / `sessionStorage` /
+  IndexedDB).
+- No direct `BIOMETRIC_ENCRYPTION_KEY` access.
+
+## Phase 4.6B3A authenticated enrollment completion Server Action
+
+PHASE 4.6B3A ships the first authenticated entry point on top of
+the B2C orchestrator. It is a small, focused Server Action that
+plugs the B2C module into the Better Auth identity boundary
+without introducing any new HTTP surface area. The action lives at
+[`apps/web/src/lib/biometrics/enrollment-completion-action.ts`](../apps/web/src/lib/biometrics/enrollment-completion-action.ts)
+and opens with `"use server"`.
+
+### Server-only boundary
+
+The module declares the `"use server"` directive at the top. The
+Server Action function (`finishFaceEnrollment`) is therefore
+executed exclusively on the server. Client Components may import
+the reference (Next.js generates a thin RPC stub) but cannot
+execute the body directly. The action never exposes any
+biometric payload and never imports Mongoose models, the
+encryption utility, or the Face Service client.
+
+### Zero browser parameters
+
+`finishFaceEnrollment` takes ZERO arguments. The function
+signature is `finishFaceEnrollment(): Promise<FaceEnrollmentCompletionActionResult>`.
+Identity, profile state, enrollment state, biometric data, and
+claim tokens are all derived server-side. The browser cannot
+choose the userId, the generationId, the claim token, the
+centroid, the sample indexes, or any other internal state.
+
+### Authentication and profile gating
+
+The action performs the following gates BEFORE delegating to
+B2C:
+
+1. **`getSession()`** — uses the same Better Auth server-session
+   pattern as every other authenticated route. A missing session
+   produces `UNAUTHENTICATED`. Raw Better Auth errors are NEVER
+   surfaced to the browser.
+2. **`isOnboardingComplete(session.user.id)`** — uses the existing
+   `profile-service`. A profile that does not exist or has
+   `onboardingCompleted === false` produces `PROFILE_INCOMPLETE`.
+   This is identical to the gating already enforced by
+   `startFaceEnrollment` and the enrollment API routes.
+
+### Delegation to B2C
+
+After auth + profile validation the action calls
+`completeFinalizedFaceEnrollmentForUser(session.user.id)` EXACTLY
+ONCE. The action does NOT call any of:
+
+- B1B (`finalizeEnrollmentSessionForUser`) directly
+- B2A (`claimEnrollmentSessionForFinalization`) directly
+- B2B (`persistFinalizedFaceProfileForUser`) directly
+- The Face Service client directly
+- A Mongoose model directly
+
+B2C is the authoritative completion orchestration boundary. The
+action is a thin wrapper.
+
+### Idempotency
+
+The B2C orchestrator already supports idempotent retries: the
+NORMAL path handles the first persistence, the CRASH-RECOVERY
+path handles a re-attempt after the FaceProfile has already been
+written. The action therefore preserves this behavior end-to-end:
+
+- First call → `cleanupStatus: "consumed"` (or `"already_consumed"`
+  if the temporary session was TTL-removed by MongoDB).
+- Second explicit call → `cleanupStatus: "already_consumed"`,
+  `configured: true`. The action does NOT fabricate an error
+  merely because completion already happened.
+- `cleanupStatus: "cleanup_pending"` is treated as a successful
+  completion — the durable `FaceProfile` is the commit point and
+  is never rolled back just because temporary cleanup is pending.
+
+### Safe success result
+
+The action returns a discriminated union:
+
+```ts
+type FaceEnrollmentCompletionActionResult =
+  | {
+      ok: true;
+      configured: true;
+      faceId: {
+        enrolledAt: string;   // ISO 8601
+        sampleCount: number;
+      };
+      cleanupStatus: "consumed" | "already_consumed" | "cleanup_pending";
+    }
+  | {
+      ok: false;
+      code: FaceEnrollmentCompletionActionErrorCode;
+      message: string;
+      retryable: boolean;
+    };
+```
+
+The success result NEVER includes `userId`, `generationId`,
+`sourceEnrollmentGenerationId`, `claimToken`, `centroid`,
+plaintext embeddings, ciphertext, IV, authTag, keyVersion,
+`modelIdentity`, `modelName`, `embeddingDimension`,
+`normalization`, or any other internal lineage. Only
+non-biometric Face ID status information (`configured`,
+`enrolledAt`, `sampleCount`, `cleanupStatus`) reaches the
+browser.
+
+### Error mapping
+
+The action maps every typed upstream error into a small,
+stable, browser-facing enum:
+
+| Upstream | Mapped action code |
+| --- | --- |
+| No Better Auth session | `UNAUTHENTICATED` |
+| Incomplete onboarding | `PROFILE_INCOMPLETE` |
+| `ENROLLMENT_SESSION_NOT_FOUND` (B1B / B2B) | `ENROLLMENT_SESSION_NOT_FOUND` |
+| `ENROLLMENT_SESSION_EXPIRED` | `ENROLLMENT_SESSION_EXPIRED` |
+| `ENROLLMENT_INCOMPLETE` | `ENROLLMENT_INCOMPLETE` |
+| `ENROLLMENT_GENERATION_CHANGED` | `ENROLLMENT_GENERATION_CHANGED` |
+| `ENROLLMENT_SAMPLE_DECRYPTION_FAILED` | `ENROLLMENT_SAMPLE_DECRYPTION_FAILED` |
+| `ENROLLMENT_SAMPLE_VECTOR_INVALID` | `ENROLLMENT_SAMPLE_VECTOR_INVALID` |
+| `ENROLLMENT_FINALIZATION_ALREADY_CLAIMED` | `ENROLLMENT_FINALIZATION_ALREADY_CLAIMED` |
+| `ENROLLMENT_FINALIZATION_IN_PROGRESS` | `ENROLLMENT_FINALIZATION_IN_PROGRESS` |
+| `FACE_PROFILE_ALREADY_EXISTS` (lineage conflict) | `FACE_PROFILE_ALREADY_EXISTS` |
+| B1B `domainError.code === "INCONSISTENT_FACE_SAMPLES"` | `INCONSISTENT_FACE_SAMPLES` |
+| B1B `domainError.code === "MODEL_MISMATCH"` | `MODEL_MISMATCH` |
+| `FACE_PROFILE_CENTROID_ENCRYPTION_FAILED` | `BIOMETRIC_ENCRYPTION_UNAVAILABLE` |
+| B1B `domainError.code === "FACE_SERVICE_TIMEOUT"` | `FACE_SERVICE_TIMEOUT` |
+| B1B `domainError.code === "FACE_SERVICE_UNAVAILABLE"` | `FACE_SERVICE_UNAVAILABLE` |
+| B1B `domainError.code === "FACE_SERVICE_UNAUTHORIZED"` | `FACE_SERVICE_UNAUTHORIZED` |
+| B1B `domainError.code === "FACE_SERVICE_INVALID_RESPONSE"` | `FACE_SERVICE_INVALID_RESPONSE` |
+| anything else | `ENROLLMENT_COMPLETION_FAILED` |
+
+Each error code carries a `retryable: boolean` hint. Transient
+infrastructure / concurrency issues are flagged retryable;
+domain / data integrity issues are flagged non-retryable so the
+future UI can prompt for an explicit "Restart setup".
+
+### One invocation → one B2C invocation
+
+The Server Action invokes B2C exactly ONCE per call. There is
+NO automatic retry on Face Service timeout, claim conflict,
+generation drift, or Mongo errors. The future UI may decide
+whether to expose an explicit user-driven retry.
+
+### No revalidation / no navigation
+
+The action does NOT call `router.refresh()`, `redirect()`, or
+`revalidatePath()`. B3A is pure authenticated action plumbing;
+UI refresh and navigation behavior belong to PHASE 4.6B3B.
+
+### No public API route
+
+PHASE 4.6B3A deliberately does NOT add
+`POST /api/face-id/enrollment/finalize` or any other HTTP
+endpoint. The Server Action is the only entry point. This keeps
+the public surface area minimal and removes the need for a
+separate authorization layer.
+
+### What PHASE 4.6B3A does NOT do
+
+- No Finish setup button — UI is PHASE 4.6B3B's responsibility.
+- No `EnrollmentSamplePanel` change.
+- No navigation change.
+- No `/face-id` or `/face-id/setup` page change.
+- No public `/api/face-id/enrollment/finalize` route.
+- No Face Service fetch — only B2C is invoked.
+- No re-enrollment flow.
+- No automatic retry.
+- No `router.refresh` / `redirect` / `revalidatePath`.
+- No `console.log` of biometric data.
 
 ## Phase plan
 
@@ -1918,6 +2327,9 @@ start responses never include `finalizationClaim` or `claimToken`.
 | **4.6B1A** | **Server-only Next.js finalization client (`finalizeFaceEnrollment` in `face-service-client.ts`): one focused function extending the existing PHASE 4.4A server-only client. Calls `POST /v1/faces/enrollment/finalize`, validates request shape and returned centroid, preserves upstream domain codes. Server-only, no MongoDB, no decryption, no persistence. Stops at the client abstraction.** |
 | **4.6B1B** | **Server-only Next.js finalization orchestration (`finalizeEnrollmentSessionForUser` in `enrollment-finalization-service.ts`): loads the current `FaceEnrollmentSession` through the existing PHASE 4.5B4.3 read service, validates the session, reconstructs the exact PHASE 4.1 AAD for each encrypted sample, decrypts server-side using the existing AES-256-GCM utility, validates plaintext vectors, calls the B1A client exactly once, re-checks the enrollment generation after the response. No `FaceProfile` persistence, no temporary-session deletion, no Next.js route / UI. Documents that PHASE 4.6B2 must still atomically verify generationId when persisting.** |
 | **4.6B2A** | **Atomic completion claim on `FaceEnrollmentSession`: OPTIONAL `finalizationClaim` field (`token`, `generationId`, `claimedAt`). Server-only `claimEnrollmentSessionForFinalization` and `releaseEnrollmentFinalizationClaim` service operations. Single atomic `findOneAndUpdate` per claim action — no read → check → write. Generation-bound (CAS verifies `generationId`). Complete-bound (CAS verifies `$size(acceptedSamples) == requiredSampleCount`). Expiry-bound (CAS verifies `expiresAt > now`). `createOrResetEnrollmentSession` is guarded atomically — start/reset while a claim is active returns `ENROLLMENT_FINALIZATION_IN_PROGRESS`. Claim token is `node:crypto randomUUID()`, server-only, never sent to browser or Face Service, never logged. No claim expiry / lease / heartbeat / setTimeout / background cleanup in B2A — the existing session TTL remains the lifecycle boundary. No `FaceProfile` persistence, no encryption of centroid, no finalize API/UI.** |
+| **4.6B2B** | **Claim-bound `FaceProfile` persistence (server-only `persistFinalizedFaceProfileForUser`): runs B1B to obtain `sourceGenerationId`, acquires B2A atomic claim, re-validates the claimed session, validates `mode`/`templateVersion`/`normalization`, cross-checks B1B model metadata against the claimed session, validates the encrypted sample index set, encrypts the centroid with `encryptBiometricVector` using the existing AAD contract `(userId, modelIdentity, templateVersion, vectorType="centroid")`, copies encrypted sample envelopes verbatim, persists via `saveFinalizedFaceProfile` (idempotent). New internal `sourceEnrollmentGenerationId` lineage field — optional at the schema level for legacy compatibility, required for new persistence. First write creates; same-generation retry returns idempotent success and preserves `enrolledAt`; different-generation create rejected with `FACE_PROFILE_ALREADY_EXISTS` (no overwrite). On failure BEFORE successful persistence, releases own claim (best-effort, never masks the original error). On success, keeps the claim and the temporary session for PHASE 4.6B2C. No MongoDB multi-document transaction. No browser route / Server Action / UI. No enrollment session deletion. No plaintext logging of centroid / claimToken / lineage.** |
+| **4.6B2C** | **Temporary-enrollment consumption + post-persistence crash-recovery orchestration (server-only `completeFinalizedFaceEnrollmentForUser`): pre-flight inspects the existing `FaceProfile`. NORMAL path: no profile yet → invoke B2B to persist a `FaceProfile`, then atomically consume the matching temporary session via the strict CAS primitive `consumeEnrollmentSession({ userId, generationId, claimToken })` (single `findOneAndDelete` filter — `userId` + `generationId` + `finalizationClaim.token` + `finalizationClaim.generationId`). CRASH-RECOVERY path: a profile already exists → prove lineage via `FaceProfile.sourceEnrollmentGenerationId`, then lineage-bound CAS-consume via `recoverAndConsumeEnrollmentSession({ userId, generationId })` (single `findOneAndDelete` filter — `userId` + `generationId`, no claim token required). FaceProfile is the durable commit point; cleanup is idempotent. A retry NEVER reruns B1B, NEVER calls the Face Service, NEVER decrypts or re-encrypts samples, NEVER rewrites the `FaceProfile`. A different temp generation is NEVER deleted. A TTL-removed or already-consumed temp session is treated as idempotent success (`already_consumed`). Legacy profiles without `sourceEnrollmentGenerationId` are still readable; no temp session is deleted by inference. Result is `FinalizedEnrollmentCompletion { configured, enrolledAt, sampleCount, cleanupStatus }` — never includes `userId`, `claimToken`, `sourceEnrollmentGenerationId`, `centroid`, ciphertext / IV / authTag. No MongoDB transaction. No direct Face Service fetch. No browser route / Server Action / UI. No re-enrollment. No `releaseEnrollmentFinalizationClaim` / claim release on cleanup path.** |
+| **4.6B3A** | **Authenticated enrollment completion Server Action (`finishFaceEnrollment` in `enrollment-completion-action.ts`): zero-argument `"use server"` action that derives identity EXCLUSIVELY from `auth.api.getSession()` (Better Auth server session), gates on a completed `Profile` via `isOnboardingComplete`, delegates to `completeFinalizedFaceEnrollmentForUser(session.user.id)` EXACTLY ONCE. No browser-supplied `userId` / `generationId` / `claimToken` / `centroid`. Safe success result `FaceEnrollmentCompletionActionResult { ok, configured, faceId: { enrolledAt, sampleCount }, cleanupStatus }` — never includes `userId`, `generationId`, `sourceEnrollmentGenerationId`, `claimToken`, `centroid`, ciphertext, IV, authTag, keyVersion, or model metadata. Discriminated-union error result maps every typed upstream error (B1B / B2A / B2B / B2C / Face Service / persistence / encryption) into a small, stable, browser-facing enum (`UNAUTHENTICATED`, `PROFILE_INCOMPLETE`, `ENROLLMENT_SESSION_NOT_FOUND`, `ENROLLMENT_SESSION_EXPIRED`, `ENROLLMENT_INCOMPLETE`, `ENROLLMENT_GENERATION_CHANGED`, `ENROLLMENT_SAMPLE_DECRYPTION_FAILED`, `ENROLLMENT_SAMPLE_VECTOR_INVALID`, `ENROLLMENT_FINALIZATION_ALREADY_CLAIMED`, `ENROLLMENT_FINALIZATION_IN_PROGRESS`, `FACE_PROFILE_ALREADY_EXISTS`, `INCONSISTENT_FACE_SAMPLES`, `MODEL_MISMATCH`, `BIOMETRIC_ENCRYPTION_UNAVAILABLE`, `FACE_SERVICE_TIMEOUT`, `FACE_SERVICE_UNAVAILABLE`, `FACE_SERVICE_UNAUTHORIZED`, `FACE_SERVICE_INVALID_RESPONSE`, `ENROLLMENT_COMPLETION_FAILED`). Idempotent: re-invoking the action on an already-configured user returns `configured: true` with `cleanupStatus: "already_consumed"` — no fabricated error. NO automatic retry. NO `router.refresh` / `redirect` / `revalidatePath`. NO public `/api/face-id/enrollment/finalize` route. NO Finish setup button — UI consumption belongs to PHASE 4.6B3B.** |
 | 4.4B | Next.js Face ID API routes + enrollment session orchestration. |
 | 5 | Classroom creation and join-by-code+password. |
 | 6 | Attendance session lifecycle. |

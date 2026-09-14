@@ -1,6 +1,6 @@
 # Privacy & Security
 
-> Status: **Phase 4.6B1B** — PHASE 4.6A1 shipped the pure enrollment finalization
+> Status: **Phase 4.6B3A** — PHASE 4.6A1 shipped the pure enrollment finalization
 > math foundation. PHASE 4.6A2 adds the protected internal finalization
 > endpoint (`POST /v1/faces/enrollment/finalize`) that receives
 > already-decrypted, already-L2-normalized embeddings from the trusted
@@ -31,6 +31,58 @@
 > Face Service, and is never logged. The claim carries no expiry /
 > lease / heartbeat / setTimeout / background cleanup — the existing
 > session TTL remains the lifecycle boundary.
+> PHASE 4.6B2B adds the **claim-bound `FaceProfile` persistence**
+> orchestration (`persistFinalizedFaceProfileForUser`) — a server-only
+> Next.js module that runs B1B → B2A claim → centroid encryption with
+> the existing PHASE 4.1 AES-GCM utility and exact AAD → copy encrypted
+> samples verbatim → idempotent persistence keyed on
+> `sourceEnrollmentGenerationId`. The centroid is never logged; the
+> claim token is returned only to trusted-server continuations and never
+> appears in any browser DTO. The temporary enrollment session is NOT
+> consumed / deleted by B2B — that belongs to PHASE 4.6B2C. No MongoDB
+> multi-document transaction is introduced in B2B.
+> PHASE 4.6B2C adds the **temporary-enrollment consumption +
+> post-persistence crash-recovery** orchestration
+> (`completeFinalizedFaceEnrollmentForUser`) — a server-only Next.js
+> module. It pre-flights the persisted `FaceProfile`, then atomically
+> consumes the matching temporary session via a strict CAS delete on
+> `(userId, generationId, claimToken)` (NORMAL path) or a
+> lineage-bound CAS delete on `(userId, generationId)` (CRASH-RECOVERY
+> path). The recovery path requires NO original claim token because the
+> durable `FaceProfile.sourceEnrollmentGenerationId` lineage proves
+> commit. The B2C result contains only `configured`, `enrolledAt`,
+> `sampleCount`, and `cleanupStatus` — never the claim token, the
+> generationId, the centroid, ciphertext, IV, authTag, keyVersion,
+> model metadata, or `userId`. A different-generation session is
+> NEVER deleted. No MongoDB transaction. No biometric decryption. No
+> Face Service call. No browser route / Server Action / UI. The
+> orchestration remains server-internal only.
+> PHASE 4.6B3A wraps the B2C orchestrator in an authenticated Server
+> Action (`finishFaceEnrollment`). Identity is derived EXCLUSIVELY
+> from the Better Auth server session; the browser sends no
+> `userId`. The action gates on a completed `Profile`, then calls
+> `completeFinalizedFaceEnrollmentForUser(session.user.id)` exactly
+> once. The success result contains only `configured`, `enrolledAt`,
+> `sampleCount`, and `cleanupStatus`. The failure result is a
+> stable, safe enum (`UNAUTHENTICATED`, `PROFILE_INCOMPLETE`,
+> `ENROLLMENT_SESSION_NOT_FOUND`, `ENROLLMENT_SESSION_EXPIRED`,
+> `ENROLLMENT_INCOMPLETE`, `INCONSISTENT_FACE_SAMPLES`,
+> `MODEL_MISMATCH`, `ENROLLMENT_SAMPLE_DECRYPTION_FAILED`,
+> `ENROLLMENT_SAMPLE_VECTOR_INVALID`,
+> `ENROLLMENT_GENERATION_CHANGED`,
+> `ENROLLMENT_FINALIZATION_ALREADY_CLAIMED`,
+> `ENROLLMENT_FINALIZATION_IN_PROGRESS`,
+> `FACE_PROFILE_ALREADY_EXISTS`, `FACE_SERVICE_TIMEOUT`,
+> `FACE_SERVICE_UNAVAILABLE`, `FACE_SERVICE_UNAUTHORIZED`,
+> `FACE_SERVICE_INVALID_RESPONSE`,
+> `BIOMETRIC_ENCRYPTION_UNAVAILABLE`,
+> `ENROLLMENT_COMPLETION_FAILED`) — each carries a restrained
+> human-readable message and a `retryable` hint. No `userId`,
+> `generationId`, `claimToken`, `centroid`, ciphertext, IV,
+> authTag, keyVersion, or model metadata is ever serialized into
+> the response. The action does NOT add a public
+> `/api/face-id/enrollment/finalize` route. The action does NOT add
+> a Finish setup button — UI consumption belongs to PHASE 4.6B3B.
 
 ## Biometric handling principles
 
@@ -2095,3 +2147,176 @@ Correctness is prioritized over instant crash recovery in the MVP.
 - No UI / button / `router.refresh`.
 - No claim expiry / lease / heartbeat / background cleanup.
 - No automatic retry on a CAS loss.
+
+## Phase 4.6B2B claim-bound FaceProfile persistence (server-only)
+
+PHASE 4.6B2B closes the enrollment loop by persisting the
+finalized `FaceProfile` after the B2A atomic claim is held.
+The new orchestration lives in
+`apps/web/src/lib/biometrics/face-profile-finalization-service.ts`
+and is exposed **only** as the server-only function
+`persistFinalizedFaceProfileForUser(userId)`. There is **no**
+browser route, Server Action, or UI in this phase.
+
+### What B2B does
+
+- Runs B1B (`finalizeEnrollmentSessionForUser`) to obtain the
+  canonical `sourceGenerationId`.
+- Acquires a B2A atomic completion claim on
+  `(userId, sourceGenerationId)`.
+- Re-reads the claimed session and verifies the claim token
+  still matches.
+- Validates `mode`, `templateVersion`, and `normalization`.
+- Cross-checks B1B model metadata against the claimed session.
+- Validates the encrypted sample index set is exactly `0..N-1`
+  once each.
+- Encrypts the centroid with `encryptBiometricVector` using the
+  exact AAD contract `(userId, modelIdentity, templateVersion,
+  vectorType="centroid")`.
+- Forwards encrypted sample envelopes verbatim — no decrypt,
+  no re-encrypt.
+- Calls `saveFinalizedFaceProfile` for idempotent persistence
+  keyed on `(userId, sourceEnrollmentGenerationId)`.
+- Persists the new internal lineage field
+  `sourceEnrollmentGenerationId` on the `FaceProfile`.
+- On failure BEFORE successful persistence, releases the claim
+  best-effort (never masks the original error).
+- On success, keeps the claim and the temporary enrollment
+  session for PHASE 4.6B2C.
+
+### Centroid & sample privacy
+
+- The centroid is encrypted with the same AAD contract as
+  PHASE 4.1. The plaintext centroid exists transiently in
+  server memory only. It is never logged.
+- The encrypted sample envelopes are forwarded byte-for-byte
+  (`ciphertext`, `iv`, `authTag`, `keyVersion`). The AAD remains
+  valid because the authoritative fields did not change.
+- Sample and centroid plaintext are never serialized into a
+  browser-safe DTO. The `PersistedFaceProfile` returned by
+  `persistFinalizedFaceProfileForUser` is server-only.
+
+### Lineage privacy
+
+- `sourceEnrollmentGenerationId` is a server-only lineage
+  field. It is **NOT** exposed in:
+  - the browser-safe `face-id-status-service` DTO
+  - `/face-id` or `/face-id/setup` pages
+  - any other browser-facing payload
+- Legacy `FaceProfile` documents lacking the lineage remain
+  readable. New persistence requires the field.
+- The claim token is returned **only** in the server-only
+  result type and **never** in any browser DTO or log line.
+
+### Idempotency & lineage conflict
+
+- First write for generation `A` creates the profile and stores
+  `sourceEnrollmentGenerationId = "A"`.
+- Same-generation retry returns the existing profile as
+  idempotent success and preserves `enrolledAt`.
+- Generation-`B` create attempt while generation `A` exists is
+  rejected with `FACE_PROFILE_ALREADY_EXISTS`. The existing
+  profile is **never** overwritten. The `userId` unique index
+  is the final safety net.
+
+### Crash recovery
+
+If B2B persists the profile but crashes before B2C, a retry
+of the same generation is recognized via
+`sourceEnrollmentGenerationId` and returns the existing profile
+as idempotent success. B2C will later consume the matching
+session safely.
+
+### What B2B does NOT do
+
+- No browser route / Server Action / UI.
+- No finalize API endpoint.
+- No enrollment session deletion.
+- No reset of the source generation.
+- No MongoDB multi-document transaction.
+- No plaintext centroid / embedding / claim token logging.
+- No direct `BIOMETRIC_ENCRYPTION_KEY` access — the encryption
+  utility owns key handling.
+- No manual AES — only the existing PHASE 4.1
+  `encryptBiometricVector` utility.
+- No new statuses beyond `"active"`.
+- No decrypt / re-encrypt of accepted samples.
+
+## Phase 4.6B2C temporary-enrollment consumption + crash recovery (server-only)
+
+PHASE 4.6B2C consumes the temporary `FaceEnrollmentSession`
+AFTER PHASE 4.6B2B has already persisted the finalized
+`FaceProfile`. The orchestration lives at
+`apps/web/src/lib/biometrics/face-enrollment-completion-service.ts`
+and is exposed **only** as the server-only function
+`completeFinalizedFaceEnrollmentForUser(userId)`. There is
+**no** public finalize API route in B2C.
+
+### FaceProfile IS the commit point
+
+B2C treats `FaceProfile` as the durable commit point, not the
+temporary session deletion. Cleanup is idempotent and post-commit.
+Therefore:
+
+- Cleanup failure must NOT roll back `FaceProfile`.
+- A retry must NOT attempt to create a second `FaceProfile`.
+- A retry must NOT rerun B1B, MUST NOT call the Face Service,
+  MUST NOT decrypt or re-encrypt samples.
+
+### Strict CAS consume (NORMAL path)
+
+`consumeEnrollmentSession({ userId, generationId, claimToken })`
+performs a single atomic `findOneAndDelete` whose filter
+requires `userId`, `generationId`,
+`finalizationClaim.token`, and `finalizationClaim.generationId`.
+The claim token is the server-side capability matching the B2A
+issuance. No read → check → write path is used.
+
+### Lineage-bound consume (CRASH-RECOVERY path)
+
+`recoverAndConsumeEnrollmentSession({ userId, generationId })`
+performs a single atomic `findOneAndDelete` whose filter
+requires BOTH `userId` AND `generationId`. No claim token is
+required — the durable `FaceProfile.sourceEnrollmentGenerationId`
+already proves commit. A different generation is NEVER deleted.
+
+### Privacy
+
+The B2C completion result (`FinalizedEnrollmentCompletion`)
+carries only:
+
+```ts
+{
+  configured: boolean;
+  enrolledAt: Date | null;
+  sampleCount: number | null;
+  cleanupStatus: "consumed" | "already_consumed" | "cleanup_pending";
+}
+```
+
+It NEVER carries `userId`, `claimToken`,
+`sourceEnrollmentGenerationId`, `centroid`, embeddings,
+ciphertext, IV, authTag, keyVersion, model metadata, or any
+other biometric payload. The claim token is server-only and is
+deleted atomically with the session — it never appears in the
+return value, in any log line, or in any browser DTO.
+
+### What B2C does NOT do
+
+- No browser route / Server Action / UI.
+- No finalize API endpoint yet (public finalize belongs to 4.6B3).
+- No re-enrollment.
+- No `FaceProfile` deletion.
+- No MongoDB multi-document transaction.
+- No B1B rerun / no Face Service call.
+- No biometric decryption / encryption / re-encryption.
+- No claim release on the success path — `releaseEnrollmentFinalizationClaim`
+  belongs to B2B's failure path. B2C atomically consumes the
+  whole session via strict CAS or leaves it alone.
+- No delete-by-userId-only operation.
+- No browser storage (`localStorage` / `sessionStorage` /
+  IndexedDB / Cache API).
+- No direct `BIOMETRIC_ENCRYPTION_KEY` access.
+- No logging of plaintext biometric data, claim tokens, or
+  generation IDs. Safe log fields, if any, are limited to the
+  standard application error code + message.
