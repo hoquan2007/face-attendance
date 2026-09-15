@@ -1,6 +1,6 @@
 # Privacy & Security
 
-> Status: **Phase 4.6B3C** — PHASE 4.6B3A shipped the authenticated `finishFaceEnrollment()` Server Action. PHASE 4.6B3B shipped the explicit "Finish setup" UI button on `/face-id/setup`. PHASE 4.6B3C is the final enrollment state consistency + UX polish phase.
+> Status: **Phase 5.1A** — PHASE 5.1A ships the persistence foundation for the `classes` and `class_memberships` collections. This phase adds two new Mongoose models, their service layers, and server-only utilities for class code generation, normalization, and password hashing. No UI, API routes, Server Actions, or attendance logic is implemented in this phase. Better Auth collections remain untouched.
 > server-only Next.js orchestration service
 > (`finalizeEnrollmentSessionForUser`) that loads the temporary
 > `FaceEnrollmentSession`, decrypts its accepted samples server-side
@@ -126,6 +126,52 @@
 7. **Biometric encryption.** From PHASE 4.1, face embeddings are
    encrypted with AES-256-GCM before storage. The encryption key is
    independent from authentication secrets.
+
+## Phase 5.1A.1 class password storage
+
+PHASE 5.1A.1 hardens the class join password primitive ahead of the future
+class create / join Server Actions. Design decisions:
+
+- **One-way hashing only.** Class passwords are hashed with **PBKDF2-SHA256**
+  via the asynchronous `node:crypto.pbkdf2` (wrapped with `util.promisify`).
+  The raw password is never stored.
+- **Asynchronous request-path API.** `hashClassPassword(password)` and
+  `verifyClassPassword(password, encodedHash)` both `await` PBKDF2 work so
+  the request-path event loop is never blocked. No `pbkdf2Sync`,
+  `scryptSync`, or busy-loop is used anywhere in the runtime.
+- **Random salt per hash.** Every `hashClassPassword()` call generates a fresh
+  32-byte random salt via `crypto.randomBytes()`, defeating rainbow tables.
+  Two identical passwords therefore produce different encoded hashes.
+- **Iteration count.** `CLASS_PASSWORD_PBKDF2_ITERATIONS = 100_000` PBKDF2
+  iterations provide defense against brute-force on leaked hashes. The
+  value lives in a single centralized constant and is **encoded into every
+  produced hash**, so the work factor can be evolved later without breaking
+  verification of older hashes.
+- **Self-describing versioned hash format.** Encoded values have the shape
+  `pbkdf2-sha256$<iterations>$<saltHex>$<derivedKeyHex>`. The encoded value
+  carries the algorithm identifier, iteration count, salt, and derived
+  key. The string does **not** carry `userId`, `classId`, `classCode`, or
+  any other identity-bearing field.
+- **Constant-time verification.** `verifyClassPassword()` compares the
+  re-derived key bytes to the stored key bytes using
+  `crypto.timingSafeEqual`, with explicit pre-flight length validation so
+  the function never crashes on a malformed stored value and never leaks
+  a `===` short-circuit to a timing attacker.
+- **Strict parsing.** The encoded hash parser is total and never throws.
+  Wrong field count, unknown algorithm, non-numeric or non-positive
+  iteration count, invalid hex, wrong salt length, and wrong derived key
+  length each map to a controlled `false` from verification (or to a
+  service-layer domain error when the future Server Action surfaces the
+  failure).
+- **No recovery.** There is no "show current password" flow. A teacher who
+  forgets the password must use a reset-password workflow (not in scope for
+  PHASE 5.1A).
+- **Never logged.** Plaintext class passwords (when accepted by the service)
+  are discarded immediately after hashing. They never appear in server logs,
+  MongoDB documents, or browser DTOs. The hashing module itself contains
+  no `console.log` / `logger.*` / `debug(` calls.
+- **No `Math.random()`.** Class codes and password salt are generated using
+  `node:crypto.randomBytes()`. `Math.random()` is never used.
 
 ## Phase 2 identity vs business data
 

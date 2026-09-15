@@ -456,6 +456,111 @@ flowchart LR
     Face["services/face-service\n(Python, CPU)"] -.inference only.-> Web
 ```
 
+## Phase 5.1A — classes + class_memberships (persistence foundation)
+
+PHASE 5.1A ships the persistence foundation for the class and membership
+domain. No UI, API routes, Server Actions, or attendance logic is
+implemented in this phase.
+
+### `classes` collection
+
+A `Class` document represents one teacher's class. There is at most one
+class per canonical `classCode`, enforced by a unique index.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `_id` | ObjectId | Mongoose-managed. |
+| `name` | string | User-facing class name. Trimmed, max 200 chars. |
+| `teacherUserId` | string | Better Auth `user._id`. **Indexed.** |
+| `classCode` | string | Canonical uppercase code. **Unique, indexed.** |
+| `passwordHash` | string | PBKDF2-SHA256 hash of the join password. **Never plaintext.** |
+| `status` | enum | `"active"` or `"archived"`. Defaults to `"active"`. |
+| `createdAt`, `updatedAt` | Date | Mongoose `timestamps: true`. |
+
+**Indexes**
+
+- `classCode` unique — enforces at most one class per canonical code.
+- `teacherUserId` — supports "list classes by teacher" queries.
+
+**Privacy posture**
+
+- The model stores only `passwordHash` — plaintext passwords are NEVER
+  stored, logged, or serialized into browser DTOs.
+- No biometric fields are present.
+- `SafeClassDto` is the browser-facing shape; it omits `passwordHash`.
+
+### `class_memberships` collection
+
+A `ClassMembership` document records a student's membership in a class.
+Each student may belong to a given class at most once, enforced by a
+compound unique index.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `_id` | ObjectId | Mongoose-managed. |
+| `classId` | ObjectId | References `classes._id`. **Part of unique compound index.** |
+| `studentUserId` | string | Better Auth `user._id`. **Indexed.** |
+| `joinedAt` | Date | When the student joined. Defaults to now. |
+| `status` | enum | `"active"` only in PHASE 5.1A. |
+| `createdAt`, `updatedAt` | Date | Mongoose `timestamps: true`. |
+
+**Indexes**
+
+- `(classId, studentUserId)` compound unique — enforces at most one
+  membership per student per class at the database layer. This index
+  also implicitly supports class-first membership queries.
+- `studentUserId` — supports "list memberships by student" queries.
+
+**Privacy posture**
+
+- No biometric fields, FaceProfile references, centroids, or embeddings.
+- No attendance fields — those belong to later phases.
+- `SafeMembershipDto` is the browser-facing shape.
+
+### Class code
+
+- Generated using `node:crypto.randomBytes()` — cryptographically secure.
+- Alphabet: uppercase letters + digits, excluding ambiguous characters (O/0/I/1).
+- Length: 7 characters (e.g. `"AB12XYZ"`).
+- Normalization: trim + uppercase. All lookups use the same normalization.
+- The unique index on `classCode` is the authoritative uniqueness guard;
+  the generator handles collisions by retrying at the service layer.
+
+### Password storage
+
+- Passwords are hashed with PBKDF2-SHA256 via the asynchronous
+  `node:crypto.pbkdf2` (wrapped with `util.promisify`). The request-path
+  API is asynchronous; no `pbkdf2Sync`, `scryptSync`, or blocking busy-loop
+  is used anywhere in the runtime.
+- The work factor is centralized in `CLASS_PASSWORD_PBKDF2_ITERATIONS =
+  100_000`. The value is encoded into every produced hash so the factor
+  can be evolved safely in the future without breaking verification of older
+  hashes.
+- 32-byte random salt (fresh per hash) and 32-byte derived key.
+- Encoded format: `pbkdf2-sha256$<iterations>$<saltHex>$<derivedKeyHex>`.
+  The encoded string is self-describing and versioned; it carries the
+  algorithm identifier, iteration count, salt, and derived key. It does
+  **not** carry `userId`, `classId`, `classCode`, or any other
+  identity-bearing field.
+- Verification uses `crypto.timingSafeEqual` for constant-time comparison
+  of derived key bytes, with explicit pre-flight length validation. A
+  malformed stored value maps to a controlled `false` — it cannot crash
+  the verification call.
+- Plaintext passwords are accepted only by `hashClassPassword()`, which
+  returns the encoded hash. The raw password is never stored, logged,
+  cached, or serialized into browser DTOs.
+
+### What PHASE 5.1A does NOT implement
+
+- No class creation UI or API route.
+- No class join UI or API route.
+- No attendance sessions or records.
+- No teacher role enforcement (future phases will verify role).
+- No student role enforcement for join (future phases will verify role).
+- No class archive/restore actions.
+- No class password reset/recovery.
+- No biometric fields, FaceProfile references, or centroid references.
+
 ## Privacy posture
 
 - Embeddings (Phase 4+) are stored, **not** raw images.
