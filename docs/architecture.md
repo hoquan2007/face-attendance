@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: **Phase 4.6B2C** — PHASE 4.6A1 shipped the pure enrollment finalization
+> Status: **Phase 4.6B3B** — PHASE 4.6A1 shipped the pure enrollment finalization
 > math foundation. PHASE 4.6A2 adds the protected internal finalization
 > endpoint (`POST /v1/faces/enrollment/finalize`) that receives
 > already-decrypted, already-L2-normalized embeddings from the trusted
@@ -33,6 +33,32 @@
 > 4.6B3A deliberately does NOT add a Finish setup button, a public
 > `/api/face-id/enrollment/finalize` route, or any UI changes — UI
 > consumption belongs to PHASE 4.6B3B.
+>
+> PHASE 4.6B3B ships the **explicit "Finish setup" UI** for the
+> temporary enrollment → durable `FaceProfile` transition. The
+> `/face-id/setup` page now renders a small `EnrollmentFinishButton`
+> client component below the camera/sample panel when (and ONLY when)
+> the temporary enrollment is in the server-authoritative complete
+> state AND no durable `FaceProfile` already exists. The button is
+> the ONLY browser-side trigger: it never auto-runs from a
+> `useEffect`, page load, router refresh, progress update, or camera
+> callback. On explicit click it invokes the PHASE 4.6B3A
+> `finishFaceEnrollment()` zero-argument Server Action. Two rapid
+> clicks collapse into exactly ONE Server Action invocation via a
+> synchronous `finishInFlightRef` guard. On success the UI navigates
+> to `/face-id` via `router.replace(...)` so the Back button cannot
+> return the user to the completion screen. The button receives NO
+> `userId`, `generationId`, `claimToken`, `centroid`, sample array,
+> or model metadata. The button never writes to `localStorage`,
+> `sessionStorage`, `IndexedDB`, or the `Cache` API; never issues
+> `fetch()` to the Face Service; never restarts the camera or
+> requests `getUserMedia`. There is NO automatic retry on failure;
+> retryable errors keep the user on the 5/5 setup state and allow
+> another explicit click. Expired / generation-changed / not-found
+> / incomplete states trigger a single, safe `router.refresh()` to
+> reconcile the server-rendered setup shell without re-invoking the
+> action. PHASE 4.6B3B does NOT implement re-enrollment, delete-Face-ID,
+> or any other next-step UI.
 > typed `CapturedVideoFrame`. PHASE 4.5B3 shipped the **capture + submit
 > + quality feedback loop**: a client helper posts one captured JPEG
 > Blob to `POST /api/face-id/enrollment/sample`, the server response
@@ -2298,6 +2324,131 @@ separate authorization layer.
 - No `router.refresh` / `redirect` / `revalidatePath`.
 - No `console.log` of biometric data.
 
+## Phase 4.6B3B — explicit "Finish setup" UI
+
+PHASE 4.6B3B introduces the user-visible trigger for the temporary
+enrollment → durable `FaceProfile` transition. It does NOT add a
+new server-side capability; it consumes the PHASE 4.6B3A
+`finishFaceEnrollment()` Server Action through a small,
+focused client component.
+
+### Component surface
+
+- `apps/web/src/components/face-id-pages/enrollment-finish-button.tsx`
+  — the explicit "Finish setup" Client Component. It receives ONLY
+  two server-derived flags: `canFinish: boolean` and
+  `faceProfileConfigured: boolean`. It does NOT receive `userId`,
+  `generationId`, `claimToken`, `centroid`, sample data, or model
+  metadata.
+- `apps/web/src/components/face-id-pages/enrollment-sample-panel-wrapper.tsx`
+  composes the camera/sample panel and the Finish setup button in
+  the same client boundary. The wrapper does NOT add new logic; it
+  forwards the server-derived flags and a `router.refresh()`
+  reconciliation callback to the sample panel.
+
+### Visibility contract
+
+The button is rendered ONLY when:
+
+1. `canFinish === true` (server-authoritative: the temporary
+   enrollment has reached the configured `requiredSamples` count),
+   AND
+2. `faceProfileConfigured === false` (no durable `FaceProfile`
+   already in place for this user).
+
+At 0/5, 1/5, 2/5, 3/5, or 4/5 the button is hidden. The button is
+also hidden after the user has already configured Face ID. The
+`/face-id/setup` page already redirects to `/face-id` when a durable
+profile is in place, so the second condition is enforced both at
+the page level and at the component level.
+
+### Explicit-action contract
+
+Finalization is NEVER automatic. The `finishFaceEnrollment()`
+Server Action is invoked ONLY when the user clicks the button. The
+component does NOT call the action from:
+
+- `useEffect` (mount, props update, prop reconciliation)
+- page load
+- `router.refresh()`
+- progress updates
+- camera callbacks
+- `getUserMedia` callbacks
+
+### Zero-argument action
+
+The Server Action is invoked with zero arguments
+(`finishFaceEnrollment()`). Identity, profile state, enrollment
+state, generation, claim, and biometric data are all derived
+server-side from the Better Auth session and the B2C orchestrator.
+
+### Double-click protection
+
+A synchronous `finishInFlightRef` guards against two rapid clicks
+landing in the same React dispatch tick. The ref is checked and set
+BEFORE the first `await`, so the second click observes the guard
+immediately and is silently dropped. The ref is released after a
+failed action so the user can explicitly retry when the contract
+allows (retryable errors only). On success the user is navigated
+away via `router.replace("/face-id")`; a second invocation is not
+needed.
+
+### Pending state
+
+While the action is in flight, the button is disabled and labelled
+"Finishing setup…". The "Capture sample", "Start setup", and other
+controls in the page continue to be governed by the camera/sample
+panel logic; the Finish button does not interfere with them.
+
+### Success navigation
+
+On `ok: true` / `configured: true` the UI calls
+`router.replace("/face-id")`. The URL never receives biometric
+values. `router.replace` (not `push`) is used so the Back button
+cannot return the user to the completion screen.
+
+### Browser persistence
+
+The Finish setup flow does NOT write to `localStorage`,
+`sessionStorage`, `IndexedDB`, or the `Cache` API. The durable
+commit point is the `FaceProfile` document in MongoDB; the action's
+safe result is only useful for the immediate UI flow.
+
+### Error feedback
+
+Safe error codes from B3A are mapped to a small, restrained
+heading / body pair and rendered with `role="alert"`. The mapping
+never references thresholds, model identifiers, service URLs, or
+raw error strings. Retryable errors keep the user on the 5/5
+setup state and allow another explicit click. Non-retryable
+errors render the safe message without auto-restart; a later phase
+may add a richer recovery affordance. Expired / not-found /
+incomplete / generation-changed states trigger a single, safe
+`router.refresh()` so the server-rendered setup shell can present
+the next valid state.
+
+### Camera regression
+
+The Finish setup flow does NOT restart the camera, request
+`getUserMedia`, capture another image, or call the sample upload
+endpoint. It is purely a UI action that invokes the completion
+Server Action.
+
+### What PHASE 4.6B3B does NOT do
+
+- No automatic finalization — the button is the ONLY trigger.
+- No re-enrollment flow.
+- No delete-Face-ID flow.
+- No public `/api/face-id/enrollment/finalize` route.
+- No additional Face Service endpoint.
+- No browser-side persistence (`localStorage` / `sessionStorage` /
+  `IndexedDB` / `Cache`).
+- No biometric data in the URL.
+- No biometric fields in the rendered DOM (centroid, generation,
+  claim, ciphertext, authTag, keyVersion, model identity).
+- No automatic retry.
+- No camera restart / new capture.
+
 ## Phase plan
 
 | Phase | Goal |
@@ -2330,6 +2481,7 @@ separate authorization layer.
 | **4.6B2B** | **Claim-bound `FaceProfile` persistence (server-only `persistFinalizedFaceProfileForUser`): runs B1B to obtain `sourceGenerationId`, acquires B2A atomic claim, re-validates the claimed session, validates `mode`/`templateVersion`/`normalization`, cross-checks B1B model metadata against the claimed session, validates the encrypted sample index set, encrypts the centroid with `encryptBiometricVector` using the existing AAD contract `(userId, modelIdentity, templateVersion, vectorType="centroid")`, copies encrypted sample envelopes verbatim, persists via `saveFinalizedFaceProfile` (idempotent). New internal `sourceEnrollmentGenerationId` lineage field — optional at the schema level for legacy compatibility, required for new persistence. First write creates; same-generation retry returns idempotent success and preserves `enrolledAt`; different-generation create rejected with `FACE_PROFILE_ALREADY_EXISTS` (no overwrite). On failure BEFORE successful persistence, releases own claim (best-effort, never masks the original error). On success, keeps the claim and the temporary session for PHASE 4.6B2C. No MongoDB multi-document transaction. No browser route / Server Action / UI. No enrollment session deletion. No plaintext logging of centroid / claimToken / lineage.** |
 | **4.6B2C** | **Temporary-enrollment consumption + post-persistence crash-recovery orchestration (server-only `completeFinalizedFaceEnrollmentForUser`): pre-flight inspects the existing `FaceProfile`. NORMAL path: no profile yet → invoke B2B to persist a `FaceProfile`, then atomically consume the matching temporary session via the strict CAS primitive `consumeEnrollmentSession({ userId, generationId, claimToken })` (single `findOneAndDelete` filter — `userId` + `generationId` + `finalizationClaim.token` + `finalizationClaim.generationId`). CRASH-RECOVERY path: a profile already exists → prove lineage via `FaceProfile.sourceEnrollmentGenerationId`, then lineage-bound CAS-consume via `recoverAndConsumeEnrollmentSession({ userId, generationId })` (single `findOneAndDelete` filter — `userId` + `generationId`, no claim token required). FaceProfile is the durable commit point; cleanup is idempotent. A retry NEVER reruns B1B, NEVER calls the Face Service, NEVER decrypts or re-encrypts samples, NEVER rewrites the `FaceProfile`. A different temp generation is NEVER deleted. A TTL-removed or already-consumed temp session is treated as idempotent success (`already_consumed`). Legacy profiles without `sourceEnrollmentGenerationId` are still readable; no temp session is deleted by inference. Result is `FinalizedEnrollmentCompletion { configured, enrolledAt, sampleCount, cleanupStatus }` — never includes `userId`, `claimToken`, `sourceEnrollmentGenerationId`, `centroid`, ciphertext / IV / authTag. No MongoDB transaction. No direct Face Service fetch. No browser route / Server Action / UI. No re-enrollment. No `releaseEnrollmentFinalizationClaim` / claim release on cleanup path.** |
 | **4.6B3A** | **Authenticated enrollment completion Server Action (`finishFaceEnrollment` in `enrollment-completion-action.ts`): zero-argument `"use server"` action that derives identity EXCLUSIVELY from `auth.api.getSession()` (Better Auth server session), gates on a completed `Profile` via `isOnboardingComplete`, delegates to `completeFinalizedFaceEnrollmentForUser(session.user.id)` EXACTLY ONCE. No browser-supplied `userId` / `generationId` / `claimToken` / `centroid`. Safe success result `FaceEnrollmentCompletionActionResult { ok, configured, faceId: { enrolledAt, sampleCount }, cleanupStatus }` — never includes `userId`, `generationId`, `sourceEnrollmentGenerationId`, `claimToken`, `centroid`, ciphertext, IV, authTag, keyVersion, or model metadata. Discriminated-union error result maps every typed upstream error (B1B / B2A / B2B / B2C / Face Service / persistence / encryption) into a small, stable, browser-facing enum (`UNAUTHENTICATED`, `PROFILE_INCOMPLETE`, `ENROLLMENT_SESSION_NOT_FOUND`, `ENROLLMENT_SESSION_EXPIRED`, `ENROLLMENT_INCOMPLETE`, `ENROLLMENT_GENERATION_CHANGED`, `ENROLLMENT_SAMPLE_DECRYPTION_FAILED`, `ENROLLMENT_SAMPLE_VECTOR_INVALID`, `ENROLLMENT_FINALIZATION_ALREADY_CLAIMED`, `ENROLLMENT_FINALIZATION_IN_PROGRESS`, `FACE_PROFILE_ALREADY_EXISTS`, `INCONSISTENT_FACE_SAMPLES`, `MODEL_MISMATCH`, `BIOMETRIC_ENCRYPTION_UNAVAILABLE`, `FACE_SERVICE_TIMEOUT`, `FACE_SERVICE_UNAVAILABLE`, `FACE_SERVICE_UNAUTHORIZED`, `FACE_SERVICE_INVALID_RESPONSE`, `ENROLLMENT_COMPLETION_FAILED`). Idempotent: re-invoking the action on an already-configured user returns `configured: true` with `cleanupStatus: "already_consumed"` — no fabricated error. NO automatic retry. NO `router.refresh` / `redirect` / `revalidatePath`. NO public `/api/face-id/enrollment/finalize` route. NO Finish setup button — UI consumption belongs to PHASE 4.6B3B.** |
+| **4.6B3B** | **Explicit "Finish setup" UI (`EnrollmentFinishButton` client component + `EnrollmentSamplePanelWrapper` composition): renders a single "Finish setup" button on `/face-id/setup` ONLY when the server-derived `canFinish` flag is true (temporary enrollment is in the configured complete state) AND `faceProfileConfigured` is false. The button is the ONLY browser-side trigger for `finishFaceEnrollment()` — it never auto-runs from a `useEffect`, page load, `router.refresh()`, progress update, or camera callback. The Server Action is invoked with ZERO arguments. A synchronous `finishInFlightRef` ensures two rapid clicks collapse into exactly ONE Server Action invocation. On success the UI navigates to `/face-id` via `router.replace(...)` so Back cannot return to the completion screen; the URL never receives biometric values. The component receives NO `userId`, `generationId`, `claimToken`, `centroid`, sample data, or model metadata. NO `localStorage` / `sessionStorage` / `IndexedDB` / `Cache` persistence. NO direct `fetch()` to the Face Service. NO camera restart / new capture / `getUserMedia`. NO automatic retry on failure; retryable errors keep the user on the 5/5 setup state and allow another explicit click. Expired / generation-changed / not-found / incomplete states trigger a single, safe `router.refresh()` to reconcile the server-rendered setup shell without re-invoking the action. NO public `/api/face-id/enrollment/finalize` route. NO re-enrollment / delete-Face-ID flows.** |
 | 4.4B | Next.js Face ID API routes + enrollment session orchestration. |
 | 5 | Classroom creation and join-by-code+password. |
 | 6 | Attendance session lifecycle. |

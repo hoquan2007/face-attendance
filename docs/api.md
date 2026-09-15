@@ -1,6 +1,6 @@
 # API
 
-> Status: **Phase 4.6B3A** — PHASE 4.4A shipped the Next.js server-only
+> Status: **Phase 4.6B3B** — PHASE 4.4A shipped the Next.js server-only
 > `FaceServiceClient`. PHASE 4.4B1 shipped the first Next.js Face ID
 > route — `POST /api/face-id/enrollment/start` — which safely starts a
 > temporary enrollment session for the authenticated user.
@@ -88,7 +88,7 @@ Base URL: `${NEXT_PUBLIC_APP_URL}`
 | `/api/face-id/enrollment/sample` | Submit one enrollment sample image. Server-side Face Service call, AES-256-GCM encryption. Authenticated, active enrollment required. | **4.4C** |
 | `/api/face/enroll` | Submit a single enrollment frame (multipart JPEG). | 4.4B |
 | — _no finalize endpoint_ | PHASE 4.6B2B performs claim-bound `FaceProfile` persistence entirely server-only via `persistFinalizedFaceProfileForUser(userId)`. There is intentionally NO browser-visible finalize route, Server Action, or UI in this phase. Cleanup / session consumption belongs to PHASE 4.6B2C. | **4.6B2B** |
-| `finishFaceEnrollment()` *(Server Action)* | Zero-argument authenticated Server Action that wraps `completeFinalizedFaceEnrollmentForUser`. Identity derives exclusively from the Better Auth session; the action gates on a completed `Profile` and returns a small safe browser result `{ ok, configured, faceId: { enrolledAt, sampleCount }, cleanupStatus }`. No biometric payload, no claim token, no `userId`/`generationId`/`centroid`/ciphertext exposure. NO `POST /api/face-id/enrollment/finalize` route exists — the Server Action is the only entry point. | **4.6B3A** |
+| `finishFaceEnrollment()` *(Server Action)* | Zero-argument authenticated Server Action that wraps `completeFinalizedFaceEnrollmentForUser`. Identity derives exclusively from the Better Auth session; the action gates on a completed `Profile` and returns a small safe browser result `{ ok, configured, faceId: { enrolledAt, sampleCount }, cleanupStatus }`. No biometric payload, no claim token, no `userId`/`generationId`/`centroid`/ciphertext exposure. NO `POST /api/face-id/enrollment/finalize` route exists — the Server Action is the only entry point. PHASE 4.6B3B consumes this Server Action from the `EnrollmentFinishButton` client component (zero-argument invocation, double-click protected, navigates to `/face-id` on success). | **4.6B3A / 4.6B3B** |
 | `/api/classes` | List / create / get classes. | 5 |
 | `/api/classes/join` | Join with `classCode` + `classPassword`. | 5 |
 | `/api/classes/:id/members` | Manage members (teacher only). | 5 |
@@ -1187,3 +1187,102 @@ PHASE 4.6B3B. B3A is pure authenticated action plumbing.
 - No `router.refresh` / `redirect` / `revalidatePath`.
 - No re-enrollment flow.
 - No `console.log` of biometric data.
+
+## Finish setup UI (PHASE 4.6B3B)
+
+PHASE 4.6B3B adds the user-visible trigger for the temporary
+enrollment → durable `FaceProfile` transition. It does NOT add any
+new HTTP surface; it consumes the PHASE 4.6B3A
+`finishFaceEnrollment()` Server Action through the
+`EnrollmentFinishButton` client component.
+
+### Visibility contract
+
+The "Finish setup" button is rendered inside the
+`EnrollmentSamplePanelWrapper` (composed on `/face-id/setup`) ONLY
+when:
+
+1. `canFinish === true` — the server reports the temporary
+   enrollment has reached `requiredSamples` (5/5 complete state).
+2. `faceProfileConfigured === false` — no durable `FaceProfile`
+   already exists. The setup page additionally redirects to
+   `/face-id` when a profile is configured, so this branch is
+   enforced at both the page and the component level.
+
+At 0/5, 1/5, 2/5, 3/5, or 4/5 the button is hidden. The button is
+also hidden after a successful enrollment.
+
+### Action contract
+
+The button is the ONLY browser-side trigger for the
+`finishFaceEnrollment()` Server Action. The component does NOT call
+the action from:
+
+- `useEffect` (mount, props update, prop reconciliation)
+- page load
+- `router.refresh()`
+- progress updates
+- camera callbacks
+- `getUserMedia` callbacks
+
+The action is invoked with ZERO arguments. The browser does NOT
+forward `userId`, `generationId`, `claimToken`, sample count, or
+model metadata.
+
+### Double-click protection
+
+A synchronous `finishInFlightRef` guards the action invocation. Two
+rapid clicks collapse into exactly ONE Server Action call. The ref
+is released after a failed action so the user can explicitly retry
+when the error is retryable. On success the user is navigated to
+`/face-id` via `router.replace(...)`; a second invocation is not
+needed.
+
+### Pending state
+
+While the action is in flight, the button is disabled and labelled
+"Finishing setup…". No other controls are intercepted; the camera
+sample panel retains its own state machine.
+
+### Success navigation
+
+`router.replace("/face-id")` is used so the Back button cannot
+return the user to the completion screen. The URL never receives
+biometric values.
+
+### Error feedback
+
+The button maps the safe B3A error codes to a small, restrained
+heading / body pair rendered with `role="alert"`. The mapping
+never references thresholds, model identifiers, service URLs, or
+raw error strings. Retryable errors keep the user on the 5/5
+setup state and allow another explicit click. Non-retryable
+errors render the safe message without auto-restart; a later phase
+may add a richer recovery affordance. Expired /
+generation-changed / not-found / incomplete states trigger a
+single, safe `router.refresh()` to reconcile the server-rendered
+setup shell without re-invoking the action.
+
+### No public finalize API
+
+PHASE 4.6B3B deliberately does NOT add
+`POST /api/face-id/enrollment/finalize` or any other HTTP route.
+The PHASE 4.6B3A Server Action remains the only entry point.
+
+### Browser persistence
+
+The Finish setup flow does NOT write to `localStorage`,
+`sessionStorage`, `IndexedDB`, or the `Cache` API. The durable
+commit point is the `FaceProfile` document in MongoDB.
+
+### What PHASE 4.6B3B does NOT add
+
+- No `POST /api/face-id/enrollment/finalize` route.
+- No automatic finalization — the button is the ONLY trigger.
+- No automatic retry.
+- No re-enrollment flow.
+- No delete-Face-ID flow.
+- No camera restart / new capture.
+- No biometric fields in the URL.
+- No biometric fields in the rendered DOM.
+- No `localStorage` / `sessionStorage` / `IndexedDB` writes.

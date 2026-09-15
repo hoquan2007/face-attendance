@@ -1,6 +1,6 @@
 # Privacy & Security
 
-> Status: **Phase 4.6B3A** — PHASE 4.6A1 shipped the pure enrollment finalization
+> Status: **Phase 4.6B3B** — PHASE 4.6A1 shipped the pure enrollment finalization
 > math foundation. PHASE 4.6A2 adds the protected internal finalization
 > endpoint (`POST /v1/faces/enrollment/finalize`) that receives
 > already-decrypted, already-L2-normalized embeddings from the trusted
@@ -83,6 +83,31 @@
 > the response. The action does NOT add a public
 > `/api/face-id/enrollment/finalize` route. The action does NOT add
 > a Finish setup button — UI consumption belongs to PHASE 4.6B3B.
+
+> PHASE 4.6B3B introduces the user-visible "Finish setup" button.
+> The button is the ONLY browser-side trigger for the B3A Server
+> Action. The button does NOT receive `userId`, `generationId`,
+> `claimToken`, `centroid`, sample data, or model metadata. The
+> Server Action is invoked with ZERO arguments. The button does
+> NOT write to `localStorage`, `sessionStorage`, `IndexedDB`, or
+> the `Cache` API. The button does NOT issue `fetch()` to the
+> Face Service. The button does NOT restart the camera, request
+> `getUserMedia`, or capture another image. The button does NOT
+> auto-retry. The rendered DOM does NOT contain `centroid`,
+> `generationId`, `sourceEnrollmentGenerationId`, `claimToken`,
+> `ciphertext`, `authTag`, `keyVersion`, or any model identifier.
+> On success the user is navigated to `/face-id` via
+> `router.replace(...)`; the URL never receives biometric values.
+> A synchronous `finishInFlightRef` guarantees two rapid clicks
+> collapse into exactly ONE Server Action invocation. Retryable
+> errors keep the user on the 5/5 setup state and allow another
+> explicit click; non-retryable errors render the safe B3A
+> message without auto-restart. Expired / generation-changed /
+> not-found / incomplete states trigger a single, safe
+> `router.refresh()` to reconcile the server-rendered setup
+> shell without re-invoking the action. PHASE 4.6B3B does NOT
+> introduce re-enrollment, delete-Face-ID, or any other
+> next-step UI.
 
 ## Biometric handling principles
 

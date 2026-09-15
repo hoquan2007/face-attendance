@@ -76,6 +76,19 @@ export default async function FaceIdSetupPage() {
           status.enrollment.requiredSamples || REQUIRED_SAMPLES,
         expiresAt: status.enrollment.expiresAt,
         generationId: status.enrollment.generationId,
+        // PHASE 4.6B3B — server-authoritative "can finalize" flag.
+        // The server decides whether the enrollment is in the
+        // complete (5/5) state. The browser never fabricates it.
+        canFinish: Boolean(
+          status.enrollment.active &&
+            status.enrollment.acceptedSamples >=
+              (status.enrollment.requiredSamples || REQUIRED_SAMPLES),
+        ),
+        // The setup page redirects to /face-id when a durable
+        // `FaceProfile` is in place, so `faceProfileConfigured` is
+        // always `false` here. We pass the explicit prop so the
+        // wrapper contract is self-documenting.
+        faceProfileConfigured: false,
       }
     : null;
 
@@ -134,6 +147,8 @@ export default async function FaceIdSetupPage() {
                 requiredSamples={activeSession.requiredSamples}
                 expiresAt={activeSession.expiresAt}
                 generationId={activeSession.generationId}
+                canFinish={activeSession.canFinish}
+                faceProfileConfigured={activeSession.faceProfileConfigured}
               />
             </CardContent>
           </Card>
