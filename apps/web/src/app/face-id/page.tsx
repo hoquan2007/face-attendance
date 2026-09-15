@@ -1,7 +1,7 @@
 /**
  * `/face-id` — Face ID overview page.
  *
- * PHASE 4.5B1 — Face ID Page Shell.
+ * PHASE 4.6B3C — Final Enrollment State Consistency + UX Polish.
  *
  * Server Component.
  *
@@ -10,10 +10,24 @@
  *   - profile incomplete  → redirect /onboarding
  *   - otherwise           → render safe overview based on status
  *
+ * Source-of-truth priority (PHASE 4.6B3C):
+ *   1. FaceProfile exists
+ *      → Face ID is CONFIGURED. The "Configured" branch wins even
+ *        if a leftover temporary EnrollmentSession still exists
+ *        (cleanup-pending, TTL-not-yet-reaped, post-B2B crash, etc.).
+ *        No "Continue setup" / "Finish setup" / "Start setup" /
+ *        "cleanup warning" / "claim status" is rendered.
+ *   2. no FaceProfile + active EnrollmentSession
+ *      → setup is IN PROGRESS, OR temporary 5/5 (samples
+ *        collected, Finish setup lives on /face-id/setup).
+ *   3. no FaceProfile + no active EnrollmentSession
+ *      → NOT CONFIGURED.
+ *
  * Only safe information is displayed:
- *   - Whether Face ID is configured
- *   - If configured: enrolledAt + sampleCount
- *   - If an enrollment session is active: progress and expiry
+ *   - Configured: enrolledAt + sampleCount
+ *   - In progress: N of 5 samples + expiry
+ *   - Temporary 5/5: "All required samples collected." + Continue
+ *     setup → /face-id/setup (where Finish setup exists).
  *
  * NEVER displayed:
  *   - Embeddings, ciphertext, IV, authTag
@@ -21,6 +35,10 @@
  *   - Quality summaries
  *   - Centroids
  *   - userId / email
+ *   - generationId / sourceEnrollmentGenerationId / claimToken
+ *   - cleanup_status / claim status
+ *   - self-similarity scores
+ *   - threshold / model identity
  */
 
 import Link from "next/link";
@@ -101,6 +119,15 @@ export default async function FaceIdPage() {
                 enrolledAt={status.faceId!.enrolledAt}
                 sampleCount={status.faceId!.sampleCount}
               />
+            ) : status.enrollment.active &&
+              status.enrollment.acceptedSamples >=
+                (status.enrollment.requiredSamples || REQUIRED_SAMPLES) ? (
+              <SamplesCollectedState
+                requiredSamples={
+                  status.enrollment.requiredSamples || REQUIRED_SAMPLES
+                }
+                expiresAt={status.enrollment.expiresAt!}
+              />
             ) : status.enrollment.active ? (
               <InProgressState
                 acceptedSamples={status.enrollment.acceptedSamples}
@@ -147,8 +174,7 @@ function NotConfiguredState() {
         <StatusBadge tone="pending" label="Not configured" />
       </div>
       <p className="text-sm leading-[21px] text-muted-foreground">
-        Face ID hasn&apos;t been set up yet. Set it up to enable face
-        recognition for attendance.
+        Face ID hasn&apos;t been set up yet.
       </p>
       <div className="flex flex-wrap gap-2">
         <EnrollmentStartButton label="Set up Face ID" />
@@ -158,7 +184,7 @@ function NotConfiguredState() {
 }
 
 /**
- * State B: Enrollment is in progress.
+ * State B: Enrollment is in progress (N of 5 samples, N < required).
  */
 function InProgressState({
   acceptedSamples,
@@ -170,26 +196,57 @@ function InProgressState({
   expiresAt: string;
 }) {
   const expiryText = formatExpiry(expiresAt);
-  const isComplete = acceptedSamples >= requiredSamples;
   return (
     <div className="flex flex-col gap-5">
       <div className="flex flex-wrap items-center gap-2">
-        <StatusBadge
-          tone={isComplete ? "success" : "info"}
-          label={isComplete ? "Setup complete" : "Setup in progress"}
-        />
+        <StatusBadge tone="info" label="Setup in progress" />
       </div>
       <p className="text-sm leading-[21px] text-muted-foreground">
         {acceptedSamples} of {requiredSamples} samples collected.
-        {isComplete
-          ? " Final setup has not been completed yet."
-          : ""}
       </p>
       <p className="text-xs leading-[18px] text-muted-foreground">
         Session {expiryText}.
-        {isComplete
-          ? " Start final setup to activate Face ID."
-          : ""}
+      </p>
+      <div className="flex flex-wrap gap-2">
+        <Button asChild>
+          <Link href="/face-id/setup">Continue setup</Link>
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * State B': Temporary 5/5 (all required samples collected, no
+ * durable FaceProfile yet).
+ *
+ * This is an HONEST INTERMEDIATE state. The badge says "Samples
+ * collected", NOT "Configured". The CTA routes to the setup page
+ * where the explicit "Finish setup" action lives. Until the user
+ * explicitly finishes setup and a durable FaceProfile is persisted,
+ * the durable enrollment is NOT configured.
+ */
+function SamplesCollectedState({
+  requiredSamples,
+  expiresAt,
+}: {
+  requiredSamples: number;
+  expiresAt: string;
+}) {
+  const expiryText = formatExpiry(expiresAt);
+  return (
+    <div className="flex flex-col gap-5">
+      <div className="flex flex-wrap items-center gap-2">
+        <StatusBadge tone="info" label="Samples collected" />
+      </div>
+      <p className="text-sm leading-[21px] text-muted-foreground">
+        All {requiredSamples} required samples have been collected.
+      </p>
+      <p className="text-sm leading-[21px] text-muted-foreground">
+        Finish setup to complete Face ID.
+      </p>
+      <p className="text-xs leading-[18px] text-muted-foreground">
+        Session {expiryText}.
       </p>
       <div className="flex flex-wrap gap-2">
         <Button asChild>

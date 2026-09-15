@@ -1,18 +1,6 @@
 # API
 
-> Status: **Phase 4.6B3B** — PHASE 4.4A shipped the Next.js server-only
-> `FaceServiceClient`. PHASE 4.4B1 shipped the first Next.js Face ID
-> route — `POST /api/face-id/enrollment/start` — which safely starts a
-> temporary enrollment session for the authenticated user.
-> PHASE 4.4B2 added the read-only status route
-> `GET /api/face-id/enrollment/status`, which reports the safe current
-> state of the user's Face ID enrollment without exposing any
-> biometric data. PHASE 4.4C adds the sample upload route
-> `POST /api/face-id/enrollment/sample`, which accepts one image,
-> forwards it to the Face Service, encrypts accepted embeddings,
-> and stores them in the temporary enrollment session.
-> Camera UI, finalization, and re-enrollment belong to later phases.
-> PHASE 4.6B1A extends the existing server-only `FaceServiceClient`
+> Status: **Phase 4.6B3C** — PHASE 4.6B3A shipped the authenticated `finishFaceEnrollment()` Server Action. PHASE 4.6B3B shipped the explicit "Finish setup" UI button on `/face-id/setup`. PHASE 4.6B3C is the final enrollment state consistency + UX polish phase. It does NOT add biometric core behavior, re-enrollment, Face ID deletion, or attendance features.
 > with a `finalizeFaceEnrollment(...)` function that calls
 > `POST /v1/faces/enrollment/finalize`. The function is the
 > server-only Next.js client for the protected finalization endpoint;

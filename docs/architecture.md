@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: **Phase 4.6B3B** — PHASE 4.6A1 shipped the pure enrollment finalization
+> Status: **Phase 4.6B3C** — PHASE 4.6B3A shipped the authenticated `finishFaceEnrollment()` Server Action. PHASE 4.6B3B shipped the explicit "Finish setup" UI button on `/face-id/setup`. PHASE 4.6B3C is the final enrollment state consistency + UX polish phase. It does NOT add biometric core behavior, re-enrollment, Face ID deletion, or attendance features.
 > math foundation. PHASE 4.6A2 adds the protected internal finalization
 > endpoint (`POST /v1/faces/enrollment/finalize`) that receives
 > already-decrypted, already-L2-normalized embeddings from the trusted
@@ -517,14 +517,31 @@ outcome).
 
 ### `/face-id` page
 
-The overview page renders one of three conceptual states, all
-derived from the shared status service:
+The overview page renders one of four conceptual states, all derived
+from the shared status service:
 
 | State | UI |
 | --- | --- |
-| Not configured, no active enrollment | "Face ID — Not configured" + "Set up Face ID" → `/face-id/setup` |
-| Not configured, active enrollment | "Setup in progress" + "N of 5 samples" + expiry copy + "Continue setup" → `/face-id/setup` |
-| Configured | "Face ID — Configured" + enrolled date + sample count |
+| Configured (FaceProfile exists) | "Configured" + enrolled date + sample count |
+| Configured + residual temp session | "Configured" (FaceProfile outranks temp residue) |
+| Not configured, active enrollment (N < 5) | "Setup in progress" + "N of 5 samples" + expiry copy + "Continue setup" → `/face-id/setup` |
+| Not configured, 5/5 temp (no FaceProfile yet) | "Samples collected" + honest intermediate copy + "Continue setup" → `/face-id/setup` |
+| Not configured, no active enrollment | "Not configured" + "Set up Face ID" → `/face-id/setup` |
+
+**PHASE 4.6B3C — Source-of-truth priority:**
+1. `FaceProfile` exists → **CONFIGURED**. The durable profile outranks any
+   leftover temporary `FaceEnrollmentSession` (cleanup-pending, TTL-not-yet-reaped,
+   post-B2B crash, etc.). No "Continue setup" / "Finish setup" / "Start setup" /
+   cleanup warning / claim status is rendered.
+2. No `FaceProfile` + active session → IN PROGRESS or SAMPLES COLLECTED.
+3. No `FaceProfile` + no active session → NOT CONFIGURED.
+
+The temporary 5/5 state is an **honest intermediate state** — it shows
+"All required samples collected" and routes to `/face-id/setup` for the
+explicit Finish setup action. It does NOT say "Configured" or "identity verified".
+
+Legacy `FaceProfile` documents (pre-dating `sourceEnrollmentGenerationId`)
+are rendered as Configured without requiring the lineage field.
 
 No biometric payload is rendered. No replace/delete actions are
 exposed. No fabricated metrics (recognition accuracy, confidence,
@@ -2324,6 +2341,90 @@ separate authorization layer.
 - No `router.refresh` / `redirect` / `revalidatePath`.
 - No `console.log` of biometric data.
 
+## Phase 4.6B3C — Final enrollment state consistency + UX polish
+
+PHASE 4.6B3C is the final enrollment polish phase. It does NOT add:
+- Biometric core behavior
+- Re-enrollment
+- Face ID deletion
+- Attendance / classes
+
+### FaceProfile as the durable source of truth
+
+`FaceProfile` is the durable commit point. Once it exists, it outranks any
+simultaneously-present temporary `FaceEnrollmentSession` document. This matters
+because B2C deliberately treats `FaceProfile` as the durable commit point —
+cleanup is post-commit and asynchronous.
+
+The following UI invariants hold for B3C:
+
+| Condition | UI |
+| --- | --- |
+| `FaceProfile` exists | `/face-id` → **Configured**. `/face-id/setup` → redirect `/face-id`. |
+| `FaceProfile` + residual partial temp session | Same as above — configured outranks residue. |
+| `FaceProfile` + residual 5/5 temp session | Same as above — configured outranks residue. |
+| No profile + active session + N < 5 | "Setup in progress" + "N of 5 samples" + Continue setup. |
+| No profile + active 5/5 | "Samples collected" + honest intermediate copy + Continue setup. |
+| No profile + no session | "Not configured" + Set up Face ID. |
+
+### Configured outranks temporary enrollment residue
+
+A `FaceProfile` existence is the only thing that makes Face ID "Configured".
+A leftover temporary session (B2B post-persistence, TTL-not-yet-reaped,
+cleanup-pending, crash-recovery residue) is never surfaced to the user
+when a `FaceProfile` already exists. The `/face-id` page checks
+`status.configured === true` first; the `/face-id/setup` page redirects
+to `/face-id` when `status.configured === true`. No UI surface is added
+to expose cleanup state, claim status, or temporary session residue.
+
+### Setup page configured guard
+
+`/face-id/setup` redirects to `/face-id` when a durable `FaceProfile`
+already exists. This guard is enforced at the Server Component level (before
+rendering any camera or finish controls). It holds even when a temporary
+session also exists. Direct URL navigation after completion safely redirects.
+
+### No automatic camera or finalization
+
+B3C does not change camera privacy guarantees. Direct navigation to
+`/face-id` or `/face-id/setup` never calls `getUserMedia` without an
+explicit button press. 5/5 never auto-finalizes — explicit "Finish setup"
+on the setup page is the only trigger.
+
+### Legacy `FaceProfile` compatibility
+
+Existing legacy `FaceProfile` documents may not contain
+`sourceEnrollmentGenerationId` (they predate PHASE 4.6B2B). They are
+rendered as Configured using their `enrolledAt` and `sampleCount` fields.
+The status service does not require the lineage field to report configured.
+
+### Status service privacy
+
+`GET /api/face-id/enrollment/status` and the `face-id-status-service`
+module do not expose:
+
+- `sourceEnrollmentGenerationId`
+- `generationId` (enrollment session is safe to expose as reconciliation token)
+- `centroid`
+- `claimToken` / `finalizationClaim`
+- `ciphertext` / `iv` / `authTag`
+- plaintext embeddings
+
+`generationId` on the enrollment session is safe to expose because it
+is a non-secret UUID used as the reload/multi-tab reconciliation token;
+the Face Service does not accept it as authentication.
+
+### What B3C does NOT implement
+
+- No session deletion, cleanup endpoint, or background cleanup from the UI layer.
+- No automatic camera trigger.
+- No automatic finalization.
+- No re-enrollment flow.
+- No Face ID deletion flow.
+- No attendance / classes integration.
+- No public `/api/face-id/enrollment/finalize` route.
+- No browser storage of configured state (`localStorage` / `sessionStorage`).
+
 ## Phase 4.6B3B — explicit "Finish setup" UI
 
 PHASE 4.6B3B introduces the user-visible trigger for the temporary
@@ -2482,6 +2583,7 @@ Server Action.
 | **4.6B2C** | **Temporary-enrollment consumption + post-persistence crash-recovery orchestration (server-only `completeFinalizedFaceEnrollmentForUser`): pre-flight inspects the existing `FaceProfile`. NORMAL path: no profile yet → invoke B2B to persist a `FaceProfile`, then atomically consume the matching temporary session via the strict CAS primitive `consumeEnrollmentSession({ userId, generationId, claimToken })` (single `findOneAndDelete` filter — `userId` + `generationId` + `finalizationClaim.token` + `finalizationClaim.generationId`). CRASH-RECOVERY path: a profile already exists → prove lineage via `FaceProfile.sourceEnrollmentGenerationId`, then lineage-bound CAS-consume via `recoverAndConsumeEnrollmentSession({ userId, generationId })` (single `findOneAndDelete` filter — `userId` + `generationId`, no claim token required). FaceProfile is the durable commit point; cleanup is idempotent. A retry NEVER reruns B1B, NEVER calls the Face Service, NEVER decrypts or re-encrypts samples, NEVER rewrites the `FaceProfile`. A different temp generation is NEVER deleted. A TTL-removed or already-consumed temp session is treated as idempotent success (`already_consumed`). Legacy profiles without `sourceEnrollmentGenerationId` are still readable; no temp session is deleted by inference. Result is `FinalizedEnrollmentCompletion { configured, enrolledAt, sampleCount, cleanupStatus }` — never includes `userId`, `claimToken`, `sourceEnrollmentGenerationId`, `centroid`, ciphertext / IV / authTag. No MongoDB transaction. No direct Face Service fetch. No browser route / Server Action / UI. No re-enrollment. No `releaseEnrollmentFinalizationClaim` / claim release on cleanup path.** |
 | **4.6B3A** | **Authenticated enrollment completion Server Action (`finishFaceEnrollment` in `enrollment-completion-action.ts`): zero-argument `"use server"` action that derives identity EXCLUSIVELY from `auth.api.getSession()` (Better Auth server session), gates on a completed `Profile` via `isOnboardingComplete`, delegates to `completeFinalizedFaceEnrollmentForUser(session.user.id)` EXACTLY ONCE. No browser-supplied `userId` / `generationId` / `claimToken` / `centroid`. Safe success result `FaceEnrollmentCompletionActionResult { ok, configured, faceId: { enrolledAt, sampleCount }, cleanupStatus }` — never includes `userId`, `generationId`, `sourceEnrollmentGenerationId`, `claimToken`, `centroid`, ciphertext, IV, authTag, keyVersion, or model metadata. Discriminated-union error result maps every typed upstream error (B1B / B2A / B2B / B2C / Face Service / persistence / encryption) into a small, stable, browser-facing enum (`UNAUTHENTICATED`, `PROFILE_INCOMPLETE`, `ENROLLMENT_SESSION_NOT_FOUND`, `ENROLLMENT_SESSION_EXPIRED`, `ENROLLMENT_INCOMPLETE`, `ENROLLMENT_GENERATION_CHANGED`, `ENROLLMENT_SAMPLE_DECRYPTION_FAILED`, `ENROLLMENT_SAMPLE_VECTOR_INVALID`, `ENROLLMENT_FINALIZATION_ALREADY_CLAIMED`, `ENROLLMENT_FINALIZATION_IN_PROGRESS`, `FACE_PROFILE_ALREADY_EXISTS`, `INCONSISTENT_FACE_SAMPLES`, `MODEL_MISMATCH`, `BIOMETRIC_ENCRYPTION_UNAVAILABLE`, `FACE_SERVICE_TIMEOUT`, `FACE_SERVICE_UNAVAILABLE`, `FACE_SERVICE_UNAUTHORIZED`, `FACE_SERVICE_INVALID_RESPONSE`, `ENROLLMENT_COMPLETION_FAILED`). Idempotent: re-invoking the action on an already-configured user returns `configured: true` with `cleanupStatus: "already_consumed"` — no fabricated error. NO automatic retry. NO `router.refresh` / `redirect` / `revalidatePath`. NO public `/api/face-id/enrollment/finalize` route. NO Finish setup button — UI consumption belongs to PHASE 4.6B3B.** |
 | **4.6B3B** | **Explicit "Finish setup" UI (`EnrollmentFinishButton` client component + `EnrollmentSamplePanelWrapper` composition): renders a single "Finish setup" button on `/face-id/setup` ONLY when the server-derived `canFinish` flag is true (temporary enrollment is in the configured complete state) AND `faceProfileConfigured` is false. The button is the ONLY browser-side trigger for `finishFaceEnrollment()` — it never auto-runs from a `useEffect`, page load, `router.refresh()`, progress update, or camera callback. The Server Action is invoked with ZERO arguments. A synchronous `finishInFlightRef` ensures two rapid clicks collapse into exactly ONE Server Action invocation. On success the UI navigates to `/face-id` via `router.replace(...)` so Back cannot return to the completion screen; the URL never receives biometric values. The component receives NO `userId`, `generationId`, `claimToken`, `centroid`, sample data, or model metadata. NO `localStorage` / `sessionStorage` / `IndexedDB` / `Cache` persistence. NO direct `fetch()` to the Face Service. NO camera restart / new capture / `getUserMedia`. NO automatic retry on failure; retryable errors keep the user on the 5/5 setup state and allow another explicit click. Expired / generation-changed / not-found / incomplete states trigger a single, safe `router.refresh()` to reconcile the server-rendered setup shell without re-invoking the action. NO public `/api/face-id/enrollment/finalize` route. NO re-enrollment / delete-Face-ID flows.** |
+| **4.6B3C** | **Final enrollment state consistency + UX polish**: `FaceProfile` is the durable configured source of truth. When a `FaceProfile` exists, the `/face-id` overview renders "Configured" and the `/face-id/setup` page redirects to `/face-id` — even if a temporary `FaceEnrollmentSession` document still exists (cleanup-pending, TTL-not-yet-reaped, B2C post-persistence residue, etc.). No "Continue setup" / "Finish setup" / "Start setup" / cleanup warning / claim status is rendered when a profile is configured. Temporary 5/5 is an honest intermediate state: "Samples collected" + "Finish setup to complete Face ID" + Continue setup CTA (routes to setup page where the explicit Finish action lives). Legacy `FaceProfile` documents without `sourceEnrollmentGenerationId` render as Configured. Status service / API do not expose `sourceEnrollmentGenerationId`, `claimToken`, `centroid`, ciphertext, IV, authTag, or plaintext embeddings. No automatic camera, no automatic finalization, no browser persistence, no public finalize API. No re-enrollment, no Face ID deletion, no attendance.** |
 | 4.4B | Next.js Face ID API routes + enrollment session orchestration. |
 | 5 | Classroom creation and join-by-code+password. |
 | 6 | Attendance session lifecycle. |

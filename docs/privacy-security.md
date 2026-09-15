@@ -1,13 +1,6 @@
 # Privacy & Security
 
-> Status: **Phase 4.6B3B** — PHASE 4.6A1 shipped the pure enrollment finalization
-> math foundation. PHASE 4.6A2 adds the protected internal finalization
-> endpoint (`POST /v1/faces/enrollment/finalize`) that receives
-> already-decrypted, already-L2-normalized embeddings from the trusted
-> Next.js server and returns a consistency result plus a normalized
-> centroid. PHASE 4.6B1A extends the existing server-only Next.js
-> `FaceServiceClient` with a `finalizeFaceEnrollment(...)` function that
-> calls the protected finalization endpoint. PHASE 4.6B1B adds the
+> Status: **Phase 4.6B3C** — PHASE 4.6B3A shipped the authenticated `finishFaceEnrollment()` Server Action. PHASE 4.6B3B shipped the explicit "Finish setup" UI button on `/face-id/setup`. PHASE 4.6B3C is the final enrollment state consistency + UX polish phase.
 > server-only Next.js orchestration service
 > (`finalizeEnrollmentSessionForUser`) that loads the temporary
 > `FaceEnrollmentSession`, decrypts its accepted samples server-side
