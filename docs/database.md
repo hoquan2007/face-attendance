@@ -1,5 +1,7 @@
 # Database
 
+> Status: **Phase 6.1** — ATTENDANCE SESSION FOUNDATION. PHASE 6.1 adds the `attendance_sessions` collection (Mongoose `AttendanceSession` model) — server-only persistence for attendance session lifecycle. The collection captures one teacher's attendance window per class. An `AttendanceSession` document records `classId`, `status` (`"active"` | `"closed"`), `startedAt`, `endedAt` (nullable while active), `startedByUserId`, and an immutable `rosterSnapshot` array captured at start time. A partial unique index on `{ classId, status }` where `status === "active"` enforces "at most ONE active session per class" at the database level. NO additional collections are introduced for `AttendanceRecord`, per-student present / absent / late records, embeddings, or centroids — those are deliberate non-features in PHASE 6.1.
+
 > Status: **Phase 4.6B2C** — Better Auth collections are live in MongoDB
 > Atlas under the `face_attendance` database. The application `profiles`
 > collection (Phase 2) is managed by Mongoose. PHASE 4.2 introduced
@@ -560,6 +562,105 @@ compound unique index.
 - No class archive/restore actions.
 - No class password reset/recovery.
 - No biometric fields, FaceProfile references, or centroid references.
+
+## Phase 6.1 — attendance_sessions (persistence foundation)
+
+PHASE 6.1 introduces a single new application collection —
+`attendance_sessions` — for the **teacher start / stop
+attendance session** lifecycle. NO additional collections are
+introduced in PHASE 6.1. Per-student `attendance_records`,
+embeddings, centroids, and recognition events are NOT part of
+this phase.
+
+### `attendance_sessions` collection (Phase 6.1)
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `_id` | ObjectId | Mongoose default. |
+| `classId` | ObjectId → `classes._id` | Required, indexed. |
+| `status` | `"active"` \| `"closed"` | Required. Enumerated at the schema. Indexed. |
+| `startedAt` | Date | Server-side wall clock. |
+| `endedAt` | Date \| null | `null` while active; set server-side at stop time. |
+| `startedByUserId` | string | Better Auth ID of the teacher who started the session. Server-internal — not exposed to the browser. |
+| `rosterSnapshot` | array | Immutable, server-built. See sub-schema below. |
+| `createdAt`, `updatedAt` | Date | Mongoose timestamps. |
+
+### `attendance_sessions.rosterSnapshot[]` sub-schema
+
+Each entry is one student in the active roster at session
+start time. The snapshot is captured ONCE at session
+creation and is NEVER refreshed / mutated / recomputed.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `studentUserId` | string | Better Auth ID from the `ClassMembership` row. |
+| `fullNameSnapshot` | string | `Profile.fullName` at start time. |
+| `identificationCodeSnapshot` | string | `Profile.identificationCode` at start time. |
+
+The snapshot is **persistence data, not a browser DTO**.
+None of these IDs are auto-projected into Server Action
+results — the browser receives only a `rosterCount`
+aggregate.
+
+### Indexes (Phase 6.1)
+
+The Mongoose schema declares the following indexes on
+`attendance_sessions`:
+
+1. **`{ classId: 1 }`** — supports per-class listing and
+   the "latest closed session for class" fallback used by
+   stop idempotency.
+2. **`{ status: 1 }`** — supports active-session filtering
+   on the start action's pre-flight read.
+3. **`{ startedAt: 1 }`** — supports chronological listing
+   and the stop idempotency's "most-recently-closed
+   session" `find().sort({ startedAt: -1 }).limit(1)`.
+4. **`{ classId: 1, status: 1 }`** — **partial unique
+   index** with `partialFilterExpression: { status: "active" }`.
+   Name: `classId_status_active_unique`. This is the
+   **database-enforced** guarantee that at most ONE
+   active session exists per class. Concurrent start
+   requests that both try to create an active session for
+   the same class collide here atomically; the service
+   classifies the collision via
+   `isAttendanceSessionActiveDuplicateKeyError(...)` and
+   the action folds the loser into a safe idempotent
+   success — no E11000 ever reaches the browser.
+
+No redundant compound indexes are declared. The Mongoose
+schema is the single source of truth.
+
+### Lifecycle (database-enforced)
+
+```
+                  ┌── status: "active", endedAt: null ──┐
+                  │                                       │
+   create ──────► │                                       │ ───── atomic findOneAndUpdate ──┐
+                  │                                       │           { status: "active" } │
+                  └───────────────────────────────────────┘               → "closed"       │
+                                                                            + endedAt: now │
+                                                                                          ▼
+                                                                                          ┌────────┐
+                                                                                          │ closed │
+                                                                                          └────────┘
+```
+
+The stop transition is performed by a SINGLE atomic
+`findOneAndUpdate` whose filter encodes
+`status: "active"`. There is NO read-then-update pattern.
+
+### What PHASE 6.1 does NOT introduce
+
+- No `attendance_records` collection (or any per-student
+  record collection).
+- No biometric fields, embeddings, centroids.
+- No `FaceProfile` write, no `FaceEnrollmentSession`
+  mutation.
+- No automatic session cleanup (`status: "closed"`
+  sessions are kept indefinitely — archive / cleanup
+  belongs to a later phase).
+- No TTL index on `attendance_sessions`.
+- No text / search index on `attendance_sessions`.
 
 ## Privacy posture
 
