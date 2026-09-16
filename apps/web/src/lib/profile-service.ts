@@ -21,6 +21,8 @@
  *   - Raw Mongoose / MongoDB errors never escape this module.
  */
 
+import "server-only";
+
 import { getMongooseConnection } from "@/lib/mongoose";
 import { ProfileModel, type ProfileAttrs } from "@/lib/profile-model";
 
@@ -67,6 +69,138 @@ export async function getProfileByUserId(
 export async function isOnboardingComplete(userId: string): Promise<boolean> {
   const profile = await getProfileByUserId(userId);
   return Boolean(profile?.onboardingCompleted);
+}
+
+/**
+ * PHASE 5.1D2B — Server-only batch lookup primitive for student
+ * Profile projections.
+ *
+ * `getStudentProfilesByUserIds(userIds)` performs a SINGLE batched
+ * `ProfileModel.find({ userId: { $in: [...] } })` query and returns
+ * the safe `SafeStudentProfileProjection` for every Profile that
+ * exists, has completed onboarding, and carries `role === "student"`.
+ *
+ * The function is the AUTHORITATIVE batch lookup for roster
+ * composition. It exists to prevent the obvious N+1 of one
+ * `getProfileByUserId(...)` call per membership row, and to keep
+ * the application memory scan out of the data path (no
+ * application-side filter over the whole `profiles` collection).
+ *
+ * ## Output shape
+ *
+ *   - The result is a `Map<string, SafeStudentProfileProjection>`
+ *     keyed by `userId` so the caller can correlate a
+ *     `ClassMembership.studentUserId` row to its Profile.
+ *   - Profiles that do not exist, are incomplete
+ *     (`onboardingCompleted === false`), or carry a non-student
+ *     `role` are OMITTED from the map. Corrupt / legacy memberships
+ *     that point at an absent or non-student Profile can therefore
+ *     be skipped safely by the caller.
+ *   - `userIds` that do not appear in any Profile are simply absent
+ *     from the returned Map (NOT represented by `null`).
+ *   - Duplicate input ids are deduplicated before the query.
+ *
+ * ## Privacy
+ *
+ *   - The function projects ONLY the fields the application
+ *     identity layer exposes for roster composition: `userId`
+ *     (internally, for correlation), `fullName`,
+ *     `identificationCode`, `role`, and `onboardingCompleted`.
+ *   - `emailSnapshot`, `phone`, `createdAt`, `updatedAt`, and the
+ *     Mongo `_id` are NEVER read from the database driver buffer.
+ *     The projection is set explicitly on the Mongoose `.find(...)`
+ *     chain so the unwanted fields never reach application memory.
+ *   - This function does NOT consult the Better Auth `user`
+ *     collection. Better Auth identity is intentionally out of
+ *     scope for roster composition.
+ *
+ * ## Authorization
+ *
+ * The function performs NO authentication, NO role check, and NO
+ * ownership check. The CALLER is responsible for supplying ONLY
+ * user ids the caller is authorized to project. The PHASE 5.1D2B
+ * teacher roster service supplies the `studentUserId` values
+ * derived from active memberships of a class the teacher owns.
+ *
+ * ## Idempotency
+ *
+ * The function is read-only and side-effect-free. Repeated calls
+ * with the same input return the same projection.
+ *
+ * ## Errors
+ *
+ * The function never throws on lookup failure: the production code
+ * wraps the query in `try/catch` and maps unexpected DB failures
+ * to the generic `CLASS_READ_FAILED` code. The caller never sees a
+ * raw stack trace or a Mongo error message.
+ */
+export interface SafeStudentProfileProjection {
+  userId: string;
+  fullName: string;
+  identificationCode: string;
+  role: "student";
+  onboardingCompleted: true;
+}
+
+export async function getStudentProfilesByUserIds(
+  userIds: ReadonlyArray<string>,
+): Promise<Map<string, SafeStudentProfileProjection>> {
+  await ensureConnection();
+
+  // Defensive input dedup — the caller should already dedupe but
+  // the function is total for arbitrary input shapes. An empty
+  // input short-circuits to an empty Map so we never issue a
+  // `$in: []` query against MongoDB.
+  const unique = Array.from(new Set(userIds)).filter(
+    (id): id is string => typeof id === "string" && id.length > 0,
+  );
+  if (unique.length === 0) return new Map();
+
+  const docs = await ProfileModel.find({
+    userId: { $in: unique },
+  })
+    // Project ONLY the fields required for roster composition.
+    // `emailSnapshot`, `phone`, `createdAt`, `updatedAt`, and the
+    // Mongo `_id` are intentionally excluded so they never reach
+    // application memory.
+    .select({
+      userId: 1,
+      fullName: 1,
+      identificationCode: 1,
+      role: 1,
+      onboardingCompleted: 1,
+    })
+    .lean<
+      Array<{
+        userId: string;
+        fullName: string;
+        identificationCode: string;
+        role: string;
+        onboardingCompleted: boolean;
+      }>
+    >()
+    .exec();
+
+  const out = new Map<string, SafeStudentProfileProjection>();
+  for (const doc of docs) {
+    if (!doc.userId) continue;
+    // Defensive: only student-role, completed Profiles enter the
+    // projection. A corrupt / legacy Profile with role != "student"
+    // (or with onboardingCompleted === false) is omitted so the
+    // caller can skip the membership row safely.
+    if (doc.role !== "student") continue;
+    if (doc.onboardingCompleted !== true) continue;
+    if (typeof doc.fullName !== "string") continue;
+    if (typeof doc.identificationCode !== "string") continue;
+    out.set(doc.userId, {
+      userId: doc.userId,
+      fullName: doc.fullName,
+      identificationCode: doc.identificationCode,
+      role: "student",
+      onboardingCompleted: true,
+    });
+  }
+  return out;
 }
 
 /**
