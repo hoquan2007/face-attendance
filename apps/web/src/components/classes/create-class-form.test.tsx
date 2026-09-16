@@ -1013,13 +1013,29 @@ describe("routes / no public API", () => {
     ).toBe(true);
   });
 
-  it("55. no class detail route added", () => {
-    expect(
-      existsSync(join(process.cwd(), "src/app/classes/[classId]/page.tsx")),
-    ).toBe(false);
-    expect(
-      existsSync(join(process.cwd(), "src/app/classes/[id]/page.tsx")),
-    ).toBe(false);
+  it("55. no class detail route touched by E2 form (PHASE 5.1E4A detail page is a different surface)", () => {
+    // PHASE 5.1E4A adds the `/classes/[classId]` Server Component
+    // detail page, but the create-class form is a Server Action
+    // submission surface only — it does NOT navigate to the detail
+    // route, does NOT know about the route id, and does NOT
+    // touch the detail read model.
+    const source = readFileSync(
+      join(
+        process.cwd(),
+        "src/components/classes/create-class-form.tsx",
+      ),
+      "utf8",
+    );
+    const codeOnly = source
+      .split("\n")
+      .filter(
+        (line) =>
+          !line.trim().startsWith("//") && !line.trim().startsWith("*"),
+      )
+      .join("\n");
+    expect(codeOnly).not.toMatch(/\/classes\/\[classId\]/);
+    expect(codeOnly).not.toMatch(/getClassDetailForCurrentUser/);
+    expect(codeOnly).not.toMatch(/getClassRosterForCurrentTeacher/);
   });
 
   it("55b. no create-class REST endpoint added", () => {

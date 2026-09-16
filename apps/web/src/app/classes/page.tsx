@@ -4,6 +4,9 @@
  * PHASE 5.1E1 — SERVER-RENDERED /classes PAGE AND CLASS LIST UI.
  * PHASE 5.1E2 — TEACHER "CREATE CLASS" CTA.
  * PHASE 5.1E3 — STUDENT "JOIN CLASS" CTA.
+ * PHASE 5.1E4A — LIST → DETAIL NAVIGATION (each visible class
+ *                item is a `<Link>` to `/classes/<safe-class-id>`,
+ *                the authorized detail page introduced by E4A).
  *
  * Server Component.
  *
@@ -25,9 +28,11 @@
  * The page is intentionally render-only for the list. It does NOT
  * create, edit, or join classes; the Create class CTA only links
  * to the `/classes/new` route where the actual Server Action lives.
- * It does NOT render a roster, class detail, attendance UI, or
- * Face ID status. Those belong to PHASE 5.1E4 and the attendance
- * phases.
+ * It does NOT render a roster, attendance UI, or Face ID status
+ * (those belong to later phases). The list items DO link to the
+ * dynamic `/classes/[classId]` detail page introduced by E4A — the
+ * detail page is server-rendered through D2A and is the canonical
+ * authorized detail entry point.
  *
  * Teacher-only "Create class" CTA (PHASE 5.1E2):
  *
@@ -124,21 +129,29 @@ function formatCreatedDate(iso: string): string {
 /**
  * Renders a single class row inside the classes list.
  *
- * Intentionally non-interactive (no link to `/classes/[classId]`
- * because that route does not exist yet — it belongs to
- * PHASE 5.1E4). The row is a semantic `<li>` with a heading,
- * the `classCode` in monospace, a `StatusBadge`, and a created
- * date. No biometric fields, no student names, no roster,
- * no attendance metrics.
+ * PHASE 5.1E4A — the row is a semantic `<li>` wrapping a Next.js
+ * `<Link>` to `/classes/<safe-class-id>`. The link target is the
+ * dynamic route that calls the canonical D2A detail read model.
+ * The link does NOT carry any query parameters, does NOT carry
+ * any userId / role / membershipId / password / classCode
+ * credential, and the route is the only entry point — there is
+ * no public REST detail API.
+ *
+ * The visible block keeps the same geometry as the prior
+ * non-interactive row (semantic heading + classCode in
+ * monospace + StatusBadge + created date) so the list layout is
+ * preserved when the row becomes a link.
  */
 function ClassListItem({ item }: { item: SafeClassSummary }) {
   const statusTone = item.status === "archived" ? "pending" : "active";
   const statusLabel = item.status === "archived" ? "Archived" : "Active";
   return (
     <li className="list-none">
-      <article
-        aria-label={item.name}
-        className="flex flex-col gap-3 rounded-xl border border-border bg-card px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:gap-6"
+      <Link
+        href={`/classes/${item.id}`}
+        aria-label={`Open class ${item.name}`}
+        data-component="class-list-item-link"
+        className="flex flex-col gap-3 rounded-xl border border-border bg-card px-5 py-4 transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background sm:flex-row sm:items-center sm:justify-between sm:gap-6"
       >
         <div className="flex min-w-0 flex-col gap-1.5">
           <h3 className="truncate text-base font-semibold leading-tight text-foreground">
@@ -160,7 +173,7 @@ function ClassListItem({ item }: { item: SafeClassSummary }) {
         <div className="flex shrink-0 items-center gap-2">
           <StatusBadge tone={statusTone} label={statusLabel} />
         </div>
-      </article>
+      </Link>
     </li>
   );
 }

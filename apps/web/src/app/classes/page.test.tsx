@@ -823,10 +823,10 @@ describe("/classes page — navigation", () => {
 });
 
 // =============================================================================
-// 33..34 — No dead detail route
+// 33..36 — List → Detail navigation (PHASE 5.1E4A)
 // =============================================================================
 
-describe("/classes page — no dead detail route", () => {
+describe("/classes page — list → detail navigation", () => {
   beforeEach(() => {
     mockGetSession.mockResolvedValue(makeSession("USER-1"));
     mockGetProfileByUserId.mockResolvedValue(
@@ -834,7 +834,7 @@ describe("/classes page — no dead detail route", () => {
     );
   });
 
-  it("33. list item does not link to nonexistent /classes/[id] route", async () => {
+  it("1. visible class item links to /classes/<id>", async () => {
     mockGetVisibleClassesForCurrentUser.mockResolvedValue({
       ok: true,
       result: {
@@ -848,17 +848,121 @@ describe("/classes page — no dead detail route", () => {
       },
     });
     const tree = renderToStaticMarkup(await ClassesPage());
-    expect(tree).not.toMatch(/href="\/classes\/650000000000000000000099"/);
-    expect(tree).not.toMatch(/href="\/classes\/\[classId\]"/);
+    expect(tree).toContain(
+      'href="/classes/650000000000000000000099"',
+    );
   });
 
-  it("34. no class-detail route is introduced by E1", async () => {
-    const source = readFileSync(
-      resolve(__dirname, "page.tsx"),
-      "utf-8",
+  it("2. multiple classes receive correct detail links", async () => {
+    mockGetVisibleClassesForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        classes: [
+          makeClass({
+            id: "650000000000000000000001",
+            name: "Algebra",
+            classCode: "ALGEBRA",
+          }),
+          makeClass({
+            id: "650000000000000000000002",
+            name: "Biology",
+            classCode: "BIOLOGY",
+          }),
+          makeClass({
+            id: "650000000000000000000003",
+            name: "Chemistry",
+            classCode: "CHEMSTR",
+          }),
+        ],
+      },
+    });
+    const tree = renderToStaticMarkup(await ClassesPage());
+    expect(tree).toContain(
+      'href="/classes/650000000000000000000001"',
     );
-    const body = stripComments(source);
-    expect(body).not.toMatch(/\/classes\/\[/);
+    expect(tree).toContain(
+      'href="/classes/650000000000000000000002"',
+    );
+    expect(tree).toContain(
+      'href="/classes/650000000000000000000003"',
+    );
+  });
+
+  it("3. link uses safe class id only (no classCode / name)", async () => {
+    mockGetVisibleClassesForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        classes: [
+          makeClass({
+            id: "650000000000000000000099",
+            name: "Algebra 101",
+            classCode: "ALGEBRA",
+          }),
+        ],
+      },
+    });
+    const tree = renderToStaticMarkup(await ClassesPage());
+    // The href must be the safe ObjectId string, NOT the classCode
+    // or the human-readable name.
+    expect(tree).toMatch(/href="\/classes\/650000000000000000000099"/);
+    expect(tree).not.toMatch(/href="\/classes\/ALGEBRA"/);
+    expect(tree).not.toMatch(/href="\/classes\/Algebra 101"/);
+    expect(tree).not.toMatch(/href="\/classes\/Algebra%20101"/);
+  });
+
+  it("4. no userId query parameter on list item links", async () => {
+    mockGetVisibleClassesForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        classes: [
+          makeClass({
+            id: "650000000000000000000099",
+            name: "Algebra 101",
+          }),
+        ],
+      },
+    });
+    const tree = renderToStaticMarkup(await ClassesPage());
+    expect(tree).not.toMatch(/href="\/classes\/[^"]*\?userId=/);
+    expect(tree).not.toMatch(/\?userId=/);
+  });
+
+  it("5. no role query parameter on list item links", async () => {
+    mockGetVisibleClassesForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        classes: [
+          makeClass({
+            id: "650000000000000000000099",
+            name: "Algebra 101",
+          }),
+        ],
+      },
+    });
+    const tree = renderToStaticMarkup(await ClassesPage());
+    expect(tree).not.toMatch(/\?role=/);
+  });
+
+  it("6. no password query parameter on list item links", async () => {
+    mockGetVisibleClassesForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        classes: [
+          makeClass({
+            id: "650000000000000000000099",
+            name: "Algebra 101",
+          }),
+        ],
+      },
+    });
+    const tree = renderToStaticMarkup(await ClassesPage());
+    expect(tree).not.toMatch(/\?password/i);
+    expect(tree.toLowerCase()).not.toMatch(/\?passwordhash=/);
   });
 });
 

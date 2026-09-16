@@ -69,5 +69,28 @@ export default defineConfig({
     // pipelines can opt it back in by running vitest with the file
     // explicitly listed.
     exclude: ["src/**/session-integration.test.ts"],
+    // PHASE 5.1E4A NOTE: Use the `forks` pool with `isolate: true`
+    // so every test file runs in a fully isolated child process.
+    //
+    // Several route-level tests mock module-level singletons
+    // (`next/navigation.redirect / notFound`,
+    // `@/lib/classes/class-read-service`, `@/lib/session`,
+    // `@/lib/profile-service`, etc.) via `vi.mock(...)` factories
+    // that close over local `mockXxx` variables. With the default
+    // `threads` pool, vitest reuses one worker for many test
+    // files and the module cache + the `mockXxx` closures leak
+    // across files: a test that throws via the mocked
+    // `redirect` / `notFound` then sees its sibling file's mock
+    // implementation (or no implementation at all) and the page
+    // resolves with JSX instead of throwing, producing
+    // `promise resolved "{ … }" instead of rejecting` failures.
+    //
+    // Running each test file in its own forked, isolated worker
+    // guarantees that `vi.mock(...)` closures, the module cache,
+    // and the `vi.fn()` state all reset between files. The
+    // trade-off is higher per-file startup cost, which is the
+    // documented cost of strong isolation in vitest 2.1.x.
+    pool: "forks",
+    isolate: true,
   },
 });
