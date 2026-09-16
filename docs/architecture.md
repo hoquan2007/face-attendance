@@ -3074,6 +3074,105 @@ The module is READ-ONLY:
 - NO Better Auth configuration change.
 - NO Face Service call.
 
+## Phase 5.1E1 — Authenticated `/classes` server-rendered list page
+
+PHASE 5.1E1 ships the first authenticated **UI surface** on top of
+the PHASE 5.1D1 read model. The page is a Server Component at
+`apps/web/src/app/classes/page.tsx` that calls
+`getVisibleClassesForCurrentUser()` exactly through the existing
+read boundary. There is intentionally NO new HTTP route, NO
+Server Action, NO client-side fetch, NO `useEffect`, and NO
+`/api/classes` endpoint.
+
+### Route
+
+- `/classes` — authenticated, server-rendered.
+
+### Module
+
+- `apps/web/src/app/classes/page.tsx` — the Server Component.
+- `apps/web/src/app/classes/page.test.tsx` — the contract tests.
+- `apps/web/src/components/layout/nav-config.ts` — the
+  Workspace → `Classes` item is flipped from `coming_soon` to
+  `ready` with `href: "/classes"`.
+
+### Server Component contract
+
+- The page opens WITHOUT `"use client"`. It is a Server Component.
+- `getSession()` is called first; a missing session redirects to
+  `/login` (the established auth pattern).
+- `getProfileByUserId(session.user.id)` is called next; a missing
+  or incomplete Profile redirects to `/onboarding` (the
+  established onboarding pattern).
+- `getVisibleClassesForCurrentUser()` is the ONLY sanctioned
+  read boundary. The page does NOT import `ClassModel`,
+  `ClassMembershipModel`, or any other Mongoose model directly.
+  The page does NOT accept a browser-supplied `userId` or `role`.
+- The page does NOT call `createClassAction`, `joinClassAction`,
+  the roster service, the Face Service, or any biometric /
+  attendance primitive.
+
+### Failure handling
+
+- `UNAUTHENTICATED`     → redirect to `/login`.
+- `PROFILE_INCOMPLETE`  → redirect to `/onboarding`.
+- `CLASS_READ_FAILED`   → render a calm, restrained error block
+                          via the existing pattern (no raw
+                          exception text, no stack traces, no
+                          driver internals).
+- A successful read carries `{ role, classes }`. The role is
+  read straight from the canonical read result — it is NEVER
+  inferred from the count of classes, ownership, or any
+  client-side state.
+
+### Rendered content
+
+- Heading: `Classes`.
+- Sub-copy adapts to role:
+  - Teacher: `Classes you manage.`
+  - Student: `Classes you've joined.`
+- The list preserves the D1 deterministic order (`createdAt`
+  DESC) — the page does NOT resort.
+- Each item shows ONLY the safe D1 fields: name, `classCode`
+  (in monospace styling), status (`Active` / `Archived`), and
+  the created date formatted with `toLocaleDateString` + a
+  deterministic `timeZone: "UTC"` (no third-party date
+  library; the same formatter is used in tests).
+- Archived entries are rendered with a neutral `StatusBadge`
+  tone — they are NOT silently hidden.
+- Empty state is rendered through the existing
+  `<EmptyState>` component. Teacher empty state:
+  `No classes yet — Classes you create will appear here.`
+  Student empty state:
+  `No classes yet — Classes you join will appear here.`
+- No Create Class / Join Class button, no `/classes/new`, no
+  `/classes/join`. PHASE 5.1E2 / 5.1E3 will add those.
+
+### Privacy invariants
+
+- The DOM NEVER contains `password`, `passwordHash`,
+  `teacherUserId`, `studentUserId`, `membershipId`, `email`,
+  `phone`, `FaceProfile`, `embedding`, or `centroid`.
+- The list items are intentionally NON-INTERACTIVE — there is
+  no link to `/classes/[classId]` because that route does not
+  exist yet (PHASE 5.1E4 will add the class detail UI).
+- No `localStorage`, `sessionStorage`, or IndexedDB access.
+- No fetch to `/api/classes`. No `useEffect`. No SWR /
+  React Query.
+
+### What PHASE 5.1E1 does NOT add
+
+- NO Create Class UI / Server Action invocation.
+- NO Join Class UI / Server Action invocation.
+- NO class detail page (`/classes/[classId]`).
+- NO roster UI.
+- NO attendance UI.
+- NO `/api/classes` route.
+- NO new runtime dependency.
+- NO change to `createClassAction` / `joinClassAction`
+  semantics, D1 / D2A / D2B authorization, class schemas,
+  Profile schema, Face ID, Face Service, or Better Auth.
+
 ## Non-goals (for now)
 
 - Employee / organization module. The recognition core uses generic user

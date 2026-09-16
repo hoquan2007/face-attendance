@@ -77,8 +77,8 @@ export const NAV_GROUPS: NavGroup[] = [
         key: "classes",
         label: "Classes",
         icon: Users2,
-        status: "coming_soon",
-        tooltip: "Classrooms arrive in a later phase.",
+        href: "/classes",
+        status: "ready",
       },
       {
         key: "attendance",

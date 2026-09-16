@@ -2895,3 +2895,52 @@ privacy / security posture is:
   only the roster-safe fields, omits `emailSnapshot` and
   `phone` from the projection, and is NOT re-exported
   through any browser-facing barrel.
+
+## Phase 5.1E1 — `/classes` browser exposure boundary
+
+PHASE 5.1E1 ships the first authenticated **UI surface** on top
+of the PHASE 5.1D1 read model: the server-rendered `/classes`
+page at `apps/web/src/app/classes/page.tsx`. The page does NOT
+introduce any new public HTTP route or Server Action — it is a
+thin Server Component that calls `getVisibleClassesForCurrentUser()`
+exactly through the established read boundary.
+
+- **No browser persistence.** The page never reads from or
+  writes to `localStorage`, `sessionStorage`, IndexedDB, or
+  the `Cache` API. Server-side state (`Profile.role` +
+  `getVisibleClassesForCurrentUser()`) is the sole source of
+  truth.
+- **No client-side class fetch.** The page does NOT call
+  `fetch("/api/classes")`, does NOT use `useEffect`, does NOT
+  introduce SWR or React Query, and does NOT add an `"use
+  client"` directive. The Server Component performs exactly
+  ONE server-side read per request.
+- **Identity is server-derived.** `userId` is taken from the
+  Better Auth session, `role` from the persisted Profile.
+  The browser cannot supply either value. The role is taken
+  straight from the canonical read result, NOT inferred from
+  the count of classes or from class ownership.
+- **DOM exposure.** The rendered DOM NEVER contains
+  `password`, `passwordHash`, `teacherUserId`,
+  `studentUserId`, `membershipId`, `emailSnapshot`, `phone`,
+  `FaceProfile`, `embedding`, or `centroid`. Only the safe D1
+  summary fields (`id`, `name`, `classCode`, `status`,
+  `createdAt`) and a derived status label are projected.
+- **Failure isolation.** `CLASS_READ_FAILED` is rendered
+  through a calm, restrained error block that never exposes
+  the raw exception, the Mongo URI, the collection name, or
+  the driver stack. `UNAUTHENTICATED` and `PROFILE_INCOMPLETE`
+  map to the established `/login` and `/onboarding` redirects.
+- **No dead detail link.** The list items are
+  intentionally non-interactive — there is NO link to
+  `/classes/[classId]` because that route does not exist yet
+  (PHASE 5.1E4 will add the class detail UI).
+- **No Create / Join UI.** The page does NOT render Create
+  Class or Join Class buttons, does NOT link to
+  `/classes/new` or `/classes/join`, and does NOT invoke
+  `createClassAction` or `joinClassAction`. PHASE 5.1E2 and
+  PHASE 5.1E3 will add those.
+
+The page does NOT add a `/api/classes` HTTP route, does NOT
+add a new runtime dependency, and does NOT modify any prior
+phase's read or write semantics.
