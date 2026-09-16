@@ -3173,6 +3173,134 @@ Server Action, NO client-side fetch, NO `useEffect`, and NO
   semantics, D1 / D2A / D2B authorization, class schemas,
   Profile schema, Face ID, Face Service, or Better Auth.
 
+## Phase 5.1E2 — Teacher Create Class UI
+
+PHASE 5.1E2 ships the **teacher-only "Create class" CTA** on
+`/classes` and the **authenticated `/classes/new` create-class
+flow** — the first browser-side consumption of the PHASE 5.1B
+`createClassAction` Server Action. PHASE 5.1E2 uses the
+PHASE 5.1B action verbatim — the action's semantics, schema, and
+error-code contract are UNCHANGED. The phase adds only a new
+server-gated route (`/classes/new`) and a small client form
+component that submits the action; no new HTTP route, no new
+Server Action, no new public API.
+
+### Routes + modules
+
+- `apps/web/src/app/classes/new/page.tsx` — Server Component,
+  teacher-gated server-rendering entry point. NO `"use client"`.
+- `apps/web/src/app/classes/new/page.test.tsx` — the
+  server-page contract tests.
+- `apps/web/src/components/classes/create-class-form.tsx` —
+  the Client Component that owns the create-class form state,
+  double-submit protection, success state, and error mapping.
+  Receives NO identity props.
+- `apps/web/src/components/classes/create-class-form.test.tsx`
+  — the client-form contract tests.
+- `apps/web/src/app/classes/page.tsx` — the EXISTING teacher
+  list page is extended to render the "Create class" CTA only
+  when the read result's `role === "teacher"`. Students
+  intentionally see NO Create class CTA.
+- `apps/web/src/lib/classes/create-class-action-types.ts`,
+  `create-class-action-constants.ts`,
+  `create-class-action-schemas.ts`,
+  `create-class-action-helpers.ts`,
+  `create-class-action-testing.ts` — split out of
+  `create-class-action.ts` to comply with Next.js 16.3.4's
+  `"use server"` boundary constraint (only `async` exports
+  are allowed from a `"use server"` module). The action
+  module itself (`create-class-action.ts`) now exports ONE
+  `async` Server Action and NOTHING else.
+
+### Server-rendered `/classes/new` contract
+
+- The page opens WITHOUT `"use client"` — it is a Server
+  Component.
+- `getSession()` first; missing session → redirect to
+  `/login` (established auth pattern).
+- `getProfileByUserId(session.user.id)` second; missing /
+  incomplete Profile → redirect to `/onboarding` (established
+  onboarding pattern).
+- Role check via `profile.role === "teacher"`. Authenticated
+  students hitting `/classes/new` directly are sent to
+  `/classes` via `redirect("/classes")` — the SAME safe
+  navigation convention already used by `/classes`.
+- The page accepts NO `searchParams` shape, NO `userId`, NO
+  `role`, NO `classCode`. The page never reads
+  `ClassModel.find(...)` directly — all persisted state is
+  owned by the action.
+
+### `/classes` teacher CTA contract
+
+- The teacher-only "Create class" entry link points to
+  `/classes/new` and is rendered ONLY when the EXISTING
+  `getVisibleClassesForCurrentUser()` result has
+  `role === "teacher"`.
+- The CTA is rendered BOTH in the populated and in the empty
+  teacher state. Students never see it.
+- No role is ever inferred client-side. The button is a
+  pure `Link` to `/classes/new`; it carries no `userId`,
+  `classCode`, or anything beyond the route path.
+
+### CreateClassForm contract
+
+- The component is `"use client"`. It owns `name` and
+  `password` state ONLY — no `userId`, `teacherUserId`,
+  `role`, `classCode`, `passwordHash`, or `classId` is
+  accepted as a prop or kept in state.
+- Password input uses `type="password"` and an
+  application-appropriate `autoComplete` token. The password
+  is NEVER stored in `localStorage`, `sessionStorage`,
+  IndexedDB, or any browser-side cache. The password is NEVER
+  logged.
+- Submit invokes `createClassAction(input)` with exactly
+  `{ name, password }` — NO other keys are passed.
+- Double-submit protection uses a synchronous
+  `submitInFlightRef` set BEFORE the `await` boundary so two
+  rapid submits collapse into ONE Server Action call.
+- Pending state disables the submit button + both inputs and
+  shows a restrained `"Creating class…"` label.
+- Success state replaces the form: it renders the returned
+  `name` and `classCode`, the latter in monospace styling,
+  plus a calm "Share this code and the class password with
+  students you want to invite." copy. The plaintext password
+  is NEVER echoed; the password input value is cleared on
+  success. A safe "Back to classes" `Link` to `/classes` is
+  shown. There is NO automatic redirect — the teacher must
+  read the code first.
+- Failure paths map every documented `CreateClassActionErrorCode`
+  (`UNAUTHENTICATED`, `PROFILE_INCOMPLETE`, `TEACHER_REQUIRED`,
+  `INVALID_CLASS_NAME`, `INVALID_CLASS_PASSWORD`,
+  `CLASS_CODE_GENERATION_FAILED`, `CLASS_CREATION_FAILED`) to
+  restrained, browser-safe copy via `role="alert"`. Raw Mongo
+  errors, `E11000`, stack traces, and `passwordHash` are
+  NEVER rendered. No automatic retry — the user can press
+  submit again on retryable codes.
+
+### Privacy invariants
+
+- No `localStorage`, `sessionStorage`, or IndexedDB access.
+- No `fetch()` to `/api/...` routes. The Client Component
+  uses the typed `createClassAction` reference exclusively.
+- The DOM NEVER contains `password`, `passwordHash`,
+  `teacherUserId`, `studentUserId`, `userId`, `role`,
+  `classCode` (as an input), raw stack frames, or raw
+  Mongo error text.
+- No clipboard dependency or password-strength meter.
+
+### What PHASE 5.1E2 does NOT add
+
+- NO change to `createClassAction` semantics, schema, or
+  error-code contract.
+- NO Student Join UI, no `/classes/join`, no join form.
+- NO class detail page, no roster UI, no attendance UI.
+- NO `/api/...` route of any kind.
+- NO new runtime dependency.
+- NO Face Service call. NO `FaceProfile` touch. NO
+  `ClassMembership` write.
+- NO automatic retry of the create-class action on any
+  failure mode.
+
 ## Non-goals (for now)
 
 - Employee / organization module. The recognition core uses generic user

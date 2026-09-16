@@ -2,6 +2,8 @@
  * `/classes` — authenticated class list page.
  *
  * PHASE 5.1E1 — SERVER-RENDERED /classes PAGE AND CLASS LIST UI.
+ * PHASE 5.1E2 — TEACHER "CREATE CLASS" CTA.
+ * PHASE 5.1E3 — STUDENT "JOIN CLASS" CTA.
  *
  * Server Component.
  *
@@ -20,10 +22,31 @@
  * No client-side class fetching. No `useEffect`. No SWR / React Query.
  * No `/api/classes` route is introduced.
  *
- * The page is intentionally render-only. It does NOT create, edit,
- * or join classes. It does NOT render a roster, class detail,
- * attendance UI, or Face ID status. Those belong to PHASE 5.1E2+,
- * PHASE 5.1E4, and the attendance phases.
+ * The page is intentionally render-only for the list. It does NOT
+ * create, edit, or join classes; the Create class CTA only links
+ * to the `/classes/new` route where the actual Server Action lives.
+ * It does NOT render a roster, class detail, attendance UI, or
+ * Face ID status. Those belong to PHASE 5.1E4 and the attendance
+ * phases.
+ *
+ * Teacher-only "Create class" CTA (PHASE 5.1E2):
+ *
+ *   - The CTA is rendered ONLY when `role === "teacher"`. The
+ *     role comes from the server-authoritative read result — it
+ *     is NEVER inferred client-side from the number of classes
+ *     or from any browser-supplied argument.
+ *   - The CTA links to `/classes/new` where the page-level
+ *     teacher guard performs defense-in-depth access gating.
+ *
+ * Student-only "Join class" CTA (PHASE 5.1E3):
+ *
+ *   - The CTA is rendered ONLY when `role === "student"`. The
+ *     role comes from the server-authoritative read result — it
+ *     is NEVER inferred client-side from the number of classes
+ *     or from any browser-supplied argument.
+ *   - The CTA links to `/classes/join` where the page-level
+ *     student guard performs defense-in-depth access gating.
+ *   - Teachers see NO "Join class" CTA.
  *
  * Guard chain:
  *   - no session        → redirect /login
@@ -31,6 +54,9 @@
  *   - read failure      → render a calm, restrained error block
  *   - success           → role-aware list
  */
+
+import Link from "next/link";
+import { Plus, UserPlus } from "lucide-react";
 
 import { redirect } from "next/navigation";
 import { Users2 } from "lucide-react";
@@ -46,6 +72,7 @@ import { PageContainer } from "@/components/layout/PageContainer";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { EmptyState } from "@/components/layout/EmptyState";
 import { StatusBadge } from "@/components/layout/StatusBadge";
+import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
@@ -139,30 +166,95 @@ function ClassListItem({ item }: { item: SafeClassSummary }) {
 }
 
 /**
- * Restrained empty-state copy.
+ * Restrained empty-state copy with role-aware CTA.
  *
- * PHASE 5.1E2 (Create Class) and PHASE 5.1E3 (Join Class) will add
- * the actual CTAs. Until then the empty state is text-only — no
- * fake disabled buttons, no dead links to non-existent routes.
+ * PHASE 5.1E2 — Teacher empty state includes a "Create class" CTA.
+ * PHASE 5.1E3 — Student empty state includes a "Join class" CTA.
  */
 function ClassesEmptyState({ role }: { role: "teacher" | "student" }) {
   if (role === "teacher") {
     return (
-      <EmptyState
-        icon={<Users2 className="h-5 w-5" aria-hidden="true" />}
-        title="No classes yet"
-        description="Classes you create will appear here."
-        tone="muted"
-      />
+      <div className="flex flex-col gap-5">
+        <EmptyState
+          icon={<Users2 className="h-5 w-5" aria-hidden="true" />}
+          title="No classes yet"
+          description="Classes you create will appear here."
+          tone="muted"
+        />
+        <div>
+          <CreateClassCta />
+        </div>
+      </div>
     );
   }
   return (
-    <EmptyState
-      icon={<Users2 className="h-5 w-5" aria-hidden="true" />}
-      title="No classes yet"
-      description="Classes you join will appear here."
-      tone="muted"
-    />
+    <div className="flex flex-col gap-5">
+      <EmptyState
+        icon={<Users2 className="h-5 w-5" aria-hidden="true" />}
+        title="No classes yet"
+        description="Classes you join will appear here."
+        tone="muted"
+      />
+      <div>
+        <JoinClassCta />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * PHASE 5.1E2 — Teacher-only "Create class" CTA.
+ *
+ * A single, calm Button that links to `/classes/new`. The link
+ * carries NO query parameters, NO class data, and NO identity
+ * fields. The page-level teacher guard at `/classes/new` is the
+ * authoritative access boundary.
+ *
+ * The CTA is rendered ONLY when the server-authoritative role is
+ * `"teacher"`. Students never see this component — the page's
+ * outer JSX branches on the server-returned `role`.
+ */
+function CreateClassCta() {
+  return (
+    <Button
+      asChild
+      variant="primary"
+      data-component="create-class-cta"
+      aria-label="Create class"
+    >
+      <Link href="/classes/new" className="inline-flex items-center gap-2">
+        <Plus className="h-4 w-4" aria-hidden="true" />
+        <span>Create class</span>
+      </Link>
+    </Button>
+  );
+}
+
+/**
+ * PHASE 5.1E3 — Student-only "Join class" CTA.
+ *
+ * A single, calm Button that links to `/classes/join`. The link
+ * carries NO query parameters, NO class data, and NO identity
+ * fields. The page-level student guard at `/classes/join` is the
+ * authoritative access boundary.
+ *
+ * The CTA is rendered ONLY when the server-authoritative role is
+ * `"student"`. Teachers never see this component — the page's
+ * outer JSX branches on the server-returned `role`.
+ */
+function JoinClassCta() {
+  return (
+    <Button
+      asChild
+      variant="primary"
+      data-component="join-class-cta"
+      aria-label="Join class"
+    >
+      <Link href="/classes/join" className="inline-flex items-center gap-2">
+        <UserPlus className="h-4 w-4" aria-hidden="true" />
+        <span>Join class</span>
+      </Link>
+    </Button>
   );
 }
 
@@ -255,6 +347,13 @@ export default async function ClassesPage() {
       <PageHeader
         title="Classes"
         description={roleDescription(role)}
+        actions={
+          role === "teacher" ? (
+            <CreateClassCta />
+          ) : role === "student" ? (
+            <JoinClassCta />
+          ) : undefined
+        }
         as="h1"
       />
 

@@ -101,10 +101,12 @@ const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
 import {
   createClassAction,
+} from "./create-class-action";
+import { __testing } from "./create-class-action-testing";
+import {
   CREATE_CLASS_ACTION_ERROR_CODES,
   MAX_CLASS_CODE_ATTEMPTS,
-  __testing,
-} from "./create-class-action";
+} from "./create-class-action-types";
 import { hashClassPassword, isValidPasswordHash } from "./class-password";
 import {
   CLASS_CODE_LENGTH,

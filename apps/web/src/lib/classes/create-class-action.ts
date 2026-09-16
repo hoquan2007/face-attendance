@@ -114,8 +114,6 @@
 
 "use server";
 
-import { z } from "zod";
-
 import { getSession } from "@/lib/session";
 import { getProfileByUserId } from "@/lib/profile-service";
 import {
@@ -123,251 +121,30 @@ import {
   ClassServiceError,
   createClass,
 } from "@/lib/classes/class-service";
+import type {
+  CreateClassActionResult,
+} from "./create-class-action-types";
+import {
+  CreateClassInputSchema,
+  type CreateClassBrowserInput,
+} from "./create-class-action-schemas";
 
 // =============================================================================
 // Constants
 // =============================================================================
 
 /**
- * Maximum number of insert attempts the action will perform for a
- * single teacher invocation. The first attempt is unconditional;
- * the remaining `MAX_CLASS_CODE_ATTEMPTS - 1` slots are reserved
- * for retried `classCode` collisions only.
- *
- * The unique index on `classCode` plus the 32-symbol alphabet make
- * collisions astronomically unlikely (≈1 in 32⁷ ≈ 1 in 3.4×10¹⁰),
- * so this small ceiling is more than enough headroom. If every
- * attempt collides we surface `CLASS_CODE_GENERATION_FAILED` —
- * the loop is intentionally bounded and never unbounded.
+ * Maximum number of attempts allowed by the unique-index race
+ * model. Mirrored as a runtime guard against future regressions
+ * that accidentally raise the constant.
  */
-export const MAX_CLASS_CODE_ATTEMPTS = 5;
+const MAX_CLASS_CODE_ATTEMPTS = 5;
 
-/**
- * Maximum number of attempts allowed by the unique-index race model.
- * Mirrored as a runtime guard against future regressions that
- * accidentally raise the constant.
- */
-const HARD_MAX_ATTEMPTS = 10;
-
-// =============================================================================
-// Validation schemas (server-authoritative)
-// =============================================================================
-
-/**
- * Class name validation.
- *
- * Mirrors the model-level constraints (trim + 1..200 chars). The
- * schema accepts whatever the browser supplies and emits the
- * canonical trimmed representation to the service. The browser
- * cannot bypass the trim because the schema runs `trim` first via
- * `z.preprocess`.
- */
-const ClassNameSchema = z.preprocess(
-  (value) => (typeof value === "string" ? value.trim() : value),
-  z
-    .string({ error: "Class name is required." })
-    .min(1, "Class name must not be empty.")
-    .max(200, "Class name must be at most 200 characters."),
-);
-
-/**
- * Class password validation.
- *
- * Deliberately restrained:
- *
- *   - must be a non-empty string,
- *   - must be at least 4 characters (a trivial floor that blocks
- *     accidental empty / single-character submissions; the
- *     cryptography is bounded by PBKDF2 not by length),
- *   - must be at most 128 characters (an explicit cap that
- *     protects the async PBKDF2 path from pathological inputs).
- *
- * The password is NEVER trimmed or transformed by this action.
- * Whitespace, casing, and any other byte are preserved exactly so
- * that the teacher's choice is the persisted choice. This is a
- * deliberate documented rule — see the file header.
- */
-const ClassPasswordSchema = z
-  .string({ error: "Class password is required." })
-  .min(4, "Class password must be at least 4 characters.")
-  .max(128, "Class password must be at most 128 characters.");
-
-/**
- * Browser-supplied input shape.
- *
- * Only `name` and `password` are accepted. The schema strips any
- * other keys via `.strict()`, so a hand-crafted client cannot
- * smuggle `teacherUserId`, `classCode`, `role`, `passwordHash`,
- * `status`, `createdAt`, or `_id` through this action.
- */
-const CreateClassInputSchema = z
-  .object({
-    name: ClassNameSchema,
-    password: ClassPasswordSchema,
-  })
-  .strict();
-
-export type CreateClassBrowserInput = z.infer<typeof CreateClassInputSchema>;
-
-// =============================================================================
-// Browser-safe error codes
-// =============================================================================
-
-/**
- * Stable browser-facing error codes for the create-class Server
- * Action. These codes overlap with the project's documented
- * conventions (`docs/api.md`) and the existing class service
- * error codes.
- */
-export const CREATE_CLASS_ACTION_ERROR_CODES = {
-  UNAUTHENTICATED: "UNAUTHENTICATED",
-  PROFILE_INCOMPLETE: "PROFILE_INCOMPLETE",
-  TEACHER_REQUIRED: "TEACHER_REQUIRED",
-  INVALID_CLASS_NAME: "INVALID_CLASS_NAME",
-  INVALID_CLASS_PASSWORD: "INVALID_CLASS_PASSWORD",
-  CLASS_CODE_GENERATION_FAILED: "CLASS_CODE_GENERATION_FAILED",
-  CLASS_CREATION_FAILED: "CLASS_CREATION_FAILED",
-} as const;
-
-export type CreateClassActionErrorCode =
-  (typeof CREATE_CLASS_ACTION_ERROR_CODES)[keyof typeof CREATE_CLASS_ACTION_ERROR_CODES];
-
-/**
- * Restrained, browser-safe copy. No thresholds, no internals, no
- * `password`, no `passwordHash`, no `teacherUserId`, no Mongo URI.
- */
-const ERROR_MESSAGES: Readonly<Record<CreateClassActionErrorCode, string>> =
-  {
-    UNAUTHENTICATED: "You must be signed in to create a class.",
-    PROFILE_INCOMPLETE: "Complete your profile before creating a class.",
-    TEACHER_REQUIRED: "Only teachers can create classes.",
-    INVALID_CLASS_NAME: "Class name is invalid.",
-    INVALID_CLASS_PASSWORD: "Class password is invalid.",
-    CLASS_CODE_GENERATION_FAILED:
-      "Could not generate a unique class code. Please try again.",
-    CLASS_CREATION_FAILED: "Could not create the class. Please try again.",
-  };
-
-/**
- * Retry hint for each failure mode. The future create-class UI
- * (PHASE 5.1B+UI) may use this flag to decide whether to render a
- * "Try again" affordance or a more conservative flow.
- */
-const RETRYABLE: Readonly<Record<CreateClassActionErrorCode, boolean>> = {
-  UNAUTHENTICATED: false,
-  PROFILE_INCOMPLETE: false,
-  TEACHER_REQUIRED: false,
-  INVALID_CLASS_NAME: false,
-  INVALID_CLASS_PASSWORD: false,
-  CLASS_CODE_GENERATION_FAILED: true,
-  CLASS_CREATION_FAILED: true,
-};
-
-// =============================================================================
-// Result types (discriminated union)
-// =============================================================================
-
-/**
- * Browser-safe success result. Contains ONLY fields the teacher
- * legitimately needs to see and share:
- *
- *   - id        — Mongo document id (string).
- *   - name      — canonical trimmed class name.
- *   - classCode — 7-char uppercase canonical code (the only
- *                 join-time identifier students will need).
- *   - status    — always "active" on a fresh create.
- *   - createdAt — ISO 8601 string for UI display.
- *
- * `password`, `passwordHash`, and `teacherUserId` are NOT
- * returned — the caller already represents the authenticated
- * teacher and there is no UI that needs any of those fields.
- */
-export interface CreateClassActionSuccess {
-  ok: true;
-  class: {
-    id: string;
-    name: string;
-    classCode: string;
-    status: "active";
-    createdAt: string;
-  };
-}
-
-/**
- * Browser-safe error result. The shape mirrors the project-wide
- * convention: `{ ok, code, message, retryable }`.
- *
- * The `code` is always one of the values in
- * `CREATE_CLASS_ACTION_ERROR_CODES`. The `message` is the safe
- * copy from `ERROR_MESSAGES`. The `retryable` flag is derived
- * from `RETRYABLE`.
- */
-export interface CreateClassActionError {
-  ok: false;
-  code: CreateClassActionErrorCode;
-  message: string;
-  retryable: boolean;
-}
-
-export type CreateClassActionResult =
-  | CreateClassActionSuccess
-  | CreateClassActionError;
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-/**
- * Defensive guard around the retry ceiling constant. Catches
- * future accidental raises without changing the call site.
- */
-function assertAttemptsCeiling(): void {
-  if (
-    !Number.isInteger(MAX_CLASS_CODE_ATTEMPTS) ||
-    MAX_CLASS_CODE_ATTEMPTS < 1 ||
-    MAX_CLASS_CODE_ATTEMPTS > HARD_MAX_ATTEMPTS
-  ) {
-    // Surface the configuration problem as a generic creation
-    // failure. We never leak the constant value or the harness
-    // details to the browser.
-    throw new ClassServiceError({
-      code: CLASS_ERROR_CODES.CLASS_CREATE_FAILED,
-      message: "Failed to create class.",
-    });
-  }
-}
-
-/**
- * Wraps an unknown thrown value into the browser-safe error
- * result. Only typed service errors receive a specific code; any
- * other error collapses to `CLASS_CREATION_FAILED` with a safe
- * generic message. Raw stacks, Mongo error codes, and connection
- * details are NEVER returned.
- */
-function toSafeError(err: unknown): CreateClassActionError {
-  // A `ClassServiceError(CLASS_CODE_ALREADY_EXISTS)` after the retry
-  // loop has been exhausted means we generated MAX_CLASS_CODE_ATTEMPTS
-  // fresh codes and every one collided on the unique index. Map to a
-  // dedicated, browser-safe code.
-  if (err instanceof ClassServiceError) {
-    if (err.code === CLASS_ERROR_CODES.CLASS_CODE_ALREADY_EXISTS) {
-      return buildError("CLASS_CODE_GENERATION_FAILED");
-    }
-    return buildError("CLASS_CREATION_FAILED");
-  }
-  return buildError("CLASS_CREATION_FAILED");
-}
-
-function buildError(
-  code: CreateClassActionErrorCode,
-): CreateClassActionError {
-  return {
-    ok: false,
-    code,
-    message: ERROR_MESSAGES[code],
-    retryable: RETRYABLE[code],
-  };
-}
+import {
+  assertAttemptsCeiling,
+  buildError,
+  toSafeError,
+} from "./create-class-action-helpers";
 
 // =============================================================================
 // Public Server Action
@@ -546,16 +323,8 @@ export async function createClassAction(
 
 // =============================================================================
 // Exposed for tests
+//
+// PHASE 5.1E2 — split out into a non-`"use server"` module so the
+// `"use server"` action file is limited to `async` exports. The
+// test-only exports live in `create-class-action-testing.ts`.
 // =============================================================================
-
-export const __testing = {
-  CreateClassInputSchema,
-  ClassNameSchema,
-  ClassPasswordSchema,
-  MAX_CLASS_CODE_ATTEMPTS,
-  ERROR_MESSAGES,
-  RETRYABLE,
-  buildError,
-  toSafeError,
-  assertAttemptsCeiling,
-};

@@ -1437,6 +1437,28 @@ error, or password hashing error.
 - No attendance session / record.
 - No Face Service call.
 - No `FaceProfile` touch.
+
+#### UI-to-Server-Action usage inventory
+
+The `createClassAction(input)` Server Action is consumed
+EXCLUSIVELY by the PHASE 5.1E2 client form
+`apps/web/src/components/classes/create-class-form.tsx`,
+rendered from the server-gated page
+`apps/web/src/app/classes/new/page.tsx`. The form passes
+exactly `{ name, password }` and reads the discriminated
+result. No REST/HTTP route, no other server action, and no
+third-party caller invokes `createClassAction`.
+
+The `createJoinClassAction(input)` Server Action is consumed
+EXCLUSIVELY by the PHASE 5.1E3 client form
+`apps/web/src/components/classes/join-class-form.tsx`,
+rendered from the server-gated page
+`apps/web/src/app/classes/join/page.tsx`. The form passes
+exactly `{ classCode, password }` and reads the discriminated
+result. No REST/HTTP route, no other server action, and no
+third-party caller invokes `createJoinClassAction`. E3 does
+NOT modify the action's semantics; the action remains the
+canonical PHASE 5.1C entry point.
 - No Profile mutation.
 - No Better Auth configuration change.
 - No student join (`/api/classes/join`).

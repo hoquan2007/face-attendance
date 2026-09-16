@@ -255,6 +255,81 @@ the PHASE 5.1A class persistence foundation:
 - **No rate limit yet.** PHASE 5.1B does not introduce a new
   rate-limit primitive or dependency.
 
+## Phase 5.1E3 student join-class UI privacy posture
+
+PHASE 5.1E3 ships the **student-only "Join class" UI** that calls
+the existing `createJoinClassAction({ classCode, password })`
+PHASE 5.1C Server Action from a focused client form, behind a
+new server-gated `/classes/join` route. The privacy / security
+posture is:
+
+- **Identity-free form.** The `JoinClassForm` Client Component
+  accepts NO identity props. It never receives `studentUserId`,
+  `userId`, `role`, `classId`, `teacherUserId`, `membershipId`,
+  or `passwordHash`. Identity derives exclusively from the
+  Better Auth session inside the Server Action.
+- **Minimal browser-supplied payload.** The form sends ONLY
+  `{ classCode, password }` to `createJoinClassAction`. The
+  action's `.strict()` Zod schema strips any extra keys; the
+  browser cannot smuggle identity or membership data through
+  the action signature.
+- **Server-side student guard.** `/classes/join` is a Server
+  Component that requires (a) a Better Auth session, (b) a
+  completed `Profile`, and (c) `role === "student"`. An
+  authenticated teacher visiting `/classes/join` is redirected
+  to `/classes`. The Server Action repeats the same gate
+  server-side as a defense-in-depth boundary — a stale cached
+  client tree cannot bypass it.
+- **Critical enumeration protection preserved.** The UI maps
+  ALL four `INVALID_CLASS_CREDENTIALS` branches (missing class
+  / wrong password / archived class / malformed stored hash) to
+  ONE generic user-facing message: "Class code or password is
+  incorrect, or the class is unavailable." The UI MUST NOT
+  display separate messages for each branch — that would
+  undermine the backend's timing-attack mitigation and allow
+  attackers to enumerate live class codes.
+- **No class-existence lookup.** The form performs NO
+  `checkClassCodeExists(...)` call, NO `/api/classes/check`
+  request, NO blur-time validation against the database. The
+  only network call from the form is the single Server Action
+  invocation.
+- **Double-submit protection.** A synchronous `submitInFlightRef`
+  is inspected and set BEFORE the first `await` inside
+  `handleSubmit`. Two rapid clicks collapse into exactly ONE
+  Server Action invocation. On a safe failure the guard is
+  released so the user may retry explicitly. On success the
+  form is replaced by the success state — no automatic retry.
+- **Password privacy.** The `password` field uses
+  `type="password"` and `autoComplete="current-password"`. The
+  password lives only in a React local state variable for the
+  lifetime of the form. After a successful submission the
+  password state is cleared via `setPassword("")` immediately.
+  The component never writes `localStorage`, `sessionStorage`,
+  IndexedDB, or the Cache API; never places the password in a
+  URL; never calls `console.log` / `console.error` with the
+  password or `passwordHash`; never echoes the password in the
+  success state (the form is hidden and only the server-returned
+  `classCode` is rendered).
+- **No `passwordHash` in DOM.** The success state renders only
+  safe fields returned by the action: `classCode`, and the
+  `alreadyJoined` boolean (which toggles between "Joined class"
+  and "Already joined"). `passwordHash`, `studentUserId`,
+  `teacherUserId`, `membershipId`, and any internal Mongoose
+  identifiers are NEVER serialized into the rendered tree.
+- **Safe error mapping.** `CLASS_JOIN_FAILED` (generic DB
+  failure) renders a single generic "Please try again in a
+  moment" message — never Mongo error codes, stack traces,
+  connection strings, or collection names. Input-format errors
+  (`INVALID_CLASS_CODE`, `INVALID_CLASS_PASSWORD`) map to
+  specific but still generic validation copy.
+- **No Face Service / FaceProfile / attendance touch.** The
+  join flow does NOT call the Face Service, does NOT inspect
+  `FaceProfile`, does NOT require Face ID, does NOT create or
+  read attendance sessions.
+- **No public join API.** There is intentionally NO
+  `POST /api/classes/join` HTTP route. The Server Action is
+  the ONLY entry point.
+
 ## Phase 5.1C join-class Server Action privacy posture
 
 PHASE 5.1C ships the student-side counterpart to PHASE 5.1B:
@@ -2944,3 +3019,80 @@ exactly through the established read boundary.
 The page does NOT add a `/api/classes` HTTP route, does NOT
 add a new runtime dependency, and does NOT modify any prior
 phase's read or write semantics.
+
+## Phase 5.1E2 — `/classes/new` + Create-Class browser exposure boundary
+
+PHASE 5.1E2 ships the **teacher-only Create-class browser flow**
+that consumes the existing PHASE 5.1B `createClassAction` Server
+Action verbatim. This section documents the privacy/security
+boundaries that the new `/classes` teacher CTA + the new
+`/classes/new` route + the new `CreateClassForm` client
+component MUST keep holding.
+
+- **Identity is server-derived at TWO layers.** `/classes/new`
+  is a Server Component that runs `getSession()` →
+  `getProfileByUserId()` → `profile.role === "teacher"` BEFORE
+  it renders any form markup. The client component additionally
+  trusts the action's authoritative identity check as a second
+  line of defense. The browser cannot supply `userId`,
+  `teacherUserId`, `role`, `classCode`, `passwordHash`, or any
+  class identifier.
+- **The action is the ONLY writer.** `CreateClassForm`
+  invokes `createClassAction(input)` directly (typed reference,
+  not `fetch`). No HTTP route is added; no
+  `fetch("/api/...")` call is made; no `useEffect` triggers a
+  write; no `localStorage` / `sessionStorage` / IndexedDB is
+  touched.
+- **Teacher CTA is role-server-derived.** The "Create class"
+  link on `/classes` is rendered ONLY when the EXISTING
+  `getVisibleClassesForCurrentUser()` result has
+  `role === "teacher"`. Students never see it. The role
+  attribute is read from the canonical read DTO — it is
+  NEVER inferred from the URL, the session alone, or any
+  client-side state.
+- **No join UI, no detail UI, no attendance UI.** Students
+  hitting `/classes/new` are redirected to `/classes` via the
+  established safe navigation. No `/classes/join` route
+  exists. No `/classes/[classId]` route exists.
+- **No browser password persistence.** The password input is
+  `type="password"` with appropriate `autoComplete` tokens.
+  The plaintext password is NEVER written to `localStorage`,
+  `sessionStorage`, IndexedDB, or the `Cache` API. The
+  password is NEVER logged to the console. The password is
+  NEVER placed in the URL or in any `query` parameter.
+- **No password echo after success.** The success state
+  renders ONLY the returned `classCode` (server-generated,
+  not the typed password), the returned `name`, and a calm
+  "Back to classes" link. The password input is hidden or
+  cleared the moment the action returns `ok: true`. The DOM
+  NEVER contains the plaintext password after success.
+- **No `passwordHash` exposure.** The browser never sees
+  `passwordHash`, a `password` echo, a Mongo URI, a Mongo
+  error code, an `E11000` literal, a stack trace, or any
+  driver / collection name. Failure paths route through
+  `role="alert"` blocks that use the action-provided safe
+  message verbatim — they do NOT log the raw exception.
+- **Bounded server-authoritative generation.** `classCode`
+  is generated server-side inside the existing PHASE 5.1B
+  action via the bounded-retry helper (at most
+  `MAX_CLASS_CODE_ATTEMPTS`). The client NEVER generates a
+  code, never receives a partial code, never picks its own
+  code, and never retries the action automatically.
+- **One user-invoked submission → at most one Server Action
+  invocation.** A synchronous `submitInFlightRef` (set before
+  the `await`) collapses two rapid presses into ONE call.
+  On a safe failure the guard releases so the teacher can
+  retry explicitly. No automatic retry exists on
+  `CLASS_CODE_GENERATION_FAILED`, `CLASS_CREATION_FAILED`,
+  auth failures, or validation failures.
+- **The `createClassAction` schema is `.strict()`.** Any
+  attempt to smuggle `userId`, `teacherUserId`, `role`,
+  `classCode`, `passwordHash`, or `status` through the
+  action is rejected server-side by Zod BEFORE the service
+  is called. The action never accepts or persists those
+  fields at the service layer either.
+
+PHASE 5.1E2 does NOT modify `createClassAction`'s semantics,
+schema, or error-code contract. It does NOT modify
+`joinClassAction`, the class model, the membership model, the
+profile model, the Face Service, or the Better Auth config.

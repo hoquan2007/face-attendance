@@ -402,7 +402,7 @@ describe("/classes page — teacher UI", () => {
     expect(tree).toContain("Classes you create will appear here");
   });
 
-  it("18. no Create Class form exists", async () => {
+  it("18. PHASE 5.1E2 — teacher renders Create class CTA linking to /classes/new", async () => {
     mockGetVisibleClassesForCurrentUser.mockResolvedValue({
       ok: true,
       result: {
@@ -411,12 +411,40 @@ describe("/classes page — teacher UI", () => {
       },
     });
     const tree = renderToStaticMarkup(await ClassesPage());
-    // No Create form copy / no /classes/new link.
-    expect(tree).not.toMatch(/create\s*class/i);
-    expect(tree).not.toContain("/classes/new");
+    expect(tree).toMatch(/create\s*class/i);
+    expect(tree).toContain('href="/classes/new"');
+    expect(tree).toContain('data-component="create-class-cta"');
   });
 
-  it("19. no Join Class form exists", async () => {
+  it("18b. PHASE 5.1E2 — empty teacher state still permits Create class CTA", async () => {
+    mockGetVisibleClassesForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", classes: [] },
+    });
+    const tree = renderToStaticMarkup(await ClassesPage());
+    expect(tree).toMatch(/create\s*class/i);
+    expect(tree).toContain('href="/classes/new"');
+  });
+
+  it("18c. PHASE 5.1E2 — student /classes does NOT render Create class CTA", async () => {
+    mockGetSession.mockResolvedValue(makeSession("STUDENT-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "student" }),
+    );
+    mockGetVisibleClassesForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "student",
+        classes: [makeClass({ name: "Algebra 101" })],
+      },
+    });
+    const tree = renderToStaticMarkup(await ClassesPage());
+    expect(tree).not.toMatch(/create\s*class/i);
+    expect(tree).not.toContain("/classes/new");
+    expect(tree).not.toContain('data-component="create-class-cta"');
+  });
+
+  it("19. no Join Class form exists on teacher page", async () => {
     mockGetVisibleClassesForCurrentUser.mockResolvedValue({
       ok: true,
       result: {
@@ -427,6 +455,90 @@ describe("/classes page — teacher UI", () => {
     const tree = renderToStaticMarkup(await ClassesPage());
     expect(tree).not.toMatch(/join\s*class/i);
     expect(tree).not.toContain("/classes/join");
+  });
+
+  it("19b. PHASE 5.1E3 — student /classes renders Join class CTA linking to /classes/join", async () => {
+    mockGetVisibleClassesForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "student",
+        classes: [makeClass({ name: "Algebra 101" })],
+      },
+    });
+    const tree = renderToStaticMarkup(await ClassesPage());
+    expect(tree).toMatch(/join\s*class/i);
+    expect(tree).toContain('href="/classes/join"');
+    expect(tree).toContain('data-component="join-class-cta"');
+  });
+
+  it("19c. PHASE 5.1E3 — empty student state permits Join class CTA", async () => {
+    mockGetVisibleClassesForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "student", classes: [] },
+    });
+    const tree = renderToStaticMarkup(await ClassesPage());
+    expect(tree).toMatch(/join\s*class/i);
+    expect(tree).toContain('href="/classes/join"');
+  });
+
+  it("19d. PHASE 5.1E3 — teacher /classes does NOT render Join class CTA", async () => {
+    mockGetVisibleClassesForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        classes: [makeClass({ name: "Algebra 101" })],
+      },
+    });
+    const tree = renderToStaticMarkup(await ClassesPage());
+    expect(tree).not.toMatch(/join\s*class/i);
+    expect(tree).not.toContain("/classes/join");
+    expect(tree).not.toContain('data-component="join-class-cta"');
+  });
+
+  it("19e. PHASE 5.1E3 — student with existing classes still permits Join class CTA", async () => {
+    mockGetVisibleClassesForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "student",
+        classes: [
+          makeClass({ name: "Algebra 101" }),
+          makeClass({ id: "B", name: "Biology", classCode: "BIOLOGY" }),
+        ],
+      },
+    });
+    const tree = renderToStaticMarkup(await ClassesPage());
+    expect(tree).toMatch(/join\s*class/i);
+    expect(tree).toContain('href="/classes/join"');
+  });
+
+  it("19f. PHASE 5.1E3 — teacher Create class CTA remains intact when student CTA also exists", async () => {
+    mockGetVisibleClassesForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        classes: [makeClass({ name: "Algebra 101" })],
+      },
+    });
+    const tree = renderToStaticMarkup(await ClassesPage());
+    // Teacher still has Create class
+    expect(tree).toMatch(/create\s*class/i);
+    expect(tree).toContain('href="/classes/new"');
+    // Teacher does NOT have Join class
+    expect(tree).not.toMatch(/join\s*class/i);
+  });
+
+  it("19g. PHASE 5.1E3 — no role renders both CTAs (verify role matrix enforced)", async () => {
+    // This test verifies that if somehow role was not set, the page
+    // would not render CTAs for both roles. In practice the read
+    // service always returns "teacher" or "student".
+    mockGetVisibleClassesForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "student" as const, classes: [] },
+    });
+    const tree = renderToStaticMarkup(await ClassesPage());
+    // Student has Join class, not Create class
+    expect(tree).toMatch(/join\s*class/i);
+    expect(tree).not.toMatch(/create\s*class/i);
   });
 });
 
@@ -674,9 +786,13 @@ describe("/classes page — navigation", () => {
       },
     });
     const tree = renderToStaticMarkup(await ClassesPage());
-    expect(tree).not.toContain("/classes/new");
+    // PHASE 5.1E2 — teacher sees a Create class link to
+    // /classes/new. Students still must not see any link to
+    // /classes/new or /classes/join.
+    expect(tree).toContain("/classes/new");
     expect(tree).not.toContain("/classes/join");
-    // The nav-config must NOT introduce such hrefs either.
+    // The nav-config must NOT introduce such hrefs either — the
+    // page itself owns the Create class CTA.
     const { NAV_GROUPS } = await import(
       "@/components/layout/nav-config"
     );
@@ -685,6 +801,24 @@ describe("/classes page — navigation", () => {
     );
     expect(allHrefs).not.toContain("/classes/new");
     expect(allHrefs).not.toContain("/classes/join");
+  });
+
+  it("32b. PHASE 5.1E3 — student /classes DOES link to /classes/join", async () => {
+    mockGetSession.mockResolvedValue(makeSession("STUDENT-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "student" }),
+    );
+    mockGetVisibleClassesForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "student",
+        classes: [makeClass()],
+      },
+    });
+    const tree = renderToStaticMarkup(await ClassesPage());
+    expect(tree).not.toContain("/classes/new");
+    // PHASE 5.1E3 — students SHOULD see Join class CTA
+    expect(tree).toContain("/classes/join");
   });
 });
 
