@@ -377,8 +377,13 @@ describe("class-service regression", () => {
     // The persisted document carries `passwordHash`, not raw password.
     expect(source).toMatch(/passwordHash/);
     // The service must not assign rawPassword into any model document.
-    // Strip the legitimate input interface field before checking.
-    const stripped = source.replace(/rawPassword\s*:\s*string;/g, "");
+    // Strip the legitimate input interface field AND the
+    // runDummyPasswordVerification helper parameter before
+    // checking — both are NOT rawPassword being persisted into a
+    // model document.
+    const stripped = source
+      .replace(/rawPassword\s*:\s*string\s*;/g, "")
+      .replace(/rawPassword\s*:\s*string\s*,/g, "");
     expect(stripped).not.toMatch(/\brawPassword\s*:/);
   });
 

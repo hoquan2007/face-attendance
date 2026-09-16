@@ -40,6 +40,7 @@ export {
   type ClassErrorCode,
   ClassServiceError,
   CLASS_ERROR_CODES,
+  isClassCodeDuplicateKeyError,
 } from "./class-service";
 
 // Membership service
@@ -55,4 +56,13 @@ export {
   type MembershipErrorCode,
   MembershipServiceError,
   MEMBERSHIP_ERROR_CODES,
+  isMembershipDuplicateKeyError,
 } from "./class-membership-service";
+
+// PHASE 5.1C — the join-time credential primitive, the fixed
+// dummy hash, and the dummy-verification helper are
+// INTENTIONALLY NOT re-exported here. They are server-only
+// deep-path imports used exclusively by the join Server Action.
+// The barrel keeps the public surface restricted to
+// `SafeClassDto` / `SafeMembershipDto` so `passwordHash` cannot
+// leak into a browser-facing payload.

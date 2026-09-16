@@ -62,8 +62,18 @@ const mockCreate = vi.fn(async (doc: ClassMembershipAttrs) => {
     duplicateKey.classId === doc.classId.toString() &&
     duplicateKey.studentUserId === doc.studentUserId
   ) {
-    const err = new Error("Duplicate key") as Error & { code: number };
+    // PHASE 5.1C — emit the canonical compound duplicate-key
+    // shape so the precise `isMembershipDuplicateKeyError`
+    // classifier recognises it.
+    const err = new Error("Duplicate key") as Error & {
+      code: number;
+      keyValue: Record<string, unknown>;
+    };
     err.code = 11000;
+    err.keyValue = {
+      classId: doc.classId.toString(),
+      studentUserId: doc.studentUserId,
+    };
     throw err;
   }
 
@@ -295,7 +305,7 @@ describe("duplicate membership rejection", () => {
     } catch (err) {
       expect(err).toBeInstanceOf(MembershipServiceError);
       expect((err as MembershipServiceError).code).toBe(
-        "MEMBERSHIP_ALREADY_EXISTS",
+        "MEMBERSHIP_ALREADY_JOINED",
       );
     }
   });

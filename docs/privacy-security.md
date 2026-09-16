@@ -1,6 +1,8 @@
 # Privacy & Security
 
-> Status: **Phase 5.1A** — PHASE 5.1A ships the persistence foundation for the `classes` and `class_memberships` collections. This phase adds two new Mongoose models, their service layers, and server-only utilities for class code generation, normalization, and password hashing. No UI, API routes, Server Actions, or attendance logic is implemented in this phase. Better Auth collections remain untouched.
+> Status: **Phase 5.1D1** — PHASE 5.1A ships the persistence foundation for the `classes` and `class_memberships` collections. This phase adds two new Mongoose models, their service layers, and server-only utilities for class code generation, normalization, and password hashing. PHASE 5.1A.1 hardens the class join password primitive (PBKDF2-SHA256, async, constant-time verification, versioned encoded hash). PHASE 5.1B adds the **authenticated Teacher create-class Server Action** (`createClassAction`) — the first browser-reachable entry point on top of the 5.1A service. The action derives teacher identity exclusively from the Better Auth server session, requires a completed Profile with `role === "teacher"`, validates browser-supplied `name` + `password` server-side, generates a fresh canonical 7-char `classCode` server-side via the 5.1A generator, reuses `hashClassPassword(...)` from the service to persist `passwordHash` only, and performs a BOUNDED internal retry (at most `MAX_CLASS_CODE_ATTEMPTS`) on exact `classCode` unique-index collisions only. The action does NOT introduce a create-class UI, a `/api/classes` route, a `ClassMembership` write, an attendance session, a Face Service call, or any FaceProfile touch. PHASE 5.1C adds the **authenticated Student join-class Server Action** (`createJoinClassAction`) — the student-side counterpart to PHASE 5.1B. The action derives student identity exclusively from the Better Auth server session, requires a completed Profile with `role === "student"`, validates browser-supplied `classCode` + `password` server-side (canonicalizing the classCode via `z.preprocess` and enforcing the canonical alphabet `[A-HJ-NP-Z2-9]`), looks up the class through the server-only `getClassJoinCredentialByCode(...)` primitive, runs ONE async PBKDF2 verification workload (real or dummy) on every branch that would otherwise short-circuit — missing class / archived class / malformed stored hash all execute `await runDummyPasswordVerification(password)` against the fixed `DUMMY_CLASS_PASSWORD_HASH` constant before returning `INVALID_CLASS_CREDENTIALS`; classifies the membership insert's E11000 collision via the precise server-only `isMembershipDuplicateKeyError` predicate that accepts ONLY compound `(classId, studentUserId)` collisions. The `DUMMY_CLASS_PASSWORD_HASH` constant is a single string literal — it is NEVER generated at module load via `hashClassPassword()`, `pbkdf2`, `randomBytes`, top-level `await`, or any other runtime primitive. The `getClassJoinCredentialByCode` primitive and `DUMMY_CLASS_PASSWORD_HASH` constant are server-only deep-path imports and are INTENTIONALLY NOT re-exported through the public `index.ts` barrel so `passwordHash` cannot leak into a browser-facing payload. The action does NOT introduce a join UI, a `/api/classes/join` route, a `Class` write, a `Profile` mutation, a `FaceProfile` touch, a Face Service call, or any attendance logic. Better Auth collections remain untouched.
+>
+> **PHASE 5.1C.1 — JOIN IDEMPOTENCY + CANONICAL VERIFICATION AUDIT.** Duplicate membership after VALID class credentials is an **idempotent success** — the compound `(classId, studentUserId)` unique-index collision maps to `ok: true, alreadyJoined: true` with the ALREADY-PERSISTED membership projected via the new server-only `getSafeMembership(classId, studentUserId)` primitive in `class-membership-service.ts`. The insert is NEVER retried. Password verification, the canonical credential-state branches, and the `active`/`joinable` check all run BEFORE the idempotency classification — an existing membership MUST NOT allow bypassing the class password. The `ALREADY_JOINED` error code is REMOVED; the duplicate path is no longer a failure mode. Unrelated E11000 collisions (a future `idempotencyKey` index) still map to `CLASS_JOIN_FAILED`.
 > server-only Next.js orchestration service
 > (`finalizeEnrollmentSessionForUser`) that loads the temporary
 > `FaceEnrollmentSession`, decrypts its accepted samples server-side
@@ -172,6 +174,259 @@ class create / join Server Actions. Design decisions:
   no `console.log` / `logger.*` / `debug(` calls.
 - **No `Math.random()`.** Class codes and password salt are generated using
   `node:crypto.randomBytes()`. `Math.random()` is never used.
+
+## Phase 5.1B create-class Server Action privacy posture
+
+PHASE 5.1B ships the first browser-reachable entry point on top of
+the PHASE 5.1A class persistence foundation:
+`createClassAction(input)` in
+`apps/web/src/lib/classes/create-class-action.ts`. It is a
+`"use server"` Server Action. The privacy / security posture is:
+
+- **Identity from the Better Auth session only.** The action derives
+  `teacherUserId` from `session.user.id` via `getSession()`. The
+  browser never supplies `teacherUserId`, `userId`, `role`,
+  `classCode`, `passwordHash`, or `status`. The action's Zod input
+  schema is `.strict()` — any extra key is rejected before the
+  service layer is reached.
+- **Profile gating.** The application `Profile` is loaded via the
+  existing `getProfileByUserId` and must satisfy both
+  `onboardingCompleted === true` and `role === "teacher"`. Missing
+  profile → `PROFILE_INCOMPLETE`; student role →
+  `TEACHER_REQUIRED`. The Profile is read for gating only — it is
+  NEVER mutated by the action.
+- **Server-generated `classCode`.** `classCode` is generated inside
+  the action via the existing `generateClassCode()` primitive
+  (canonical 7-char, crypto-random, no `Math.random`). The browser
+  cannot supply or override `classCode`.
+- **Bounded retry on `classCode` collisions only.** The action
+  performs at most `MAX_CLASS_CODE_ATTEMPTS` insert attempts.
+  Retries are allowed ONLY when the service throws
+  `ClassServiceError(CLASS_CODE_ALREADY_EXISTS)`, which the
+  service produces ONLY when the precise
+  `isClassCodeDuplicateKeyError(err)` predicate confirms the
+  MongoDB `code === 11000` collided key is `classCode` (via
+  `keyValue.classCode`). Unrelated 11000 errors and any other
+  failure stop the loop immediately. There is no read-before-insert
+  uniqueness check; the unique index closes the race. Exhausting
+  the retry budget surfaces `CLASS_CODE_GENERATION_FAILED`.
+- **Password hashing reused, never re-implemented.** The action
+  reuses the PHASE 5.1A.1 `hashClassPassword(...)` primitive
+  (PBKDF2-SHA256, async, 100k iterations, versioned encoded hash).
+  The plaintext password:
+  - enters the action exactly once (only because the teacher chose
+    it),
+  - is NEVER trimmed, lowercased, or otherwise transformed — the
+    exact bytes the teacher submitted are passed to the hash
+    primitive,
+  - is NEVER logged, NEVER returned, NEVER stored as plaintext,
+    NEVER included in error messages or in doc examples as a real
+    credential,
+  - is discarded immediately after
+    `await hashClassPassword(...)` returns. Only `passwordHash` is
+    persisted.
+- **PasswordHash is never serialized.** The success result
+  `{ ok: true, class: { id, name, classCode, status, createdAt } }`
+  intentionally omits `passwordHash`. The error union
+  (`UNAUTHENTICATED`, `PROFILE_INCOMPLETE`, `TEACHER_REQUIRED`,
+  `INVALID_CLASS_NAME`, `INVALID_CLASS_PASSWORD`,
+  `CLASS_CODE_GENERATION_FAILED`, `CLASS_CREATION_FAILED`) and
+  their messages are browser-safe copy that never references the
+  password, hash, Mongo URI, driver stack, or `E11000` text.
+- **`teacherUserId` is not returned.** The caller already represents
+  the authenticated teacher; the response does not echo
+  `teacherUserId` back to the browser.
+- **Service boundary.** The action calls the existing
+  `createClass(...)` service function — it never touches the
+  Mongoose model directly. PHASE 5.1B adds one precise classifier
+  helper (`isClassCodeDuplicateKeyError`) to the service so the
+  action can distinguish a precise `classCode` collision from any
+  unrelated duplicate-key error.
+- **No automatic browser-side retry.** The action does NOT
+  internally retry on auth failure, validation failure, generic
+  DB error, or password hashing error — only on an exact
+  `classCode` unique-index collision. The action performs NO
+  router-level side effects (`router.refresh`, `redirect`,
+  `revalidatePath`).
+- **Scope.** The action does NOT create `ClassMembership`,
+  attendance sessions, `FaceProfile`, or any other domain record.
+  It does NOT call the Face Service. It does NOT introduce a
+  `/api/classes` route or any create-class UI.
+- **No rate limit yet.** PHASE 5.1B does not introduce a new
+  rate-limit primitive or dependency.
+
+## Phase 5.1C join-class Server Action privacy posture
+
+PHASE 5.1C ships the student-side counterpart to PHASE 5.1B:
+`createJoinClassAction(input)` in
+`apps/web/src/lib/classes/join-class-action.ts`. It is a
+`"use server"` Server Action. The privacy / security posture is:
+
+- **Identity from the Better Auth session only.** The action
+  derives `studentUserId` from `session.user.id` via
+  `getSession()`. The browser never supplies `studentUserId`,
+  `userId`, `role`, `classId`, `passwordHash`, `status`, or
+  `joinedAt`. The action's Zod input schema is `.strict()` and
+  strips any extra keys via `flatten().fieldErrors`.
+- **Profile gating.** The action calls the existing
+  `getProfileByUserId(studentUserId)` and requires
+  `onboardingCompleted === true` AND `role === "student"`.
+  Missing profile / incomplete onboarding → `PROFILE_INCOMPLETE`
+  (non-retryable). Wrong role → `STUDENT_REQUIRED` (non-
+  retryable). The profile document is NEVER mutated.
+- **Canonical classCode.** The browser-supplied classCode is
+  canonicalized to uppercase via `z.preprocess` and validated
+  against the canonical alphabet `[A-HJ-NP-Z2-9]` (excludes `I`,
+  `O`, `0`, `1`). The lookup re-applies
+  `normalizeClassCode(code)` so case / whitespace variations are
+  handled correctly even when the schema bypassed them.
+- **Password is never trimmed.** The browser-supplied password
+  reaches `verifyClassPassword(password, storedHash)` byte-for-
+  byte. There is no `String#trim`, no lowercase, no whitespace
+  removal, no `Number()`, no `parseInt()`. The student's exact
+  bytes are hashed. Whitespace, casing, and any other byte are
+  preserved exactly.
+- **`passwordHash` is exposed only to server-side join
+  orchestration.** A new server-only primitive
+  `getClassJoinCredentialByCode(code)` returns a
+  `ClassJoinCredential` shape that includes `passwordHash` for
+  the action's use. The primitive is INTENTIONALLY NOT re-
+  exported through the public `apps/web/src/lib/classes/
+  index.ts` barrel so a hand-crafted client (or a future careless
+  consumer) cannot smuggle `passwordHash` into a browser-facing
+  payload. `SafeClassDto` continues to omit `passwordHash`.
+- **Fixed `DUMMY_CLASS_PASSWORD_HASH` constant.** A single,
+  syntactically-valid encoded PBKDF2 hash (`pbkdf2-sha256$
+  100000$<32-byte salt hex>$<32-byte derived key hex>`) lives
+  in `apps/web/src/lib/classes/class-service.ts` as a single
+  string literal. It is NEVER generated at module load via
+  `hashClassPassword()`, `pbkdf2`, `randomBytes`, top-level
+  `await`, or any other runtime primitive. Module evaluation is
+  therefore synchronous and side-effect-free.
+- **Canonical timing path.** The action runs ONE async PBKDF2
+  verification workload on every branch that would otherwise
+  short-circuit:
+    - missing class → `await runDummyPasswordVerification(password)`
+    - archived class → `await runDummyPasswordVerification(password)`
+    - malformed stored hash → `await runDummyPasswordVerification(password)`
+    - wrong password → `await verifyClassPassword(password, storedHash)`
+  All four branches return the SAME safe code
+  `INVALID_CLASS_CREDENTIALS`. An attacker observing latency
+  cannot differentiate "wrong password" from "missing class" /
+  "archived class" / "malformed hash" by less than the cost of
+  one async PBKDF2 workload. Wall-clock timing tests are
+  explicitly NOT used — the test contract asserts BEHAVIOR
+  (which primitive is invoked on each branch), not latency.
+- **Precise `isMembershipDuplicateKeyError` classifier.** The
+  classifier accepts a Mongo `code === 11000` collision ONLY
+  when `keyValue` (or `keyPattern`) identifies the compound
+  `(classId, studentUserId)` uniqueness. Unrelated 11000
+  collisions (a future `idempotencyKey` index, etc.) map to
+  `CLASS_JOIN_FAILED` and the insert is NEVER retried.
+- **Duplicate membership is an idempotent success
+  (PHASE 5.1C.1).** When `createMembership` collides on the
+  compound `(classId, studentUserId)` index, the action
+  fetches the ALREADY-PERSISTED membership via the new
+  server-only `getSafeMembership(classId, studentUserId)`
+  primitive in `class-membership-service.ts` and surfaces
+  `ok: true, alreadyJoined: true` with the existing
+  `SafeMembershipDto` projected. The action does NOT
+  internally retry the insert and does NOT surface an
+  `ALREADY_JOINED` error code. Password verification and
+  the canonical credential-state branches run FIRST — the
+  idempotency classification fires ONLY after the supplied
+  password has been verified against the stored hash.
+  An existing membership MUST NOT allow bypassing the class
+  password.
+- **No `Class` write, no `Profile` mutation, no `FaceProfile`
+  touch, no Face Service call, no attendance session, no
+  `/api/classes/join` route, no join UI, no new rate-limit
+  dependency, no Better Auth configuration change.** Better
+  Auth collections remain untouched.
+- **Safe result projection.** The success result is the
+  browser-safe `SafeMembershipDto` projection
+  `{ id, classId, classCode, joinedAt, status: "active",
+  alreadyJoined: boolean }`. It NEVER includes `password`,
+  `passwordHash`, `studentUserId`, `teacherUserId`, raw
+  Mongoose fields, raw stack traces, Mongo error messages, or
+  the raw `classId` ObjectId. The `alreadyJoined` flag is
+  `false` on a fresh insert and `true` when the action
+  detected an existing membership via the compound unique
+  index and surfaced an idempotent success
+  (PHASE 5.1C.1).
+- **No logging.** Plaintext passwords, `passwordHash`, MongoDB
+  internals, raw stack traces, `studentUserId`, and
+  `teacherUserId` are NEVER logged. The action module contains
+  no `console.log` / `logger.*` / `debug(` calls. The test
+  suite asserts no password appears in any console output.
+
+## Phase 5.1D1 class-list read model privacy posture
+
+PHASE 5.1D1 ships the server-only authenticated class-list
+read boundary as a plain `async` function
+(`getVisibleClassesForCurrentUser()` in
+`apps/web/src/lib/classes/class-read-service.ts`). It is NOT a
+Server Action, NOT a REST route, and NOT a UI surface. The
+privacy / security posture is:
+
+- **Identity from the Better Auth session only.** The function
+  derives `userId` from `session.user.id` via `getSession()`.
+  The function accepts NO `userId` argument — a hand-crafted
+  caller cannot select another user. The function performs NO
+  class query on the unauthenticated branch.
+- **Profile gating.** The function calls the existing
+  `getProfileByUserId(userId)` and requires
+  `onboardingCompleted === true`. Missing profile / incomplete
+  onboarding → `PROFILE_INCOMPLETE` (the function performs NO
+  class query on this branch). The role derives EXCLUSIVELY from
+  the persisted `Profile.role`; the browser cannot choose the
+  viewer role.
+- **Teacher visibility** is `Class.teacherUserId === session.user.id`.
+  The query uses the existing `teacherUserId` index on the
+  `classes` collection. A teacher does NOT see classes owned by
+  another teacher.
+- **Student visibility** is
+  `ClassMembership.studentUserId === session.user.id` AND
+  `status === "active"`. The query asks for `status: "active"`
+  explicitly so a future status expansion (e.g. `removed`) cannot
+  silently grant visibility from a non-active membership. A
+  student does NOT see another student's classes.
+- **No `Class` scan + application-memory filter.** The student
+  read path uses TWO queries — one membership query + ONE
+  batched `ClassModel.find({ _id: { $in: [...] } })` lookup.
+  There is no obvious N+1 one-query-per-class loop, and the
+  implementation does NOT fetch the entire `classes` collection
+  and filter in application memory.
+- **Missing referenced class ids are skipped safely.** A
+  membership referencing a non-existent class document does NOT
+  crash the read; the summary is simply omitted from the
+  result. No Mongo internals are leaked on this path.
+- **Duplicate class ids are deduplicated.** A corrupt legacy
+  dataset that contains duplicate `classId`s across membership
+  rows for the same student cannot produce duplicate class
+  summaries in the result.
+- **Safe DTO.** The result contains ONLY
+  `{ id, name, classCode, status, createdAt }` per class. It
+  NEVER includes `password`, `passwordHash`, `teacherUserId`,
+  `studentUserId`, membership internal ids, Mongoose internals
+  (`__v`), biometric fields, raw timestamps, or credential
+  helpers.
+- **Read-only.** The module NEVER creates / updates / deletes a
+  `Class`, a `ClassMembership`, or a `Profile`. It NEVER calls
+  the Face Service. It NEVER reads or writes a `FaceProfile`. It
+  NEVER reads `passwordHash`. It NEVER calls
+  `verifyClassPassword`, `runDummyPasswordVerification`,
+  `hashClassPassword`, or `getClassJoinCredentialByCode`. It
+  NEVER touches attendance data.
+- **Safe error mapping.** Unexpected DB / read failures map to
+  `CLASS_READ_FAILED`. Mongo URI, raw query text, collection
+  names, and raw stack traces are NEVER serialized. There is no
+  internal `passwordHash` or `studentUserId` exposure on the
+  error path.
+- **No logging.** Plaintext passwords, `passwordHash`, biometric
+  fields, Mongo error messages, and `studentUserId` are NEVER
+  logged. The module contains no `console.log` / `logger.*` /
+  `debug(` calls.
 
 ## Phase 2 identity vs business data
 

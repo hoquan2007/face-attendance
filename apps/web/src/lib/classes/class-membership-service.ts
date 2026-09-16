@@ -24,6 +24,7 @@ import { getMongooseConnection } from "@/lib/mongoose";
 import {
   ClassMembershipModel,
   type ClassMembershipAttrs,
+  type ClassMembershipDoc,
   type SafeMembershipDto,
   toSafeMembershipDto,
 } from "@/lib/classes/class-membership-model";
@@ -46,10 +47,17 @@ async function ensureConnection(): Promise<void> {
 
 /**
  * Application-level error codes for membership operations.
+ *
+ * PHASE 5.1C introduces `MEMBERSHIP_ALREADY_JOINED` for the
+ * server-only "this student has already joined this class" case.
+ * The legacy coarse `MEMBERSHIP_ALREADY_EXISTS` constant is
+ * preserved as an alias so callers that pre-date 5.1C continue to
+ * work. New code MUST use `MEMBERSHIP_ALREADY_JOINED`.
  */
 export const MEMBERSHIP_ERROR_CODES = {
   MEMBERSHIP_NOT_FOUND: "MEMBERSHIP_NOT_FOUND",
   MEMBERSHIP_ALREADY_EXISTS: "MEMBERSHIP_ALREADY_EXISTS",
+  MEMBERSHIP_ALREADY_JOINED: "MEMBERSHIP_ALREADY_JOINED",
   MEMBERSHIP_CREATE_FAILED: "MEMBERSHIP_CREATE_FAILED",
 } as const;
 
@@ -64,6 +72,79 @@ export class MembershipServiceError extends Error {
     this.name = "MembershipServiceError";
     this.code = code;
   }
+}
+
+// =============================================================================
+// PHASE 5.1C — Precise duplicate-key classifier
+// =============================================================================
+
+/**
+ * Returns `true` ONLY when the supplied thrown value matches the
+ * canonical Mongo / Mongoose duplicate-key error shape AND the
+ * collided index is the compound `(classId, studentUserId)`
+ * uniqueness guard on the `class_memberships` collection.
+ *
+ * PHASE 5.1C — this classifier is the AUTHORITATIVE
+ * "already joined" predicate. The join Server Action does NOT
+ * retry on a positive classification; it surfaces the typed
+ * `MEMBERSHIP_ALREADY_JOINED` error so the action can map it to
+ * an idempotent success with `alreadyJoined: true`.
+ *
+ * The function is total and never throws. It accepts these error
+ * shapes (any of which Mongo / Mongoose may emit depending on
+ * driver version):
+ *
+ *   1. `{ code: 11000, keyValue: { classId, studentUserId } }`
+ *   2. `{ code: 11000, keyValue: { classId: "...", studentUserId: "..." } }`
+ *      (stringified ObjectIds are accepted)
+ *   3. `{ code: 11000, keyPattern: { classId: 1, studentUserId: 1 } }`
+ *   4. `{ code: 11000, keyValue: { ... }, keyPattern: { ... } }`
+ *
+ * Any other error — including a future unique index, a non-11000
+ * error, or a 11000 error whose `keyValue` / `keyPattern` does not
+ * identify the compound `(classId, studentUserId)` uniqueness —
+ * returns `false`. The caller must map `false` to the generic
+ * `MEMBERSHIP_CREATE_FAILED` code so an unrelated uniqueness
+ * collision (e.g. a future `idempotencyKey` index) is NOT silently
+ * reported as "already joined".
+ *
+ * The function is total and never throws.
+ */
+export function isMembershipDuplicateKeyError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  if ((err as { code?: unknown }).code !== 11000) return false;
+
+  // 1. Compound identification via `keyValue` (the modern Mongo /
+  //    Mongoose shape). Both fields must be present on the
+  //    `keyValue` object.
+  const keyValue = (err as { keyValue?: unknown }).keyValue;
+  if (keyValue && typeof keyValue === "object") {
+    const kv = keyValue as Record<string, unknown>;
+    if (
+      "classId" in kv &&
+      "studentUserId" in kv &&
+      // Belt-and-braces: explicitly reject any unrelated value type
+      // so a `null` / `undefined` / etc. cannot accidentally match.
+      kv["classId"] !== null &&
+      kv["classId"] !== undefined &&
+      kv["studentUserId"] !== null &&
+      kv["studentUserId"] !== undefined
+    ) {
+      return true;
+    }
+  }
+
+  // 2. Compound identification via `keyPattern` (some driver
+  //    versions emit the index keys instead of the values).
+  const keyPattern = (err as { keyPattern?: unknown }).keyPattern;
+  if (keyPattern && typeof keyPattern === "object") {
+    const kp = keyPattern as Record<string, unknown>;
+    if ("classId" in kp && "studentUserId" in kp) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // =============================================================================
@@ -120,6 +201,46 @@ export async function getMembership(
 }
 
 /**
+ * Retrieves the safe `SafeMembershipDto` projection for a specific
+ * (classId, studentUserId) pair.
+ *
+ * PHASE 5.1C — the duplicate-path lookup primitive for the join
+ * Server Action. When `createMembership` collides on the compound
+ * unique index, the action calls this primitive to project the
+ * ALREADY-PERSISTED membership into the browser-safe shape and
+ * return `ok: true, alreadyJoined: true`.
+ *
+ * Returns `null` when no membership exists. The function NEVER
+ * throws on lookup failure — the action maps `null` to the
+ * generic `CLASS_JOIN_FAILED` code so an attacker cannot learn
+ * whether a membership exists out of band.
+ */
+export async function getSafeMembership(
+  classId: string | Types.ObjectId,
+  studentUserId: string,
+): Promise<SafeMembershipDto | null> {
+  await ensureConnection();
+  // Mongoose `.lean()` returns plain objects that include the
+  // Mongo-managed `_id` and timestamps. We cast to a slightly
+  // richer shape so the existing `toSafeMembershipDto` can be
+  // reused without duplicating the projection logic.
+  const doc = await ClassMembershipModel.findOne({
+    classId: new Types.ObjectId(classId.toString()),
+    studentUserId,
+  })
+    .lean<
+      ClassMembershipAttrs & {
+        _id: Types.ObjectId;
+        createdAt: Date;
+        updatedAt: Date;
+      }
+    >()
+    .exec();
+  if (!doc) return null;
+  return toSafeMembershipDto(doc as unknown as ClassMembershipDoc);
+}
+
+/**
  * Lists all memberships for a given student.
  *
  * Returns memberships sorted by `joinedAt` descending.
@@ -158,13 +279,24 @@ export async function listMembershipsByClassId(
  *
  * - Checks are not performed here — the unique compound index is the
  *   authoritative guard against duplicates.
- * - Throws `MembershipServiceError` on duplicate membership (index violation).
+ * - Throws `MembershipServiceError` on duplicate membership (index
+ *   violation) classified via the precise
+ *   `isMembershipDuplicateKeyError` predicate.
+ * - Throws `MembershipServiceError(MEMBERSHIP_CREATE_FAILED)` on any
+ *   other persistence failure. Unrelated 11000 collisions (e.g. a
+ *   future `idempotencyKey` unique index) MUST NOT be remapped to
+ *   the "already joined" code — the caller would otherwise mask a
+ *   real persistence bug.
+ * - The function NEVER retries the insert. Duplicate classification
+ *   is purely a label for the failure mode; the join Server
+ *   Action surfaces the safe code to the browser and lets the UI
+ *   decide.
  *
  * Returns the created membership as a `SafeMembershipDto`.
  *
- * Note: this function does NOT enforce student role or verify the class
- * password. Future server orchestration must perform those checks before
- * calling `createMembership`.
+ * Note: this function does NOT enforce student role or verify the
+ * class password. Future server orchestration must perform those
+ * checks before calling `createMembership`.
  */
 export async function createMembership(
   input: CreateMembershipInput,
@@ -181,20 +313,20 @@ export async function createMembership(
 
     return toSafeMembershipDto(doc);
   } catch (err: unknown) {
-    // Handle MongoDB duplicate-key error on (classId, studentUserId).
-    if (
-      err &&
-      typeof err === "object" &&
-      "code" in err &&
-      (err as { code: number }).code === 11000
-    ) {
+    // PHASE 5.1C — precise duplicate-key classification.
+    // The classifier accepts the compound `(classId, studentUserId)`
+    // collision ONLY. Unrelated E11000 collisions (a future unique
+    // index, a typo'd index name, a driver quirk) fall through to
+    // `MEMBERSHIP_CREATE_FAILED`. The function NEVER retries.
+    if (isMembershipDuplicateKeyError(err)) {
       throw new MembershipServiceError({
-        code: MEMBERSHIP_ERROR_CODES.MEMBERSHIP_ALREADY_EXISTS,
-        message: "You are already a member of this class.",
+        code: MEMBERSHIP_ERROR_CODES.MEMBERSHIP_ALREADY_JOINED,
+        message: "You have already joined this class.",
       });
     }
-    // Re-throw MembershipServiceError unchanged so the test error code
-    // assertion (e.g. ALREADY_EXISTS via test setup) is preserved.
+    // Re-throw MembershipServiceError unchanged so the test error
+    // code assertion (e.g. ALREADY_JOINED via test setup) is
+    // preserved.
     if (err instanceof MembershipServiceError) throw err;
     throw new MembershipServiceError({
       code: MEMBERSHIP_ERROR_CODES.MEMBERSHIP_CREATE_FAILED,

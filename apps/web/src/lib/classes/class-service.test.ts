@@ -51,8 +51,16 @@ let duplicateCode: string | null = null;
 
 const mockCreate = vi.fn(async (doc: ClassAttrs) => {
   if (duplicateCode && doc.classCode === duplicateCode) {
-    const err = new Error("Duplicate key") as Error & { code: number };
+    // Simulate the canonical Mongo / Mongoose duplicate-key error shape
+    // that PHASE 5.1B relies on for retry classification. The `keyValue`
+    // field identifies the collided index — the service classifier
+    // accepts a collision only when `keyValue.classCode` is present.
+    const err = new Error("Duplicate key") as Error & {
+      code: number;
+      keyValue: Record<string, unknown>;
+    };
     err.code = 11000;
+    err.keyValue = { classCode: doc.classCode };
     throw err;
   }
 
