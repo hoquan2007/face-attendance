@@ -1047,3 +1047,113 @@ describe("routes / no public API", () => {
     ).toBe(false);
   });
 });
+
+// =============================================================================
+// 56..63 — PHASE 5.1E4B — VIEW CLASS LINK IN SUCCESS STATE
+// =============================================================================
+
+describe("PHASE 5.1E4B — View class in success state", () => {
+  async function submitSuccess() {
+    mockCreateClassAction.mockResolvedValue(makeSuccess());
+    const { container } = render(<CreateClassForm />);
+    fireEvent.change(container.querySelector('input[name="name"]')!, {
+      target: { value: "Intro to CS" },
+    });
+    fireEvent.change(container.querySelector('input[name="password"]')!, {
+      target: { value: "ClassP@ssw0rd-2026" },
+    });
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: /create class/i }),
+      );
+    });
+    await waitFor(() => {
+      expect(screen.getByText("ABC2XYZ")).toBeTruthy();
+    });
+  }
+
+  it("56. success state renders View class link when class.id exists", async () => {
+    await submitSuccess();
+    const viewLink = screen.getByRole("link", { name: /view class/i });
+    expect(viewLink).toBeTruthy();
+  });
+
+  it("57. View class link points to /classes/<id>", async () => {
+    await submitSuccess();
+    const viewLink = screen.getByRole("link", { name: /view class/i });
+    expect(viewLink.getAttribute("href")).toBe(
+      "/classes/65f0000000000000000000a1",
+    );
+  });
+
+  it("58. View class link carries no query parameters", async () => {
+    await submitSuccess();
+    const viewLink = screen.getByRole("link", { name: /view class/i });
+    const href = viewLink.getAttribute("href") ?? "";
+    expect(href).not.toMatch(/\?/);
+    expect(href).not.toMatch(/userId=/);
+    expect(href).not.toMatch(/role=/);
+    expect(href).not.toMatch(/classCode=/);
+    expect(href).not.toMatch(/password/i);
+    expect(href).not.toMatch(/passwordHash/i);
+  });
+
+  it("59. View class link carries no classCode / password in URL", async () => {
+    await submitSuccess();
+    const viewLink = screen.getByRole("link", { name: /view class/i });
+    const href = viewLink.getAttribute("href") ?? "";
+    // The classCode is ABC2XYZ and must NOT appear in the
+    // href; the class password is NEVER echoed.
+    expect(href).not.toContain("ABC2XYZ");
+    expect(href).not.toContain("ClassP@ssw0rd-2026");
+    expect(href).not.toContain("passwordHash");
+  });
+
+  it("60. View class link is rendered alongside Back to classes", async () => {
+    await submitSuccess();
+    expect(
+      screen.getByRole("link", { name: /view class/i }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("link", { name: /back to classes/i }),
+    ).toBeTruthy();
+  });
+
+  it("61. Back to classes still points to /classes", async () => {
+    await submitSuccess();
+    const backLink = screen.getByRole("link", {
+      name: /back to classes/i,
+    });
+    expect(backLink.getAttribute("href")).toBe("/classes");
+  });
+
+  it("62. success state still hides the password", async () => {
+    mockCreateClassAction.mockResolvedValue(makeSuccess());
+    const { container } = render(<CreateClassForm />);
+    fireEvent.change(container.querySelector('input[name="name"]')!, {
+      target: { value: "Intro to CS" },
+    });
+    fireEvent.change(container.querySelector('input[name="password"]')!, {
+      target: { value: "ClassP@ssw0rd-2026" },
+    });
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: /create class/i }),
+      );
+    });
+    await waitFor(() => {
+      expect(screen.getByText("ABC2XYZ")).toBeTruthy();
+    });
+    // Password input is unmounted; passwordHash is NOT in DOM.
+    expect(container.querySelector('input[name="password"]')).toBeNull();
+    expect(container.innerHTML).not.toContain("ClassP@ssw0rd-2026");
+    expect(container.innerHTML.toLowerCase()).not.toContain("passwordhash");
+  });
+
+  it("63. success state still shows classCode prominently", async () => {
+    await submitSuccess();
+    // The classCode is still rendered in the success state.
+    const codeEl = screen.getByText("ABC2XYZ");
+    expect(codeEl.className.toLowerCase()).toContain("font-mono");
+  });
+});

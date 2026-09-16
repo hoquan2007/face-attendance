@@ -18,6 +18,12 @@
  *   - Renders safe success feedback for both first-join
  *     (`alreadyJoined: false`) and idempotent already-joined
  *     (`alreadyJoined: true`) — both are SUCCESS states.
+ *     PHASE 5.1E4B — both branches additionally render a
+ *     secondary "View class" link to `/classes/<classId>` when
+ *     the safe action result carries `membership.classId`.
+ *     The teacher / student still needs to read the
+ *     `classCode` before navigating away, so the success state
+ *     does NOT auto-redirect.
  *   - Renders safe error feedback (no Mongo detail, no stack, no
  *     `passwordHash`) for every documented error code.
  *   - Uses ONE generic message for all credential failures
@@ -26,7 +32,10 @@
  *     "archived class" / "malformed stored hash".
  *   - Provides a "Back to classes" affordance on success that
  *     links to `/classes`. The link does NOT carry class data
- *     in the URL.
+ *     in the URL. PHASE 5.1E4B — both first-join and
+ *     already-joined branches also render a secondary
+ *     "View class" link to `/classes/<classId>` when the safe
+ *     action result carries a non-empty `membership.classId`.
  *   - Uses `type="password"` and an appropriate `autoComplete`
  *     value. Does NOT store the password in localStorage /
  *     sessionStorage / IndexedDB. Does NOT log the password.
@@ -181,6 +190,7 @@ export function JoinClassForm({ className }: JoinClassFormProps) {
     retryable: boolean;
   } | null>(null);
   const [success, setSuccess] = React.useState<{
+    classId: string;
     className: string;
     classCode: string;
     alreadyJoined: boolean;
@@ -236,6 +246,7 @@ export function JoinClassForm({ className }: JoinClassFormProps) {
           // The membership result contains the class identity.
           // We don't have the class name directly in the membership,
           // but we can surface it if returned.
+          classId: result.membership.classId,
           className: "", // className is not in the membership; placeholder
           classCode: result.membership.classCode,
           alreadyJoined: result.alreadyJoined,
@@ -371,6 +382,7 @@ export function JoinClassForm({ className }: JoinClassFormProps) {
 
 interface SuccessStateProps {
   success: {
+    classId: string;
     className: string;
     classCode: string;
     alreadyJoined: boolean;
@@ -384,14 +396,23 @@ interface SuccessStateProps {
  * gained access to the class.
  *
  * The student is given a calm heading, the classCode in monospace,
- * and a "Back to classes" link to `/classes`. The link does NOT
- * carry any class data in the URL.
+ * and:
+ *
+ *   - A primary "Back to classes" `Link` to `/classes` (the
+ *     existing affordance, preserved verbatim).
+ *   - PHASE 5.1E4B — A secondary "View class" `Link` to
+ *     `/classes/<safe-classId>`. The link is rendered ONLY when
+ *     the safe action result includes a non-empty
+ *     `membership.classId` — it is never fabricated. The link
+ *     target carries NO query parameters, NO `classCode`, NO
+ *     `studentUserId`, NO password, and NO `membershipId`. The
+ *     success state does NOT auto-redirect.
  *
  * The password is NEVER echoed (we cannot recover the plaintext
  * from `passwordHash` anyway).
  */
 function SuccessState({ success, className }: SuccessStateProps) {
-  const { classCode, alreadyJoined } = success;
+  const { classId, classCode, alreadyJoined } = success;
 
   const heading = alreadyJoined
     ? "Already joined"
@@ -399,6 +420,13 @@ function SuccessState({ success, className }: SuccessStateProps) {
   const description = alreadyJoined
     ? "You're already in this class."
     : "You've joined the class successfully.";
+  // PHASE 5.1E4B — `classId` is the safe action result field
+  // `result.membership.classId` (canonical ObjectId string).
+  // The safe action already projects ONLY safe fields; the
+  // browser receives the canonical ObjectId string and NOTHING
+  // else from the membership document.
+  const hasViewClassHref =
+    typeof classId === "string" && classId.length > 0;
 
   return (
     <div
@@ -429,6 +457,20 @@ function SuccessState({ success, className }: SuccessStateProps) {
           </dl>
         </CardContent>
         <div className="flex flex-wrap items-center justify-end gap-3 px-5 py-4 border-t border-border">
+          {hasViewClassHref ? (
+            <Button
+              asChild
+              variant="secondary"
+              data-component="view-class-link"
+            >
+              <Link
+                href={`/classes/${classId}`}
+                aria-label="View class"
+              >
+                View class
+              </Link>
+            </Button>
+          ) : null}
           <Button asChild variant="primary">
             <Link href="/classes">Back to classes</Link>
           </Button>

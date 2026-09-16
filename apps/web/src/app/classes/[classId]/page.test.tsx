@@ -48,6 +48,7 @@ import { resolve } from "node:path";
 const mockGetSession = vi.fn();
 const mockGetProfileByUserId = vi.fn();
 const mockGetClassDetailForCurrentUser = vi.fn();
+const mockGetClassRosterForCurrentTeacher = vi.fn();
 // `notFound()` throws to halt the route segment — mirror the
 // existing redirect-mock pattern so tests can observe the call.
 const mockNotFound = vi.fn(() => {
@@ -74,9 +75,18 @@ vi.mock("@/lib/profile-service", () => ({
 vi.mock("@/lib/classes/class-read-service", () => ({
   getClassDetailForCurrentUser: (...args: unknown[]) =>
     mockGetClassDetailForCurrentUser(...args),
+  getClassRosterForCurrentTeacher: (...args: unknown[]) =>
+    mockGetClassRosterForCurrentTeacher(...args),
   CLASS_DETAIL_READ_ERROR_CODES: {
     UNAUTHENTICATED: "UNAUTHENTICATED",
     PROFILE_INCOMPLETE: "PROFILE_INCOMPLETE",
+    CLASS_NOT_ACCESSIBLE: "CLASS_NOT_ACCESSIBLE",
+    CLASS_READ_FAILED: "CLASS_READ_FAILED",
+  },
+  CLASS_ROSTER_READ_ERROR_CODES: {
+    UNAUTHENTICATED: "UNAUTHENTICATED",
+    PROFILE_INCOMPLETE: "PROFILE_INCOMPLETE",
+    TEACHER_REQUIRED: "TEACHER_REQUIRED",
     CLASS_NOT_ACCESSIBLE: "CLASS_NOT_ACCESSIBLE",
     CLASS_READ_FAILED: "CLASS_READ_FAILED",
   },
@@ -155,6 +165,15 @@ function makeClassDetail(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Default safe roster result for tests that exercise the
+  // teacher viewer path. Tests that assert specific roster
+  // behavior override this mock locally. The student viewer
+  // path does NOT call this function at all, so student-path
+  // tests are unaffected even with this default.
+  mockGetClassRosterForCurrentTeacher.mockResolvedValue({
+    ok: true,
+    result: { class: makeClassDetail(), students: [] },
+  });
 });
 
 afterEach(() => {
@@ -845,24 +864,96 @@ describe("/classes/[classId] page — domain isolation", () => {
     sourceBody = stripComments(source);
   });
 
-  it("41. page does not call getClassRosterForCurrentTeacher", () => {
-    expect(sourceBody).not.toMatch(/getClassRosterForCurrentTeacher/);
+  it("41. page does not call getClassRosterForCurrentTeacher on student viewer path", async () => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "student" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "student", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue({
+      ok: true,
+      result: {
+        class: makeClassDetail(),
+        students: [
+          {
+            fullName: "Should Not Appear",
+            identificationCode: "SHOULDNOT",
+            joinedAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      },
+    });
+    await ClassDetailPage({
+      params: Promise.resolve({ classId: "650000000000000000000099" }),
+    });
+    expect(mockGetClassRosterForCurrentTeacher).not.toHaveBeenCalled();
   });
 
-  it("42. no Students section", () => {
-    expect(sourceBody.toLowerCase()).not.toMatch(/students/);
+  it("41b. teacher viewer path calls getClassRosterForCurrentTeacher", async () => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "teacher" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue({
+      ok: true,
+      result: {
+        class: makeClassDetail(),
+        students: [],
+      },
+    });
+    await ClassDetailPage({
+      params: Promise.resolve({ classId: "650000000000000000000099" }),
+    });
+    expect(mockGetClassRosterForCurrentTeacher).toHaveBeenCalledTimes(1);
+    expect(mockGetClassRosterForCurrentTeacher).toHaveBeenCalledWith(
+      "650000000000000000000099",
+    );
+  });
+
+  it("42. page does not render Students section on student viewer path", async () => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "student" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "student", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue({
+      ok: true,
+      result: { class: makeClassDetail(), students: [] },
+    });
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    // The "Students" heading appears ONLY on the teacher viewer
+    // path. The student viewer path MUST NOT render it.
+    expect(tree).not.toMatch(/Students<\/h2/);
   });
 
   it("43. no Members section", () => {
     expect(sourceBody.toLowerCase()).not.toMatch(/members/);
   });
 
-  it("44. no identificationCode in source", () => {
-    expect(sourceBody.toLowerCase()).not.toContain("identificationcode");
+  it("44. studentUserId is NEVER projected in source", () => {
+    // The page may mention the field name in safe comments /
+    // projections, but it MUST NOT build a roster row from
+    // `studentUserId`. The field is identity-bearing and must
+    // never be rendered into the DOM.
+    expect(sourceBody.toLowerCase()).not.toContain("studentuserid");
   });
 
-  it("45. no joinedAt roster row", () => {
-    expect(sourceBody.toLowerCase()).not.toContain("joinedat");
+  it("45. teacherUserId is NEVER projected in source", () => {
+    expect(sourceBody.toLowerCase()).not.toContain("teacheruserid");
   });
 
   it("46. no createClassAction", () => {
@@ -1046,5 +1137,502 @@ describe("/classes/[classId] page — accessibility / structure", () => {
     expect(tree).not.toMatch(/stack/i);
     expect(tree).not.toMatch(/mongo/i);
     expect(tree).not.toMatch(/E11000/);
+  });
+});
+
+// =============================================================================
+// 63..78 — PHASE 5.1E4B — TEACHER ROSTER UI
+// =============================================================================
+
+/**
+ * PHASE 5.1E4B — teacher roster UI contract. The page calls
+ * `getClassRosterForCurrentTeacher(classId)` only on the teacher
+ * viewer path and renders a Students section using ONLY the safe
+ * roster DTO fields. The student viewer path performs ZERO roster
+ * lookups.
+ *
+ * The contract covers:
+ *   - roster read invocation (teacher path only)
+ *   - rendering fullName / identificationCode / joinedAt
+ *   - empty roster state
+ *   - archived teacher class still renders roster
+ *   - student path performs no roster lookup
+ *   - roster failure keeps class detail visible
+ *   - privacy (no email / phone / user IDs / membership / Face /
+ *     attendance in the rendered DOM)
+ *   - no public roster REST API
+ */
+
+// Shared helpers for the E4B roster contract tests.
+interface RosterItemFixture {
+  fullName: string;
+  identificationCode: string;
+  joinedAt: string;
+}
+
+function makeRosterItem(
+  overrides: Partial<RosterItemFixture> = {},
+): RosterItemFixture {
+  return {
+    fullName: "Alice Adams",
+    identificationCode: "S-001",
+    joinedAt: "2026-01-01T10:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function makeRosterSuccess(students: RosterItemFixture[]) {
+  return {
+    ok: true as const,
+    result: {
+      class: makeClassDetail(),
+      students,
+    },
+  };
+}
+
+function makeRosterFailure(
+  code: string,
+  message: string,
+): {
+  ok: false;
+  code: string;
+  message: string;
+} {
+  // The `message` field is preserved here so we can verify
+  // it is NEVER surfaced in the rendered DOM by the page
+  // (the panel renders a hardcoded safe copy regardless).
+  return { ok: false, code, message };
+}
+
+describe("/classes/[classId] page — PHASE 5.1E4B teacher roster UI", () => {
+  beforeEach(() => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "teacher" }),
+    );
+  });
+
+  it("63. teacher detail calls roster read with route classId", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterSuccess([]),
+    );
+    await ClassDetailPage({
+      params: Promise.resolve({ classId: "650000000000000000000099" }),
+    });
+    expect(mockGetClassRosterForCurrentTeacher).toHaveBeenCalledTimes(1);
+    expect(mockGetClassRosterForCurrentTeacher).toHaveBeenCalledWith(
+      "650000000000000000000099",
+    );
+  });
+
+  it("64. teacher roster renders fullName", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterSuccess([
+        makeRosterItem({
+          fullName: "Alice Adams",
+          identificationCode: "S-001",
+        }),
+      ]),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree).toContain("Alice Adams");
+  });
+
+  it("65. teacher roster renders identificationCode", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterSuccess([
+        makeRosterItem({
+          fullName: "Alice Adams",
+          identificationCode: "S-001ABC",
+        }),
+      ]),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree).toContain("S-001ABC");
+  });
+
+  it("66. teacher roster renders joinedAt as a formatted date", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterSuccess([
+        makeRosterItem({
+          joinedAt: "2026-02-15T10:00:00.000Z",
+        }),
+      ]),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree).toContain("Feb 15, 2026");
+  });
+
+  it("67. empty roster state renders the calm placeholder", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterSuccess([]),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree).toContain("No students have joined this class yet.");
+  });
+
+  it("67b. empty roster state never renders a fake count", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterSuccess([]),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    // No fake numeric count, no fake student rows.
+    expect(tree).not.toMatch(/\b0 students\b/i);
+    expect(tree).not.toMatch(/\b1 student\b/i);
+  });
+
+  it("68. archived teacher class still renders roster", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        class: makeClassDetail({ status: "archived" }),
+      },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterSuccess([
+        makeRosterItem({
+          fullName: "Alice Adams",
+          identificationCode: "S-001",
+        }),
+      ]),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree).toContain("Archived");
+    expect(tree).toContain("Alice Adams");
+    // The roster read still runs on the archived teacher path.
+    expect(mockGetClassRosterForCurrentTeacher).toHaveBeenCalledTimes(1);
+  });
+
+  it("69. student detail does NOT call roster read", async () => {
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "student" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "student", class: makeClassDetail() },
+    });
+    // The roster mock is configured to reject if called — but
+    // it MUST NOT be called at all.
+    mockGetClassRosterForCurrentTeacher.mockImplementation(() => {
+      throw new Error("ROSTER_SHOULD_NOT_BE_CALLED");
+    });
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(mockGetClassRosterForCurrentTeacher).not.toHaveBeenCalled();
+    // No "Students" heading on the student viewer path.
+    expect(tree).not.toMatch(/Students<\/h2/);
+  });
+
+  it("70. student viewer path renders no roster identity fields", async () => {
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "student" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "student", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterSuccess([
+        makeRosterItem({
+          fullName: "Should Not Appear",
+          identificationCode: "SHOULDNOT",
+        }),
+      ]),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    // The page MUST NOT have rendered any roster identity
+    // fields, because the roster read was never invoked.
+    expect(tree).not.toContain("Should Not Appear");
+    expect(tree).not.toContain("SHOULDNOT");
+    expect(mockGetClassRosterForCurrentTeacher).not.toHaveBeenCalled();
+  });
+
+  it("71. roster read failure keeps class detail visible", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterFailure(
+        "CLASS_READ_FAILED",
+        "Could not load the roster. Please try again.",
+      ),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    // The class detail card is still rendered.
+    expect(tree).toContain("ABCDEFG");
+    expect(tree).toContain("Back to classes");
+    // The calm roster-local failure block is rendered.
+    expect(tree).toContain("Student list could not be loaded.");
+  });
+
+  it("72. roster failure exposes no raw internal error", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    // Simulate a malformed driver-internal message arriving in
+    // the message field. The page MUST NOT echo it.
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterFailure(
+        "CLASS_READ_FAILED",
+        "E11000 duplicate key on mongodb://internal:27017/face_attendance.class_memberships",
+      ),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    // The panel renders a constant safe copy and the backend
+    // message MUST NEVER leak into the DOM.
+    expect(tree).not.toMatch(/E11000/);
+    expect(tree).not.toMatch(/mongodb:\/\//);
+    expect(tree).not.toMatch(/duplicate key/);
+    expect(tree).not.toMatch(/face_attendance/);
+    expect(tree).not.toMatch(/stack/i);
+    // The calm safe copy IS rendered.
+    expect(tree).toContain("Student list could not be loaded.");
+  });
+
+  it("73. roster DOM contains no email / emailSnapshot", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterSuccess([
+        makeRosterItem({
+          fullName: "Alice Adams",
+          identificationCode: "S-001",
+        }),
+      ]),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree).not.toContain("emailSnapshot");
+    expect(tree).not.toContain("u@example.com");
+    expect(tree).not.toContain("EMAIL_SNAPSHOT");
+  });
+
+  it("74. roster DOM contains no phone", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterSuccess([
+        makeRosterItem({
+          fullName: "Alice Adams",
+          identificationCode: "S-001",
+        }),
+      ]),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree.toLowerCase()).not.toContain("phone");
+  });
+
+  it("75. roster DOM contains no user IDs", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterSuccess([
+        makeRosterItem({
+          fullName: "Alice Adams",
+          identificationCode: "S-001",
+        }),
+      ]),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree).not.toContain("studentUserId");
+    expect(tree).not.toContain("teacherUserId");
+    expect(tree.toLowerCase()).not.toContain("membershipid");
+    expect(tree.toLowerCase()).not.toContain("membership_id");
+  });
+
+  it("76. roster DOM contains no biometric data", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterSuccess([
+        makeRosterItem({
+          fullName: "Alice Adams",
+          identificationCode: "S-001",
+        }),
+      ]),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree.toLowerCase()).not.toContain("embedding");
+    expect(tree.toLowerCase()).not.toContain("centroid");
+    expect(tree.toLowerCase()).not.toContain("faceprofile");
+  });
+
+  it("77. roster DOM contains no attendance copy", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterSuccess([
+        makeRosterItem({
+          fullName: "Alice Adams",
+          identificationCode: "S-001",
+        }),
+      ]),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    // The roster panel must NOT advertise attendance — the
+    // phase does NOT implement attendance. Copy such as
+    // "Present / Absent / Late / Attendance %" must NOT leak.
+    expect(tree.toLowerCase()).not.toMatch(/\bpresent\b/);
+    expect(tree.toLowerCase()).not.toMatch(/\babsent\b/);
+    expect(tree.toLowerCase()).not.toMatch(/\blate\b/);
+    expect(tree.toLowerCase()).not.toContain("attendance");
+    expect(tree.toLowerCase()).not.toContain("recognition");
+    expect(tree.toLowerCase()).not.toContain("camera");
+  });
+
+  it("78. no public roster REST route introduced", async () => {
+    const source = readFileSync(
+      resolve(
+        __dirname,
+        "..",
+        "..",
+        "..",
+        "app",
+        "classes",
+        "[classId]",
+        "page.tsx",
+      ),
+      "utf-8",
+    );
+    const body = stripComments(source);
+    expect(body).not.toMatch(/\/api\/classes\/.+\/roster/);
+    expect(body).not.toMatch(/\/api\/roster/);
+    expect(body).not.toMatch(/route\.ts/);
+  });
+
+  it("78b. roster read preserves server-supplied joinedAt ASC ordering", async () => {
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: { role: "teacher", class: makeClassDetail() },
+    });
+    // Server returns joinedAt ASC: oldest first.
+    mockGetClassRosterForCurrentTeacher.mockResolvedValue(
+      makeRosterSuccess([
+        makeRosterItem({
+          fullName: "Oldest First",
+          identificationCode: "OLD-001",
+          joinedAt: "2026-01-01T10:00:00.000Z",
+        }),
+        makeRosterItem({
+          fullName: "Middle Second",
+          identificationCode: "MID-001",
+          joinedAt: "2026-02-01T10:00:00.000Z",
+        }),
+        makeRosterItem({
+          fullName: "Newest Third",
+          identificationCode: "NEW-001",
+          joinedAt: "2026-03-01T10:00:00.000Z",
+        }),
+      ]),
+    );
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    // The page must NOT resort. Verify the server-supplied
+    // order is preserved in the rendered output.
+    const idxOldest = tree.indexOf("Oldest First");
+    const idxMiddle = tree.indexOf("Middle Second");
+    const idxNewest = tree.indexOf("Newest Third");
+    expect(idxOldest).toBeGreaterThan(-1);
+    expect(idxMiddle).toBeGreaterThan(idxOldest);
+    expect(idxNewest).toBeGreaterThan(idxMiddle);
   });
 });

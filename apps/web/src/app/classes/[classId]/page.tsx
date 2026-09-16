@@ -2,6 +2,7 @@
  * `/classes/[classId]` — authenticated, authorized class detail page.
  *
  * PHASE 5.1E4A — AUTHORIZED CLASS DETAIL UI.
+ * PHASE 5.1E4B — TEACHER ROSTER UI + VIEW CLASS INTEGRATION.
  *
  * Server Component.
  *
@@ -27,8 +28,15 @@
  *   - never reads `passwordHash`, `teacherUserId`, `studentUserId`,
  *     membership internal ids, or biometric state.
  *
- * No client-side class fetching. No `useEffect`. No SWR / React Query.
- * No `/api/classes/[classId]` route is introduced.
+ * PHASE 5.1E4B additionally calls the teacher-only
+ * `getClassRosterForCurrentTeacher(classId)` read boundary
+ * (PHASE 5.1D2B) on the teacher viewer path. The roster read is
+ * CONDITIONAL on the server-authoritative `role === "teacher"`
+ * branch from the canonical detail read — the student path
+ * performs ZERO roster lookups (not even a discarded call).
+ *
+ * No client-side class / roster fetching. No `useEffect`. No SWR
+ * / React Query. No `/api/classes/[classId]` route is introduced.
  *
  * Next.js 16.3.4 dynamic-route signature:
  *
@@ -46,12 +54,12 @@
  *     no "Class does not exist", "You do not own this class", "You
  *     are not a member", or "Invalid class ID" outcome.
  *   - CLASS_READ_FAILED → render a calm, restrained error block.
+ *   - CLASS_ROSTER_READ_FAILED → keep the class detail visible;
+ *     render a small safe roster-local message. The class detail
+ *     page does NOT collapse into a global error.
  *
  * What this page does NOT do:
  *
- *   - No roster read (`getClassRosterForCurrentTeacher`).
- *   - No roster UI (students / members / identificationCode /
- *     joinedAt).
  *   - No class editing / archive / delete controls.
  *   - No attendance UI.
  *   - No Face ID state / biometric enrollment state.
@@ -59,6 +67,9 @@
  *   - No password / passwordHash / teacherUserId / studentUserId /
  *     membershipId / email / phone / FaceProfile / embedding /
  *     centroid in the rendered DOM.
+ *   - NO roster call on the student viewer path. The student path
+ *     does NOT call `getClassRosterForCurrentTeacher` — neither to
+ *     call-then-hide nor to call-then-discard.
  */
 
 import Link from "next/link";
@@ -70,7 +81,12 @@ import { getProfileByUserId } from "@/lib/profile-service";
 import {
   getClassDetailForCurrentUser,
   CLASS_DETAIL_READ_ERROR_CODES,
+  getClassRosterForCurrentTeacher,
 } from "@/lib/classes/class-read-service";
+import {
+  RosterPanel,
+  type RosterPanelState,
+} from "@/components/classes/roster-panel";
 import { PageContainer } from "@/components/layout/PageContainer";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { StatusBadge } from "@/components/layout/StatusBadge";
@@ -221,6 +237,39 @@ export default async function ClassDetailPage({
   const statusLabel =
     classDetail.status === "archived" ? "Archived" : "Active";
 
+  // PHASE 5.1E4B — Teacher roster read. The student viewer path
+  // skips this branch entirely: there is ZERO roster lookup on
+  // the student path — neither a call-then-hide nor a call-then-
+  // discard pattern. The conditional is the explicit gate; the
+  // panel receives `{ status: "absent" }` so it renders nothing.
+  let rosterState: RosterPanelState = { status: "absent" };
+  if (role === "teacher") {
+    const rosterResult = await getClassRosterForCurrentTeacher(classId);
+    if (rosterResult.ok) {
+      // The roster DTO is the safe projection: fullName,
+      // identificationCode, joinedAt. studentUserId /
+      // membershipId / email / phone are NEVER projected.
+      rosterState = {
+        status: "success",
+        students: rosterResult.result.students.map((s) => ({
+          fullName: s.fullName,
+          identificationCode: s.identificationCode,
+          joinedAt: s.joinedAt,
+        })),
+      };
+    } else {
+      // Roster read failure is LOCAL to the roster panel. The
+      // class detail card is preserved; the panel renders a
+      // calm, safe, hardcoded message. We deliberately do NOT
+      // forward the backend `message` field — the panel always
+      // renders a constant safe copy so any future backend
+      // regression that surfaces a raw `E11000` / `mongodb://`
+      // / stack-trace through the failure message can NEVER
+      // leak into the rendered DOM through this surface.
+      rosterState = { status: "failure" };
+    }
+  }
+
   return (
     <PageContainer size="default">
       <PageHeader
@@ -266,6 +315,10 @@ export default async function ClassDetailPage({
             </dl>
           </CardContent>
         </Card>
+
+        {role === "teacher" ? (
+          <RosterPanel state={rosterState} />
+        ) : null}
 
         <div className="flex justify-start">
           <Link

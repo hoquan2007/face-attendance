@@ -21,6 +21,18 @@
  *     createdAt. The plaintext password is NEVER echoed. The form
  *     fields are hidden once the action succeeds and the password
  *     state is cleared immediately.
+ *   - PHASE 5.1E4B — On success, when the safe action result
+ *     includes `class.id`, renders a secondary "View class" link
+ *     to `/classes/<class.id>` so the teacher can navigate to the
+ *     canonical authorized class detail page introduced by
+ *     PHASE 5.1E4A / 5.1E4B. The link target carries NO query
+ *     parameters, NO `classCode`, NO password, NO `userId`, and
+ *     is the only entry point to the detail page (no public
+ *     REST API).
+ *   - PHASE 5.1E4B — The teacher still needs to read the
+ *     `classCode` before navigating away, so the success state
+ *     does NOT auto-redirect. Both "View class" and "Back to
+ *     classes" remain explicit user actions.
  *   - Renders safe error feedback (no Mongo detail, no stack, no
  *     `passwordHash`) for every documented error code.
  *   - Provides a "Back to classes" affordance on success that links
@@ -178,6 +190,7 @@ export function CreateClassForm({ className }: CreateClassFormProps) {
     retryable: boolean;
   } | null>(null);
   const [success, setSuccess] = React.useState<{
+    id: string;
     name: string;
     classCode: string;
     createdAt: string;
@@ -230,6 +243,7 @@ export function CreateClassForm({ className }: CreateClassFormProps) {
         setPassword("");
         submitInFlightRef.current = false;
         setSuccess({
+          id: result.class.id,
           name: result.class.name,
           classCode: result.class.classCode,
           createdAt: result.class.createdAt,
@@ -366,7 +380,12 @@ export function CreateClassForm({ className }: CreateClassFormProps) {
 // =============================================================================
 
 interface SuccessStateProps {
-  success: { name: string; classCode: string; createdAt: string };
+  success: {
+    id: string;
+    name: string;
+    classCode: string;
+    createdAt: string;
+  };
   className?: string;
   formatCreatedAt: (iso: string) => string;
 }
@@ -378,15 +397,31 @@ interface SuccessStateProps {
  * anyway).
  *
  * The teacher is given a calm heading, the prominent classCode in
- * monospace, and a "Back to classes" link to `/classes`. The link
- * does NOT carry any class data in the URL.
+ * monospace, and:
+ *
+ *   - A primary "Back to classes" `Link` to `/classes` (the
+ *     existing affordance, preserved verbatim).
+ *   - PHASE 5.1E4B — A secondary "View class" `Link` to
+ *     `/classes/<safe-class-id>`. The link is rendered ONLY when
+ *     the safe action result includes `class.id` — it is never
+ *     fabricated. The link target carries NO query parameters,
+ *     NO `classCode`, NO password, NO `userId`, and NO
+ *     `membershipId`. The teacher still needs to read the
+ *     `classCode` before navigating away, so the success state
+ *     does NOT auto-redirect.
  */
 function SuccessState({
   success,
   className,
   formatCreatedAt,
 }: SuccessStateProps) {
-  const { name, classCode, createdAt } = success;
+  const { id, name, classCode, createdAt } = success;
+  // PHASE 5.1E4B — `id` is the safe action result field
+  // `result.class.id`. The safe action already projects ONLY
+  // safe fields; the browser receives the canonical Mongo
+  // ObjectId string and NOTHING else from the class document.
+  const hasViewClassHref =
+    typeof id === "string" && id.length > 0;
   return (
     <div
       data-component="create-class-form-success"
@@ -431,6 +466,20 @@ function SuccessState({
           </dl>
         </CardContent>
         <div className="flex flex-wrap items-center justify-end gap-3 px-5 py-4 border-t border-border">
+          {hasViewClassHref ? (
+            <Button
+              asChild
+              variant="secondary"
+              data-component="view-class-link"
+            >
+              <Link
+                href={`/classes/${id}`}
+                aria-label={`View class ${name}`}
+              >
+                View class
+              </Link>
+            </Button>
+          ) : null}
           <Button asChild variant="primary">
             <Link href="/classes">Back to classes</Link>
           </Button>

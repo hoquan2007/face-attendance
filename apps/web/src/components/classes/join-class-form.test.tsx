@@ -1228,3 +1228,204 @@ describe("enumeration protection", () => {
     expect(body.toLowerCase()).not.toContain("xyz1234");
   });
 });
+
+// =============================================================================
+// 61..73 — PHASE 5.1E4B — VIEW CLASS LINK IN SUCCESS STATE
+// =============================================================================
+
+describe("PHASE 5.1E4B — View class in success state", () => {
+  async function submitSuccess(alreadyJoined: boolean) {
+    mockCreateJoinClassAction.mockResolvedValue(makeSuccess(alreadyJoined));
+    const { container } = render(<JoinClassForm />);
+    fireEvent.change(container.querySelector('input[name="classCode"]')!, {
+      target: { value: "ABCDEFG" },
+    });
+    fireEvent.change(container.querySelector('input[name="password"]')!, {
+      target: { value: "ClassPass123" },
+    });
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: /join class/i }),
+      );
+    });
+    await waitFor(() => {
+      expect(screen.getByText("ABCDEFG")).toBeTruthy();
+    });
+  }
+
+  it("61. first-join success renders View class link when classId exists", async () => {
+    await submitSuccess(false);
+    expect(
+      screen.getByRole("link", { name: /view class/i }),
+    ).toBeTruthy();
+  });
+
+  it("62. already-joined success also renders View class link", async () => {
+    await submitSuccess(true);
+    expect(
+      screen.getByRole("link", { name: /view class/i }),
+    ).toBeTruthy();
+  });
+
+  it("63. View class link points to /classes/<classId>", async () => {
+    await submitSuccess(false);
+    const viewLink = screen.getByRole("link", { name: /view class/i });
+    expect(viewLink.getAttribute("href")).toBe(
+      "/classes/65f000000000000000000abc",
+    );
+  });
+
+  it("64. View class link in already-joined state also points to /classes/<classId>", async () => {
+    await submitSuccess(true);
+    const viewLink = screen.getByRole("link", { name: /view class/i });
+    expect(viewLink.getAttribute("href")).toBe(
+      "/classes/65f000000000000000000abc",
+    );
+  });
+
+  it("65. View class link carries no query parameters", async () => {
+    await submitSuccess(false);
+    const viewLink = screen.getByRole("link", { name: /view class/i });
+    const href = viewLink.getAttribute("href") ?? "";
+    expect(href).not.toMatch(/\?/);
+    expect(href).not.toMatch(/userId=/);
+    expect(href).not.toMatch(/studentUserId=/i);
+    expect(href).not.toMatch(/role=/);
+    expect(href).not.toMatch(/classCode=/);
+    expect(href).not.toMatch(/password/i);
+    expect(href).not.toMatch(/passwordHash/i);
+    expect(href).not.toMatch(/membershipId=/i);
+  });
+
+  it("66. View class link carries no classCode / password in URL", async () => {
+    await submitSuccess(false);
+    const viewLink = screen.getByRole("link", { name: /view class/i });
+    const href = viewLink.getAttribute("href") ?? "";
+    // The classCode is ABCDEFG and must NOT appear in the
+    // href; the class password is NEVER echoed.
+    expect(href).not.toContain("ABCDEFG");
+    expect(href).not.toContain("ClassPass123");
+    expect(href).not.toContain("passwordHash");
+  });
+
+  it("67. View class link is rendered alongside Back to classes (first-join)", async () => {
+    await submitSuccess(false);
+    expect(
+      screen.getByRole("link", { name: /view class/i }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("link", { name: /back to classes/i }),
+    ).toBeTruthy();
+  });
+
+  it("68. View class link is rendered alongside Back to classes (already-joined)", async () => {
+    await submitSuccess(true);
+    expect(
+      screen.getByRole("link", { name: /view class/i }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("link", { name: /back to classes/i }),
+    ).toBeTruthy();
+  });
+
+  it("69. Back to classes still points to /classes (first-join)", async () => {
+    await submitSuccess(false);
+    const backLink = screen.getByRole("link", {
+      name: /back to classes/i,
+    });
+    expect(backLink.getAttribute("href")).toBe("/classes");
+  });
+
+  it("70. Back to classes still points to /classes (already-joined)", async () => {
+    await submitSuccess(true);
+    const backLink = screen.getByRole("link", {
+      name: /back to classes/i,
+    });
+    expect(backLink.getAttribute("href")).toBe("/classes");
+  });
+
+  it("71. success state still hides the password (first-join)", async () => {
+    mockCreateJoinClassAction.mockResolvedValue(makeSuccess(false));
+    const { container } = render(<JoinClassForm />);
+    fireEvent.change(container.querySelector('input[name="classCode"]')!, {
+      target: { value: "ABCDEFG" },
+    });
+    fireEvent.change(container.querySelector('input[name="password"]')!, {
+      target: { value: "ClassPass123" },
+    });
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: /join class/i }),
+      );
+    });
+    await waitFor(() => {
+      expect(screen.getByText("ABCDEFG")).toBeTruthy();
+    });
+    expect(container.querySelector('input[name="password"]')).toBeNull();
+    expect(container.innerHTML).not.toContain("ClassPass123");
+    expect(container.innerHTML.toLowerCase()).not.toContain("passwordhash");
+  });
+
+  it("72. success state still hides the password (already-joined)", async () => {
+    mockCreateJoinClassAction.mockResolvedValue(makeSuccess(true));
+    const { container } = render(<JoinClassForm />);
+    fireEvent.change(container.querySelector('input[name="classCode"]')!, {
+      target: { value: "ABCDEFG" },
+    });
+    fireEvent.change(container.querySelector('input[name="password"]')!, {
+      target: { value: "ClassPass123" },
+    });
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: /join class/i }),
+      );
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/already joined/i)).toBeTruthy();
+    });
+    expect(container.querySelector('input[name="password"]')).toBeNull();
+    expect(container.innerHTML).not.toContain("ClassPass123");
+    expect(container.innerHTML.toLowerCase()).not.toContain("passwordhash");
+  });
+
+  it("73. no auto-redirect after success — classCode still visible", async () => {
+    // The form MUST NOT call router.replace / router.push /
+    // window.location.replace. The success state remains the
+    // canonical "you have the code, choose your next step"
+    // affordance.
+    mockCreateJoinClassAction.mockResolvedValue(makeSuccess(false));
+    const { container } = render(<JoinClassForm />);
+    fireEvent.change(container.querySelector('input[name="classCode"]')!, {
+      target: { value: "ABCDEFG" },
+    });
+    fireEvent.change(container.querySelector('input[name="password"]')!, {
+      target: { value: "ClassPass123" },
+    });
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: /join class/i }),
+      );
+    });
+    await waitFor(() => {
+      expect(screen.getByText("ABCDEFG")).toBeTruthy();
+    });
+    const source = readFileSync(
+      join(
+        process.cwd(),
+        "src/components/classes/join-class-form.tsx",
+      ),
+      "utf8",
+    );
+    const codeOnly = source
+      .split("\n")
+      .filter(
+        (line) =>
+          !line.trim().startsWith("//") && !line.trim().startsWith("*"),
+      )
+      .join("\n");
+    expect(codeOnly.includes("useRouter")).toBe(false);
+    expect(codeOnly.includes("router.replace")).toBe(false);
+    expect(codeOnly.includes("router.push")).toBe(false);
+    expect(codeOnly.includes("window.location.replace")).toBe(false);
+  });
+});
