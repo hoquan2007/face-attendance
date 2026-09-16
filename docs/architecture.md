@@ -1,5 +1,7 @@
 # Architecture
 
+> Status: **Phase 5.1E4C** — Class UX MVP closed. The four Class routes (`/classes`, `/classes/new`, `/classes/join`, `/classes/[classId]`) and three Class components (`CreateClassForm`, `JoinClassForm`, `RosterPanel`) implement the full teacher + student flows (list, create, detail, roster, join). No new Class domain features are introduced in E4C — this phase audits role-aware UX consistency, accessibility, empty / error / archived states, and navigation, and ships the final regression layer (`apps/web/src/app/classes/__tests__/class-ux-regression-closure.test.tsx`) proving the full teacher + student flows work together. See `## Phase 5.1E4C — Class UX Final Closure` for the explicit MVP-completion statement.
+
 > Status: **Phase 5.1E4B** — PHASE 5.1A ships the persistence foundation for the `classes` and `class_memberships` collections. This phase adds two new Mongoose models, their service layers, and server-only utilities for class code generation, normalization, and password hashing. PHASE 5.1A.1 hardens the class join password primitive (PBKDF2-SHA256, async, constant-time verification, versioned encoded hash). PHASE 5.1B adds the **authenticated Teacher create-class Server Action** (`createClassAction`) — the first browser-reachable entry point on top of the 5.1A service. The action derives teacher identity exclusively from the Better Auth server session, requires a completed Profile with `role === "teacher"`, validates browser-supplied `name` + `password` server-side, generates a fresh canonical 7-char `classCode` server-side via the 5.1A generator, reuses `hashClassPassword(...)` from the service to persist `passwordHash` only, and performs a BOUNDED internal retry (at most `MAX_CLASS_CODE_ATTEMPTS`) on exact `classCode` unique-index collisions only. The action does NOT introduce a create-class UI, a `/api/classes` route, a `ClassMembership` write, an attendance session, a Face Service call, or any FaceProfile touch. PHASE 5.1C adds the **authenticated Student join-class Server Action** (`createJoinClassAction`) — the student-side counterpart to PHASE 5.1B. The action derives student identity exclusively from the Better Auth server session, requires a completed Profile with `role === "student"`, validates browser-supplied `classCode` + `password` server-side (canonicalizing the classCode via `z.preprocess` and enforcing the canonical alphabet `[A-HJ-NP-Z2-9]`), looks up the class through the server-only `getClassJoinCredentialByCode(...)` primitive, runs ONE async PBKDF2 verification workload (real or dummy) on every branch that would otherwise short-circuit — missing class / archived class / malformed stored hash all execute `await runDummyPasswordVerification(password)` against the fixed `DUMMY_CLASS_PASSWORD_HASH` constant before returning `INVALID_CLASS_CREDENTIALS` (wall-clock timing tests are explicitly NOT used; the contract asserts BEHAVIOR); classifies the membership insert's E11000 collision via the precise server-only `isMembershipDuplicateKeyError` predicate that accepts ONLY compound `(classId, studentUserId)` collisions — unrelated 11000 errors map to `CLASS_JOIN_FAILED` and the insert is NEVER retried. The action does NOT introduce a join UI, a `/api/classes/join` route, a `Class` write, a `Profile` mutation, a `FaceProfile` touch, a Face Service call, or any attendance logic. Better Auth collections remain untouched. PHASE 5.1D1 ships the **authenticated class-list read model foundation** as a server-only module (`getVisibleClassesForCurrentUser()` in `apps/web/src/lib/classes/class-read-service.ts`) — NOT a Server Action, NOT an REST route. The function accepts NO arguments and derives identity exclusively from the Better Auth server session and the persisted Profile. It is the canonical, READ-ONLY entry point for future Server Components that need to list the caller's classes. Teacher visibility = `Class.teacherUserId === session.user.id`; Student visibility = `ClassMembership.studentUserId === session.user.id` AND `status === "active"`. The student path batches the referenced `Class` lookups in a single `ClassModel.find({ _id: { $in: [...] } })` query — there is NO application-memory scan and NO obvious N+1. Missing referenced class ids are skipped safely; duplicate class ids across corrupt memberships are deduplicated. The safe summary DTO contains ONLY `{ id, name, classCode, status, createdAt }` — `passwordHash`, `teacherUserId`, `studentUserId`, membership internal ids, and biometric fields are NEVER serialized. The module is READ-ONLY: it does NOT create / mutate any `Class`, `ClassMembership`, or `Profile`; it does NOT call the Face Service; it does NOT touch `FaceProfile`; it does NOT verify a class password. D1 does NOT add a class list page, a class detail page, a roster, attendance, or any other public API surface. PHASE 5.1D2A ships the **authenticated class-detail read model** as a server-only function (`getClassDetailForCurrentUser(classId)` in `apps/web/src/lib/classes/class-read-service.ts`) — NOT a Server Action, NOT an HTTP route. The function accepts ONLY `classId` (the resource identifier). Identity derives exclusively from `session.user.id`; role derives exclusively from `Profile.role`. Teacher access = `ClassModel.findOne({ _id: classId, teacherUserId: session.user.id })` (the authorization constraint is encoded directly in the filter — the database refuses to surface a class the teacher does not own). Student access = `ClassMembershipModel.findOne({ classId, studentUserId: session.user.id, status: "active" })` THEN `ClassModel.findById(classId)`. Malformed `classId` (not a canonical 24-hex string) collapses to the SAME `CLASS_NOT_ACCESSIBLE` boundary used for missing / unauthorized classes — there is intentionally NO separate outward-facing code for "malformed syntax" vs "not yours" vs "no membership". The safe detail DTO contains ONLY `{ id, name, classCode, status, createdAt, updatedAt, role }` — `passwordHash`, `teacherUserId`, `studentUserId`, Mongoose internals, biometric fields, and roster / membership identifiers are NEVER serialized. The module is READ-ONLY: it does NOT create / mutate any `Class`, `ClassMembership`, or `Profile`; it does NOT call the Face Service; it does NOT touch `FaceProfile`; it does NOT verify a class password. Archived classes remain readable to authorized viewers (owner teacher or student with active membership); the result exposes `status: "archived"` safely. D2A does NOT add a class detail page, a roster, attendance, or any other public API surface. PHASE 5.1D2B ships the **authenticated teacher-owner roster read model** as a server-only function (`getClassRosterForCurrentTeacher(classId)` in `apps/web/src/lib/classes/class-read-service.ts`) — NOT a Server Action, NOT an HTTP route, NOT a UI surface. The function accepts ONLY `classId`. Identity derives exclusively from `session.user.id`; role derives exclusively from `Profile.role === "teacher"` (a student returns `TEACHER_REQUIRED` BEFORE any class / membership / Profile query is performed; a student must NOT be able to probe the existence of a class through the roster boundary). Teacher-owner access = `ClassModel.findOne({ _id: classId, teacherUserId: session.user.id })`. The active memberships are listed via `ClassMembershipModel.find({ classId, status: "active" }).sort({ joinedAt: 1 })` (oldest member first); student Profiles are batch-loaded in ONE call via the new server-only `getStudentProfilesByUserIds(userIds)` primitive on `@/lib/profile-service` — there is NO N+1 lookup, NO application-memory scan over the `profiles` collection. Orphaned / incomplete / non-student Profile references are skipped silently. The safe roster DTO contains ONLY `{ class: { id, name, classCode, status, createdAt, updatedAt }, students: [{ fullName, identificationCode, joinedAt }] }` — `passwordHash`, `teacherUserId`, `studentUserId`, membership internal ids, `emailSnapshot`, `phone`, Mongoose internals, biometric fields, attendance data, Better Auth user data, and credential helpers are NEVER serialized. The module is READ-ONLY: it does NOT create / mutate any `Class`, `ClassMembership`, or `Profile`; it does NOT call the Face Service; it does NOT touch `FaceProfile`; it does NOT verify a class password; it does NOT query the Better Auth user collection. Archived classes remain readable to the owner teacher; the result exposes `status: "archived"` safely. D2B does NOT add a roster UI, a Server Action, an HTTP route, an attendance endpoint, or any other public API surface. — PHASE 5.1A ships the persistence foundation for the `classes` and `class_memberships` collections. This phase adds two new Mongoose models, their service layers, and server-only utilities for class code generation, normalization, and password hashing. PHASE 5.1A.1 hardens the class join password primitive (PBKDF2-SHA256, async, constant-time verification, versioned encoded hash). PHASE 5.1B adds the **authenticated Teacher create-class Server Action** (`createClassAction`) — the first browser-reachable entry point on top of the 5.1A service. The action derives teacher identity exclusively from the Better Auth server session, requires a completed Profile with `role === "teacher"`, validates browser-supplied `name` + `password` server-side, generates a fresh canonical 7-char `classCode` server-side via the 5.1A generator, reuses `hashClassPassword(...)` from the service to persist `passwordHash` only, and performs a BOUNDED internal retry (at most `MAX_CLASS_CODE_ATTEMPTS`) on exact `classCode` unique-index collisions only. The action does NOT introduce a create-class UI, a `/api/classes` route, a `ClassMembership` write, an attendance session, a Face Service call, or any FaceProfile touch. PHASE 5.1C adds the **authenticated Student join-class Server Action** (`createJoinClassAction`) — the student-side counterpart to PHASE 5.1B. The action derives student identity exclusively from the Better Auth server session, requires a completed Profile with `role === "student"`, validates browser-supplied `classCode` + `password` server-side (canonicalizing the classCode via `z.preprocess` and enforcing the canonical alphabet `[A-HJ-NP-Z2-9]`), looks up the class through the server-only `getClassJoinCredentialByCode(...)` primitive, runs ONE async PBKDF2 verification workload (real or dummy) on every branch that would otherwise short-circuit — missing class / archived class / malformed stored hash all execute `await runDummyPasswordVerification(password)` against the fixed `DUMMY_CLASS_PASSWORD_HASH` constant before returning `INVALID_CLASS_CREDENTIALS` (wall-clock timing tests are explicitly NOT used; the contract asserts BEHAVIOR); classifies the membership insert's E11000 collision via the precise server-only `isMembershipDuplicateKeyError` predicate that accepts ONLY compound `(classId, studentUserId)` collisions — unrelated 11000 errors map to `CLASS_JOIN_FAILED` and the insert is NEVER retried. The action does NOT introduce a join UI, a `/api/classes/join` route, a `Class` write, a `Profile` mutation, a `FaceProfile` touch, a Face Service call, or any attendance logic. Better Auth collections remain untouched. PHASE 5.1D1 ships the **authenticated class-list read model foundation** as a server-only module (`getVisibleClassesForCurrentUser()` in `apps/web/src/lib/classes/class-read-service.ts`) — NOT a Server Action, NOT a REST route. The function accepts NO arguments and derives identity exclusively from the Better Auth server session and the persisted Profile. It is the canonical, READ-ONLY entry point for future Server Components that need to list the caller's classes. Teacher visibility = `Class.teacherUserId === session.user.id`; Student visibility = `ClassMembership.studentUserId === session.user.id` AND `status === "active"`. The student path batches the referenced `Class` lookups in a single `ClassModel.find({ _id: { $in: [...] } })` query — there is NO application-memory scan and NO obvious N+1. Missing referenced class ids are skipped safely; duplicate class ids across corrupt memberships are deduplicated. The safe summary DTO contains ONLY `{ id, name, classCode, status, createdAt }` — `passwordHash`, `teacherUserId`, `studentUserId`, membership internal ids, and biometric fields are NEVER serialized. The module is READ-ONLY: it does NOT create / mutate any `Class`, `ClassMembership`, or `Profile`; it does NOT call the Face Service; it does NOT touch `FaceProfile`; it does NOT verify a class password. D1 does NOT add a class list page, a class detail page, a roster, attendance, or any other public API surface.
 > math foundation. PHASE 4.6A2 adds the protected internal finalization
 > endpoint (`POST /v1/faces/enrollment/finalize`) that receives
@@ -3602,6 +3604,232 @@ The teacher roster is limited to the safe DTO fields:
 - NO new runtime dependency.
 - NO change to Class schema, Membership schema, Profile
   schema, Better Auth configuration, or Vercel.
+
+## Phase 5.1E4C — Class UX Final Closure
+
+PHASE 5.1E4C **closes** the Class UX MVP. No new Class domain
+features are introduced; this phase tightens role-aware UX
+consistency, accessibility, empty / error states, archived
+behavior, and navigation, and ships the final regression layer
+proving the full teacher + student flows work together.
+
+### Class UX MVP — Completed Surface
+
+| Capability | Surface | Server boundary |
+|---|---|---|
+| Teacher — list own classes | `/classes` (role-aware copy) | `getVisibleClassesForCurrentUser()` |
+| Teacher — create class | `/classes/new` → `CreateClassForm` | `createClassAction` |
+| Teacher — open class detail | `/classes/[classId]` | `getClassDetailForCurrentUser()` |
+| Teacher — view active roster | `<RosterPanel>` on `/classes/[classId]` | `getClassRosterForCurrentTeacher()` |
+| Student — list joined classes | `/classes` (role-aware copy) | `getVisibleClassesForCurrentUser()` |
+| Student — join class | `/classes/join` → `JoinClassForm` | `createJoinClassAction` |
+| Student — open authorized detail | `/classes/[classId]` | `getClassDetailForCurrentUser()` |
+
+### Role-aware UX consistency
+
+The `/classes` list page renders `Classes you manage.` for a
+teacher and `Classes you've joined.` for a student. The
+teacher sees the `Create class` CTA linking to `/classes/new`;
+the student sees the `Join class` CTA linking to `/classes/join`.
+Roles are NEVER inferred in Client Components — they come from
+the server-authoritative read boundaries (`getVisibleClassesForCurrentUser`,
+`getClassDetailForCurrentUser`).
+
+The `/classes/[classId]` detail page renders `Class you manage.`
+for a teacher-owner (Students section visible) and `Class you've
+joined.` for a student member (Students section absent). The
+same `<StatusBadge>`, the same ISO-based date formatting, and
+the same spacing / typography are used in the list and the
+detail. The class code remains visible, selectable, and rendered
+in `font-mono` everywhere it is displayed.
+
+### Archived behavior
+
+Authorized archived classes:
+
+- remain in `/classes`
+- remain linkable — `/classes/[classId]` still opens
+- are not collapsed to `notFound()` purely because of their
+  `status`
+- display the visible `Archived` text
+- the teacher's roster read still runs
+- the student's authorized detail still runs
+
+No `Restore` / `Archive` / `Delete` buttons are introduced in
+the E4C scope. The student path still performs ZERO roster
+lookups on archived detail.
+
+### Navigation consistency
+
+- `/classes` items link to `/classes/[classId]` (safe class
+  id, no query string).
+- Create success renders `View class` → `/classes/[classId]`
+  and `Back to classes` → `/classes`.
+- Join success (first-join AND `alreadyJoined`) renders the
+  same `View class` / `Back to classes` affordance.
+- Detail renders `Back to classes` → `/classes`.
+
+No dead links. No class data in any URL beyond the
+`/classes/[classId]` route segment. No `userId`, `role`,
+`membershipId`, `password`, `passwordHash`, or `classCode`
+credential in any query string or path segment.
+
+### Accessibility
+
+- Semantic headings (`<h1>` on every page; `<h2>` for the
+  Students section and the sub-titles in the success state).
+- Real `<label>` association through the shared `<Field>`
+  primitive (`aria-required` on required inputs).
+- Real `<button>` and `<a>` elements (no custom `div`-based
+  controls).
+- `role="alert"` on form errors with `aria-live` matching the
+  retryable / non-retryable severity.
+- `<StatusBadge>` carries visible textual status (`Active` /
+  `Archived`) so the status is conveyed by both color AND
+  text — color is never the sole carrier.
+- Roster uses a semantic `<table>` with `<thead>` /
+  `<tbody>` / `<tr>` / `<th scope="col">` / `<td>`.
+- Disabled submit buttons remain semantically
+  `disabled`; success navigation is keyboard-reachable through
+  real `<a>` elements.
+- No custom keyboard shortcuts.
+
+### Empty / error states
+
+The four Class routes share a calm, restrained empty-state
+copy:
+
+- Teacher `/classes`: "No classes yet." (with the `Create class`
+  CTA below).
+- Student `/classes`: "No classes yet." (with the `Join class`
+  CTA below).
+- Teacher roster: "No students have joined this class yet."
+- Form errors render through `classifyCreateError` /
+  `classifyJoinError` with `role="alert"` copy. Roster failure
+  renders the local safe message "Student list could not be
+  loaded." without ever collapsing the class detail.
+
+### Error boundaries (preserved)
+
+- `CLASS_NOT_ACCESSIBLE` (malformed id, missing class,
+  unauthorized teacher, non-member student, inactive
+  membership) → `notFound()`. There is intentionally NO
+  distinguishable UI for the four failure modes — they all
+  collapse to the same safe 404 affordance.
+- `CLASS_READ_FAILED` → calm `Could not load your classes` /
+  `Could not load the class` block. The browser NEVER sees a
+  raw `MongoError`, `mongodb://`, `E11000`, or stack trace.
+- `CLASS_ROSTER_READ_FAILED` → the class detail card remains
+  visible; the `<RosterPanel>` renders the hardcoded safe
+  copy `Student list could not be loaded.`. The backend
+  `message` field is NEVER forwarded to the panel.
+- Create / join Server Action failures render through
+  `classifyCreateError` / `classifyJoinError`. No raw
+  exception is exposed.
+
+### Join enumeration protection (preserved)
+
+All four credential failure branches (missing class, wrong
+password, archived class, malformed stored hash) collapse to
+ONE generic message:
+
+> "Class code or password is incorrect, or the class is unavailable."
+
+There is intentionally NO class-existence lookup from the UI.
+The UI cannot enumerate which class codes correspond to live
+classes.
+
+### Privacy invariants (regression-tested)
+
+The browser output of every Class UX surface NEVER contains:
+
+- `passwordHash`
+- `teacherUserId`
+- `studentUserId`
+- `membershipId`
+- `emailSnapshot`
+- `phone`
+- `FaceProfile`
+- `embedding`
+- `centroid`
+- raw `MongoError` text (`E11000`, `mongodb://`, `duplicate
+  key`, `face_attendance`, stack traces)
+
+These invariants are now also asserted in
+`apps/web/src/app/classes/__tests__/class-ux-regression-closure.test.tsx`
+as runtime assertions against the rendered trees of every
+Class surface.
+
+### Domain isolation (regression-tested)
+
+The Class UX never:
+
+- calls the Face Service
+- queries `FaceProfile`
+- creates attendance data
+- displays attendance state (no `present` / `absent` / `late`
+  / recognition / camera wording)
+- calls a class password verification primitive
+- introduces a public Class REST API
+  (`/api/classes`, `/api/classes/join`,
+  `/api/classes/[classId]`, `/api/classes/[classId]/students`)
+
+### Routes — closed surface
+
+The only Class routes are:
+
+- `/classes`
+- `/classes/new`
+- `/classes/join`
+- `/classes/[classId]`
+
+E4C introduces no new Class route.
+
+### Final regression layer
+
+`apps/web/src/app/classes/__tests__/class-ux-regression-closure.test.tsx`
+adds the final regression coverage:
+
+- Teacher flow items 1..10 (Create CTA, Join CTA absent,
+  create success, success classCode, success View class href,
+  detail summary, Students roster, empty roster state,
+  archived teacher class, Back to classes).
+- Student flow items 11..20 (Join CTA, Create CTA absent,
+  join success, first-join View class, alreadyJoined View
+  class, detail summary, no roster read, no Students section,
+  archived joined class, Back to classes).
+- Privacy invariants items 21..30 (every forbidden value is
+  scanned across every Class surface; a parallel test covers
+  the success-state trees of the create / join forms).
+- Domain isolation items 31..36 (source-wide assertions per
+  the seven Class files).
+- Route regression (four Class routes still exist; no public
+  REST route introduced; Vitest keeps `pool: "forks"` +
+  `isolate: true`).
+
+### Explicit non-features in E4C
+
+The Class UX MVP **explicitly does NOT yet** ship:
+
+- class editing
+- class archiving / restore / delete
+- class archive action buttons
+- student removal / member management
+- attendance (start, history, present / absent / late, camera,
+  recognition)
+- Face Service / biometric coupling
+- a public Class REST API
+- any further mutations to `createClassAction` or
+  `createJoinClassAction`
+- any further mutations to `getVisibleClassesForCurrentUser`,
+  `getClassDetailForCurrentUser`, or
+  `getClassRosterForCurrentTeacher`
+- any schema mutation on `Class`, `ClassMembership`, or
+  `Profile`
+- any change to Better Auth, Face Service, or Vercel
+
+These belong to later phases (attendance, class management,
+member management). The current Class UX MVP is COMPLETE.
 
 ## Non-goals (for now)
 
