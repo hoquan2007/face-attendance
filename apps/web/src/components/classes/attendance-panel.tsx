@@ -61,7 +61,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { Video } from "lucide-react";
+import { History, Video } from "lucide-react";
 
 import {
   Card,
@@ -358,6 +358,16 @@ export function AttendancePanel({
               label={controlLabel(payload.state)}
             />
           ) : null}
+
+          {/* PHASE 6.7: Attendance history link */}
+          <Link
+            href={`/classes/${classId}/attendance/history`}
+            className="inline-flex items-center gap-2 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background rounded-sm"
+            data-attendance-history-link="true"
+          >
+            <History className="h-4 w-4" aria-hidden="true" />
+            Attendance history
+          </Link>
         </div>
       </CardContent>
     </Card>

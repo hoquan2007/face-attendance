@@ -1,6 +1,6 @@
 # Frontend Design — Quiet Precision
 
-> Status: **Phase 6.6** — ATTENDANCE SESSION FINALIZATION + ABSENT FINALIZATION + FINAL SUMMARY. PHASE 6.6 extends `/classes/[classId]/attendance` with a new `Final Attendance` summary panel that becomes the SOLE rendered attendance state once a session has been closed. The final summary card surfaces a counter row (`Present: X`, `Absent: Y`, `Total: Z`) and a rosterSnapshot-ordered list of students with visible-text status (`Present` / `Absent`), full name, identification code, and a `Recognized at` column — `—` placeholder for absent rows (no fake timestamp). The auto-scan camera workspace is no longer rendered on the closed-session page (it cleanly transitions to the summary). There is NO new chrome / banner / modal; the page transitions from live active session → closed summary via the existing `router.refresh()` discipline. PHASE 6.6 does NOT introduce `Late`, manual-editing controls, Absent ↔ Present toggles, attendance-history browsing, or an Excel / CSV export affordance.
+> Status: **Phase 6.7** — ATTENDANCE HISTORY + CSV EXPORT. PHASE 6.7 adds the Teacher attendance history feature and CSV export. The `AttendancePanel` on the class detail page adds a restrained "Attendance history" link (teachers only). `/classes/[classId]/attendance/history` renders the list of CLOSED sessions (newest first) with date/time, present/absent/total counts, and a "View session" link. `/classes/[classId]/attendance/history/[sessionId]` reuses the final summary panel to display immutable historical session detail, with a "Back to attendance history" link. The authenticated `GET /api/attendance/export?classId&sessionId` route exports a closed session as an Excel-compatible UTF-8 CSV with BOM, correct escaping, formula injection protection, and a safe filename. The history UI uses the existing `AttendanceFinalSummaryPanel` component. PHASE 6.7 does NOT introduce manual-editing controls, history mutations, XLSX dependencies, or recognition pipeline changes.
 
 > Status: **Phase 6.5** — CONTROLLED CONTINUOUS FACE SCANNING + BACKPRESSURE + SESSION-AWARE AUTO STOP. PHASE 6.5 extends the live attendance camera UI on `/classes/[classId]/attendance` with an EXPLICIT teacher-started auto-scan toggle. Auto scan NEVER begins automatically after the camera is enabled — the teacher must press `Start auto scan`. Auto scan is rate-limited to a conservative cadence (~1.8 s) and never creates overlapping recognition requests. The auto-scan state is conveyed through text only ("Auto scanning"); a restrained "Scanning…" overlay appears only while a recognition request is in flight (no flashing, no neon, no scanner overlay). Auto scan stops automatically on session-close, no-candidates, track-ended, Stop camera, explicit Stop auto scan, component unmount, and document-hidden. The Phase 6.4 persisted Present panel remains the source of truth. PHASE 6.5 does NOT introduce a manual mark UI, does NOT introduce `Absent` / `Late` labels, does NOT add continuous-recognition settings, and does NOT modify the dark/light theme tokens.
 
@@ -517,6 +517,66 @@ NOT change.
 - DO NOT call the Face Service from the summary panel.
 - DO NOT alter the camera workspace during the transition —
   Phase 6.5's stop-on-session-closed discipline is preserved.
+
+---
+
+## Attendance History (Phase 6.7)
+
+### History Page
+
+`/classes/[classId]/attendance/history` — Teacher-only Server Component
+rendering the attendance history list.
+
+**Header:**
+- Title: "Attendance History"
+- Description: "Completed sessions for {className}."
+
+**History List Card:**
+- Heading: "Completed Sessions" with `lucide-history` icon.
+- Description: "Review past attendance records for this class."
+
+**Session Entry Row (per closed session):**
+- Date (from `startedAt`)
+- Time range: `HH:mm — HH:mm` (startedAt → endedAt)
+- "Total: {N}" count
+- Present count badge + number
+- Absent count badge + number
+- "View session" link → `/classes/[classId]/attendance/history/[sessionId]`
+
+**Empty State:**
+Copy: "No completed attendance sessions yet." with description:
+"Completed sessions will appear here after you stop an attendance session."
+
+**Error State:**
+Calm error card: "Could not load attendance history" / "Please try again in a moment."
+
+### History Detail Page
+
+`/classes/[classId]/attendance/history/[sessionId]` — Teacher-only Server
+Component rendering the historical session detail.
+
+**Layout:**
+1. Session Metadata Card (present/absent/total counts, startedAt, endedAt)
+2. Attendance Record Card with Export CSV button + description
+3. Final Attendance Summary Panel (reused from Phase 6.6)
+4. "Back to attendance history" link
+
+**Export CSV Button:**
+- Label: "Export as CSV" with `lucide-download` icon.
+- Triggers `GET /api/attendance/export?classId=&sessionId=`.
+- Client Component with download state + error handling.
+
+**Session Metadata Card:**
+- Title: "Session Details"
+- Fields: Started, Ended, Total, Present, Absent (all with data attributes for tests)
+
+### Phase 6.7 hard constraints
+
+- DO NOT introduce manual mark UI or attendance editing.
+- DO NOT introduce history mutations (edit/delete).
+- DO NOT allow students to view history.
+- DO NOT install XLSX/ExcelJS dependencies.
+- DO NOT modify recognition pipeline (Phase 6.6 semantics sealed).
 
 ---
 

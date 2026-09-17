@@ -1,6 +1,6 @@
 # Architecture
 
-> Status: **Phase 6.6** — ATTENDANCE SESSION FINALIZATION + ABSENT FINALIZATION + FINAL SUMMARY + STOP/RECOGNITION RACE RECONCILIATION. PHASE 6.6 extends the AttendanceMark model with a second `status` value `"absent"` (paired with a new `source: "session_finalization"`), so stopping an active attendance session now atomically closes the session AND finalizes the roster. Concretely: when `stopAttendanceSessionAction` is invoked, the action atomically CAS-transitions the active session to `closed` (PHASE 6.1E semantics preserved) and then calls `finalizeAbsentMarksForClosedSession(...)`. That service compares the immutable `rosterSnapshot` (the ONLY authority — current ClassMembership / Profile are never read here) against existing PRESENT marks, and creates one `absent` mark per unmatched snapshot student, using a server-side `finalizedAt` timestamp with `source: "session_finalization"`. The `(sessionId, studentUserId)` unique index is the authoritative idempotency guard — repeated stop / finalize calls are safe and produce no duplicate absent rows. A new server-only read boundary `getAttendanceFinalSummaryForCurrentTeacher(classId, sessionId)` exposes the immutable final summary (Present / Absent / Total counts and a rosterSnapshot-ordered student list) to the authenticated teacher; the read boundary projects ONLY safe historical identity (fullName, identificationCode, status, recognizedAt) and never exposes internal IDs, biometric fields, embeddings, or raw images. PHASE 6.6 also hardens the stop/recognition race: a `recognitionDecisionAt` timestamp is generated server-side by the recognize route AFTER the Face Service accepts a match and AFTER the final ACTIVE-session pre-write check. If a concurrent stop closes the session and finalizes an Absent mark for the same `(sessionId, studentUserId)`, the persistence path checks `recognitionDecisionAt <= AttendanceSession.endedAt`. If true, the Absent mark is atomically converted to Present with `source: "face_recognition"` and `recognizedAt: recognitionDecisionAt`. Recognition that arrives after `endedAt` cannot alter finalized attendance. No MongoDB transaction is introduced — the unique index and atomic conditional update together provide the correctness guarantee. PHASE 6.6 does NOT implement Late, manual editing, attendance history browsing, Excel / CSV export, or late/override/absent editing APIs.
+> Status: **Phase 6.7** — ATTENDANCE HISTORY + CSV EXPORT. PHASE 6.7 adds the Teacher attendance history feature and CSV export. A new server-only read boundary `getAttendanceHistoryForCurrentTeacher(classId)` returns the list of CLOSED AttendanceSessions for a class owned by the authenticated teacher, sorted newest first (endedAt DESC). Each entry contains: id, startedAt, endedAt, rosterCount, presentCount, absentCount. N+1 queries are avoided: a single batch query fetches all marks for all session IDs and aggregates server-side. The read boundary projects ONLY safe aggregate data; no rosterSnapshot, no student IDs, no startedByUserId, no teacherUserId are exposed. The new Teacher-only route `/classes/[classId]/attendance/history` renders the history list with an "Attendance history" link in the AttendancePanel. The new route `/classes/[classId]/attendance/history/[sessionId]` reuses `getAttendanceFinalSummaryForCurrentTeacher` to display historical session detail with immutable rosterSnapshot identity. The new authenticated API route `GET /api/attendance/export?classId&sessionId` exports a closed session as an Excel-compatible UTF-8 CSV with BOM, correct escaping, formula injection protection, and safe filename. PHASE 6.7 does NOT modify recognition concurrency logic, does NOT install XLSX dependencies, and does NOT introduce history mutations or manual override capabilities. See `## Phase 6.7 — Attendance History + CSV Export` below for the explicit phase statement.
 
 > Status: **Phase 6.5** — CONTROLLED CONTINUOUS FACE SCANNING + BACKPRESSURE + SESSION-AWARE AUTO STOP. PHASE 6.5 extends the `AttendanceCameraClient` with an EXPLICIT teacher-started auto-scan loop. Auto scan NEVER starts automatically after Enable camera; the teacher must press a dedicated Start auto scan button. The loop is self-scheduling: every scan is awaited to completion before the next scan is scheduled, with a fixed conservative `AUTO_SCAN_INTERVAL_MS` cooldown. At most ONE recognize request is in flight at any moment — manual and auto scans share a single synchronous in-flight ref guard. The loop honors `document.visibilityState` (hidden tabs pause; visible tabs resume ONLY if auto scan was active before the hide); explicit Stop auto scan, Stop camera, track-ended, session-closed, and no-recognition-candidates responses all stop the auto loop. Raw frames remain transient; no second attendance state is held in client memory; the existing Phase 6.4 recognize route is reused (no new endpoint, no Face Service changes). PHASE 6.5 does NOT add `absent` / `late` / history / export, does NOT introduce `setInterval` / `requestAnimationFrame` recognition loops, does NOT persist raw images / embeddings / centroids, and does NOT modify the Face Service threshold or matching algorithm.
 
@@ -4739,6 +4739,116 @@ the final summary. After reconciliation, the next read via
 The stop-action's original counts are NOT cached as permanent
 truth — they are recomputed from the persisted state on every
 read.
+
+## Phase 6.7 — Attendance History + CSV Export
+
+PHASE 6.7 adds the Teacher attendance history feature and CSV export.
+After a session is closed (PHASE 6.6), the teacher can view
+historical sessions and export them as Excel-compatible CSV.
+
+### New read boundary: `getAttendanceHistoryForCurrentTeacher`
+
+A new server-only read boundary `getAttendanceHistoryForCurrentTeacher(classId)`
+returns the list of CLOSED AttendanceSessions for a class owned by
+the authenticated teacher. The function:
+
+1. Authenticates via Better Auth session.
+2. Loads the application Profile and requires `role === "teacher"`.
+3. Encodes the teacher-owner constraint in `ClassModel.findOne({ _id: classId,
+   teacherUserId: session.user.id })`.
+4. Loads ALL CLOSED sessions for the class, sorted `endedAt DESC` (newest
+   first). Active session is excluded.
+5. Batch-loads ALL marks for all session IDs in ONE query using
+   `AttendanceMarkModel.find({ sessionId: { $in: sessionIds } })` — avoiding
+   N+1 queries.
+6. Aggregates `presentCount` and `absentCount` per session server-side.
+7. Returns safe DTO with per-session `{ id, startedAt, endedAt, rosterCount,
+   presentCount, absentCount }`. NO rosterSnapshot, NO student IDs,
+   NO startedByUserId, NO teacherUserId are projected.
+
+The function is READ-ONLY and never writes to any collection.
+
+### History UI routes
+
+**`/classes/[classId]/attendance/history`** — Teacher-only Server Component
+that renders the history list. Student viewers receive `notFound()`. The page
+shows an empty-state card with copy "No completed attendance sessions yet." when
+no closed sessions exist.
+
+**`/classes/[classId]/attendance/history/[sessionId]`** — Teacher-only Server
+Component that reuses `getAttendanceFinalSummaryForCurrentTeacher(classId, sessionId)`
+to display historical session detail. The page requires:
+- Session belongs to the requested class.
+- Class belongs to the current Teacher.
+- Session is closed.
+
+Malformed/wrong-class/non-owner → `notFound()`. Historical identity comes from
+the immutable `rosterSnapshot`, not current `Profile` or `ClassMembership`.
+
+### Navigation
+
+The `AttendancePanel` on `/classes/[classId]` adds a restrained "Attendance
+history" link visible only to teachers:
+
+```tsx
+<Link
+  href={`/classes/${classId}/attendance/history`}
+  className="inline-flex items-center gap-2 text-sm font-medium text-muted-foreground ..."
+>
+  <History className="h-4 w-4" aria-hidden="true" />
+  Attendance history
+</Link>
+```
+
+The link is NOT shown to students.
+
+### CSV Export API
+
+`GET /api/attendance/export?classId=<id>&sessionId=<id>` — authenticated
+Teacher-only API route that exports a closed session as a downloadable CSV file.
+
+**Authorization:**
+- Requires Better Auth session.
+- Requires completed Teacher Profile.
+- Requires `profile.role === "teacher"`.
+- Requires class ownership via `ClassModel.findOne({ _id: classId, teacherUserId })`.
+- Requires session belongs to the class and is CLOSED.
+
+**CSV Format:**
+- UTF-8 with BOM (`\uFEFF`) for Excel/Vietnamese compatibility.
+- Columns: `STT`, `Họ và tên`, `Mã sinh viên`, `Trạng thái`, `Thời gian nhận diện`.
+- Present rows: `recognizedAt` formatted as `YYYY-MM-DD HH:mm:ss`.
+- Absent rows: blank `recognizedAt`.
+- Correct CSV escaping: fields with comma/quote/newline are quoted; double-quotes
+  inside quoted fields are escaped by doubling them (`""`).
+
+**Formula Injection Protection:**
+Cells starting with `=`, `+`, `-`, `@` are neutralized by prefixing with a
+single quote (`'`). This prevents spreadsheet applications from interpreting
+the content as formulas.
+
+**Safe Filename:**
+`attendance-<classCode>-<date>.csv` where components are sanitized (no
+path traversal, no special characters).
+
+**Privacy:**
+- Exports ONLY: `fullName`, `identificationCode`, `status`, `recognizedAt`.
+- NEVER exports: `studentUserId`, `AttendanceMark._id`, `teacherUserId`,
+  `membershipId`, `FaceProfile`, `embeddings`, `centroids`, biometric data.
+
+**Constraints:**
+- Only CLOSED sessions can be exported. Active sessions return HTTP 400.
+- No XLSX dependency. CSV must be Excel-compatible without new dependencies.
+
+### What PHASE 6.7 does NOT introduce
+
+- Recognition pipeline modifications (PHASE 6.6 semantics sealed).
+- Manual attendance editing or override capabilities.
+- History mutation (no edit/delete for historical sessions).
+- XLSX/ExcelJS dependencies.
+- Late/Excused/Manual attendance states.
+- Student attendance history viewing.
+- Any Face Service calls from history/export flows.
 
 ## Non-goals (for now)
 

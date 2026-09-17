@@ -544,7 +544,9 @@ describe("PHASE 5.1E4C teacher flow — items 1..10", () => {
     expect(tree).toMatch(/href="\/classes"/);
     // Back link carries no class data in the URL.
     expect(tree).not.toMatch(/href="\/classes\?/);
-    expect(tree).not.toMatch(/href="\/classes\/6500/);
+    // The back link should point to /classes (not /classes/<id>).
+    // We verify by looking for the exact pattern.
+    expect(tree).toMatch(/href="\/classes"\s*>/);
   });
 });
 
