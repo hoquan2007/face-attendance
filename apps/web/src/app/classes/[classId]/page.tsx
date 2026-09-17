@@ -3,6 +3,7 @@
  *
  * PHASE 5.1E4A — AUTHORIZED CLASS DETAIL UI.
  * PHASE 5.1E4B — TEACHER ROSTER UI + VIEW CLASS INTEGRATION.
+ * PHASE 6.2   — TEACHER ATTENDANCE CONTROL UI.
  *
  * Server Component.
  *
@@ -35,8 +36,18 @@
  * branch from the canonical detail read — the student path
  * performs ZERO roster lookups (not even a discarded call).
  *
- * No client-side class / roster fetching. No `useEffect`. No SWR
- * / React Query. No `/api/classes/[classId]` route is introduced.
+ * PHASE 6.2 additionally calls the teacher-only
+ * `getAttendanceSessionStatusForCurrentTeacher(classId)` read
+ * boundary on the teacher viewer path. The attendance status
+ * read is CONDITIONAL on the server-authoritative
+ * `role === "teacher"` branch from the canonical detail read —
+ * the student path performs ZERO attendance lookups (not even
+ * a discarded call).
+ *
+ * No client-side class / roster / attendance fetching. No
+ * `useEffect`. No SWR / React Query. No `/api/classes/[classId]`
+ * route is introduced. No `/api/attendance` route is
+ * introduced.
  *
  * Next.js 16.3.4 dynamic-route signature:
  *
@@ -57,19 +68,29 @@
  *   - CLASS_ROSTER_READ_FAILED → keep the class detail visible;
  *     render a small safe roster-local message. The class detail
  *     page does NOT collapse into a global error.
+ *   - ATTENDANCE_READ_FAILED → keep the class detail visible;
+ *     render a small safe attendance-local message via the
+ *     AttendancePanel failure state.
  *
  * What this page does NOT do:
  *
  *   - No class editing / archive / delete controls.
- *   - No attendance UI.
  *   - No Face ID state / biometric enrollment state.
  *   - No public detail API.
+ *   - No public attendance API.
  *   - No password / passwordHash / teacherUserId / studentUserId /
  *     membershipId / email / phone / FaceProfile / embedding /
  *     centroid in the rendered DOM.
  *   - NO roster call on the student viewer path. The student path
  *     does NOT call `getClassRosterForCurrentTeacher` — neither to
  *     call-then-hide nor to call-then-discard.
+ *   - NO attendance status call on the student viewer path. The
+ *     student path does NOT call
+ *     `getAttendanceSessionStatusForCurrentTeacher` — neither to
+ *     call-then-hide nor to call-then-discard.
+ *   - No attendance UI controls (camera / face recognition /
+ *     present / absent / late / confidence).
+ *   - No face recognition. No attendance marks.
  */
 
 import Link from "next/link";
@@ -87,6 +108,13 @@ import {
   RosterPanel,
   type RosterPanelState,
 } from "@/components/classes/roster-panel";
+import {
+  AttendancePanel,
+  type AttendancePanelState,
+} from "@/components/classes/attendance-panel";
+import {
+  getAttendanceSessionStatusForCurrentTeacher,
+} from "@/lib/attendance/attendance-session-status-read-service";
 import { PageContainer } from "@/components/layout/PageContainer";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { StatusBadge } from "@/components/layout/StatusBadge";
@@ -270,6 +298,37 @@ export default async function ClassDetailPage({
     }
   }
 
+  // PHASE 6.2 — Teacher attendance status read. Mirrors the
+  // roster gate: the student viewer path performs ZERO
+  // attendance lookups. The conditional is the explicit gate;
+  // the panel receives `{ status: "absent" }` so it renders
+  // nothing. The student path therefore does NOT call
+  // `getAttendanceSessionStatusForCurrentTeacher` — neither to
+  // call-then-hide nor to call-then-discard.
+  let attendanceState: AttendancePanelState = { status: "absent" };
+  if (role === "teacher") {
+    const attendanceResult =
+      await getAttendanceSessionStatusForCurrentTeacher(classId);
+    if (attendanceResult.ok) {
+      // The status DTO is the safe projection: state, session
+      // (id, status, startedAt, endedAt, rosterCount).
+      // rosterSnapshot / studentUserId / startedByUserId /
+      // teacherUserId / profile ids / biometric fields are
+      // NEVER projected.
+      attendanceState = {
+        status: "success",
+        payload: attendanceResult.result,
+      };
+    } else {
+      // Attendance read failure is LOCAL to the panel. The
+      // class detail card and the roster panel are preserved;
+      // the attendance panel renders a calm, safe, hardcoded
+      // message. The backend `message` is NEVER forwarded to
+      // the DOM.
+      attendanceState = { status: "failure" };
+    }
+  }
+
   return (
     <PageContainer size="default">
       <PageHeader
@@ -318,6 +377,14 @@ export default async function ClassDetailPage({
 
         {role === "teacher" ? (
           <RosterPanel state={rosterState} />
+        ) : null}
+
+        {role === "teacher" ? (
+          <AttendancePanel
+            state={attendanceState}
+            classId={classDetail.id}
+            classStatus={classDetail.status}
+          />
         ) : null}
 
         <div className="flex justify-start">

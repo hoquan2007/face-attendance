@@ -49,6 +49,7 @@ const mockGetSession = vi.fn();
 const mockGetProfileByUserId = vi.fn();
 const mockGetClassDetailForCurrentUser = vi.fn();
 const mockGetClassRosterForCurrentTeacher = vi.fn();
+const mockGetAttendanceSessionStatusForCurrentTeacher = vi.fn();
 // `notFound()` throws to halt the route segment — mirror the
 // existing redirect-mock pattern so tests can observe the call.
 const mockNotFound = vi.fn(() => {
@@ -92,9 +93,28 @@ vi.mock("@/lib/classes/class-read-service", () => ({
   },
 }));
 
+vi.mock(
+  "@/lib/attendance/attendance-session-status-read-service",
+  () => ({
+    getAttendanceSessionStatusForCurrentTeacher: (
+      ...args: unknown[]
+    ) => mockGetAttendanceSessionStatusForCurrentTeacher(...args),
+    ATTENDANCE_SESSION_STATUS_READ_ERROR_CODES: {
+      UNAUTHENTICATED: "UNAUTHENTICATED",
+      PROFILE_INCOMPLETE: "PROFILE_INCOMPLETE",
+      TEACHER_REQUIRED: "TEACHER_REQUIRED",
+      CLASS_NOT_ACCESSIBLE: "CLASS_NOT_ACCESSIBLE",
+      ATTENDANCE_READ_FAILED: "ATTENDANCE_READ_FAILED",
+    },
+  }),
+);
+
 vi.mock("next/navigation", () => ({
   redirect: (href: string) => mockRedirect(href),
   notFound: () => mockNotFound(),
+  useRouter: () => ({
+    refresh: () => undefined,
+  }),
 }));
 
 import ClassDetailPage from "@/app/classes/[classId]/page";
@@ -173,6 +193,15 @@ beforeEach(() => {
   mockGetClassRosterForCurrentTeacher.mockResolvedValue({
     ok: true,
     result: { class: makeClassDetail(), students: [] },
+  });
+  // Default safe attendance status result for the teacher
+  // viewer path. Tests that assert specific attendance
+  // behavior override this mock locally. The student viewer
+  // path does NOT call this function at all, so student-path
+  // tests are unaffected even with this default.
+  mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue({
+    ok: true,
+    result: { state: "none", session: null },
   });
 });
 
@@ -981,8 +1010,16 @@ describe("/classes/[classId] page — domain isolation", () => {
     expect(sourceBody).not.toMatch(/face-profile-service/);
   });
 
-  it("51. no attendance operation", () => {
-    expect(sourceBody.toLowerCase()).not.toContain("attendance");
+  it("51. no attendance OPERATION (only the read-only attendance status read is allowed)", () => {
+    // PHASE 6.2 introduces the Attendance READ on the teacher
+    // viewer path — it is intentionally a server-only read
+    // boundary. The page MUST NOT mutate / create / start /
+    // stop attendance. The control surfaces live in the
+    // dedicated `AttendanceControlButton` Client Component.
+    expect(sourceBody.toLowerCase()).not.toMatch(/startattendance/);
+    expect(sourceBody.toLowerCase()).not.toMatch(/stopattendance/);
+    expect(sourceBody.toLowerCase()).not.toMatch(/attendance_records/);
+    expect(sourceBody.toLowerCase()).not.toMatch(/attendance-marks/);
   });
 
   it("52. no class mutation", () => {
@@ -1547,7 +1584,7 @@ describe("/classes/[classId] page — PHASE 5.1E4B teacher roster UI", () => {
     expect(tree.toLowerCase()).not.toContain("faceprofile");
   });
 
-  it("77. roster DOM contains no attendance copy", async () => {
+  it("77. roster DOM contains no attendance marker copy", async () => {
     mockGetClassDetailForCurrentUser.mockResolvedValue({
       ok: true,
       result: { role: "teacher", class: makeClassDetail() },
@@ -1565,15 +1602,18 @@ describe("/classes/[classId] page — PHASE 5.1E4B teacher roster UI", () => {
         params: Promise.resolve({ classId: "650000000000000000000099" }),
       }),
     );
-    // The roster panel must NOT advertise attendance — the
-    // phase does NOT implement attendance. Copy such as
-    // "Present / Absent / Late / Attendance %" must NOT leak.
-    expect(tree.toLowerCase()).not.toMatch(/\bpresent\b/);
-    expect(tree.toLowerCase()).not.toMatch(/\babsent\b/);
-    expect(tree.toLowerCase()).not.toMatch(/\blate\b/);
-    expect(tree.toLowerCase()).not.toContain("attendance");
+    // The roster panel must NOT advertise attendance marks.
+    // Copy such as "Present: 5" / "Absent: 2" / "Late" /
+    // "Confidence" must NOT leak — those do not exist in
+    // this phase. The word "present" alone is too broad
+    // (it appears in section copy); the assertion below
+    // checks for the marker label shape instead.
+    expect(tree).not.toMatch(/present\s*:/i);
+    expect(tree).not.toMatch(/absent\s*:/i);
+    expect(tree).not.toMatch(/\blate\b/i);
     expect(tree.toLowerCase()).not.toContain("recognition");
     expect(tree.toLowerCase()).not.toContain("camera");
+    expect(tree.toLowerCase()).not.toContain("confidence");
   });
 
   it("78. no public roster REST route introduced", async () => {
@@ -1634,5 +1674,432 @@ describe("/classes/[classId] page — PHASE 5.1E4B teacher roster UI", () => {
     expect(idxOldest).toBeGreaterThan(-1);
     expect(idxMiddle).toBeGreaterThan(idxOldest);
     expect(idxNewest).toBeGreaterThan(idxMiddle);
+  });
+});
+
+// =============================================================================
+// PHASE 6.2 — TEACHER ATTENDANCE CONTROL UI
+// =============================================================================
+
+describe("/classes/[classId] page — PHASE 6.2 teacher attendance status read", () => {
+  it("A1. teacher viewer calls getAttendanceSessionStatusForCurrentTeacher with route classId", async () => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "teacher" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        class: makeClassDetail({ id: "650000000000000000000099" }),
+      },
+    });
+    mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue({
+      ok: true,
+      result: { state: "none", session: null },
+    });
+    await ClassDetailPage({
+      params: Promise.resolve({ classId: "650000000000000000000099" }),
+    });
+    expect(
+      mockGetAttendanceSessionStatusForCurrentTeacher,
+    ).toHaveBeenCalledTimes(1);
+    expect(
+      mockGetAttendanceSessionStatusForCurrentTeacher,
+    ).toHaveBeenCalledWith("650000000000000000000099");
+  });
+
+  it("A2. student viewer NEVER calls getAttendanceSessionStatusForCurrentTeacher", async () => {
+    mockGetSession.mockResolvedValue(makeSession("STUDENT-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({
+        role: "student",
+        userId: "STUDENT-1",
+      }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "student",
+        class: makeClassDetail(),
+      },
+    });
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    // The student path performs ZERO attendance reads —
+    // neither to call-then-hide nor to call-then-discard.
+    expect(
+      mockGetAttendanceSessionStatusForCurrentTeacher,
+    ).not.toHaveBeenCalled();
+    // The student detail DOM must NOT contain the Attendance
+    // panel.
+    expect(tree.toLowerCase()).not.toContain('data-component="attendance-panel"');
+    expect(tree).not.toMatch(/start attendance/i);
+    expect(tree).not.toMatch(/stop attendance/i);
+  });
+
+  it("A3. teacher detail renders the Attendance panel (NONE state)", async () => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "teacher" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        class: makeClassDetail(),
+      },
+    });
+    mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue({
+      ok: true,
+      result: { state: "none", session: null },
+    });
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree).toContain('data-component="attendance-panel"');
+    expect(tree).toContain('data-attendance-state="none"');
+    expect(tree).toMatch(/start attendance/i);
+  });
+
+  it("A4. teacher detail renders the Attendance panel (ACTIVE state)", async () => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "teacher" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        class: makeClassDetail(),
+      },
+    });
+    mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue({
+      ok: true,
+      result: {
+        state: "active",
+        session: {
+          id: "65f000000000000000000fff",
+          status: "active",
+          startedAt: "2026-09-16T10:00:00.000Z",
+          endedAt: null,
+          rosterCount: 4,
+        },
+      },
+    });
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree).toContain('data-attendance-state="active"');
+    expect(tree).toMatch(/stop attendance/i);
+    // The rosterCount from the read is rendered verbatim.
+    expect(tree).toContain('data-attendance-roster-count="4"');
+  });
+
+  it("A5. teacher detail renders the Attendance panel (CLOSED state)", async () => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "teacher" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        class: makeClassDetail(),
+      },
+    });
+    mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue({
+      ok: true,
+      result: {
+        state: "closed",
+        session: {
+          id: "65f000000000000000000fff",
+          status: "closed",
+          startedAt: "2026-09-16T10:00:00.000Z",
+          endedAt: "2026-09-16T11:00:00.000Z",
+          rosterCount: 9,
+        },
+      },
+    });
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree).toContain('data-attendance-state="closed"');
+    expect(tree).toMatch(/start new attendance/i);
+    expect(tree).toContain('data-attendance-roster-count="9"');
+  });
+
+  it("A6. attendance read failure renders the safe failure block (no raw error)", async () => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "teacher" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        class: makeClassDetail(),
+      },
+    });
+    mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue({
+      ok: false,
+      code: "ATTENDANCE_READ_FAILED",
+      message:
+        "MongoServerSelectionError: ECONNREFUSED 10.0.0.1:27017 stack-trace",
+    });
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    // The detail card is preserved; the attendance panel
+    // surfaces a calm local safe failure block.
+    expect(tree).toMatch(/attendance status could not be loaded/i);
+    // The raw backend message MUST NOT leak into the DOM.
+    expect(tree).not.toContain("ECONNREFUSED");
+    expect(tree).not.toContain("10.0.0.1");
+    expect(tree).not.toContain("27017");
+    expect(tree).not.toContain("MongoServerSelectionError");
+    expect(tree).not.toContain("stack-trace");
+    // The Start / Stop buttons are NOT rendered when the
+    // read fails — there is no session to interact with.
+    expect(tree).not.toMatch(/<button[^>]*data-mode="start"/);
+    expect(tree).not.toMatch(/<button[^>]*data-mode="stop"/);
+  });
+
+  it("A7. archived class renders the archived notice and NO Start button", async () => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "teacher" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        class: makeClassDetail({ status: "archived" }),
+      },
+    });
+    mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue({
+      ok: true,
+      result: { state: "none", session: null },
+    });
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree).toContain('data-attendance-archived-notice="true"');
+    expect(tree).toMatch(
+      /attendance cannot be started for an archived class/i,
+    );
+    // No interactive Start button is rendered for archived
+    // classes. The closed session metadata (when present) is
+    // still rendered.
+    expect(tree).not.toMatch(/<button[^>]*data-mode="start"/);
+    expect(tree).not.toMatch(/<button[^>]*data-mode="stop"/);
+  });
+
+  it("A8. archived class with a historical closed session still renders the metadata", async () => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "teacher" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        class: makeClassDetail({ status: "archived" }),
+      },
+    });
+    mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue({
+      ok: true,
+      result: {
+        state: "closed",
+        session: {
+          id: "65f000000000000000000fff",
+          status: "closed",
+          startedAt: "2026-09-16T10:00:00.000Z",
+          endedAt: "2026-09-16T11:00:00.000Z",
+          rosterCount: 12,
+        },
+      },
+    });
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    // The closed session metadata is still rendered.
+    expect(tree).toContain('data-attendance-roster-count="12"');
+    // The Start button is still NOT rendered for archived
+    // classes.
+    expect(tree).not.toMatch(/<button[^>]*data-mode="start"/);
+  });
+
+  it("A9. attendance panel NEVER renders rosterSnapshot / studentUserId / teacherUserId / startedByUserId", async () => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "teacher" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        class: makeClassDetail(),
+      },
+    });
+    mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue({
+      ok: true,
+      result: {
+        state: "active",
+        session: {
+          id: "65f000000000000000000fff",
+          status: "active",
+          startedAt: "2026-09-16T10:00:00.000Z",
+          endedAt: null,
+          rosterCount: 3,
+        },
+      },
+    });
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree).not.toContain("rosterSnapshot");
+    expect(tree).not.toContain("fullNameSnapshot");
+    expect(tree).not.toContain("identificationCodeSnapshot");
+    expect(tree.toLowerCase()).not.toContain("studentuserid");
+    expect(tree.toLowerCase()).not.toContain("teacheruserid");
+    expect(tree.toLowerCase()).not.toContain("startedbyuserid");
+  });
+
+  it("A10. attendance panel NEVER renders FaceProfile / embedding / centroid / biometric", async () => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "teacher" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        class: makeClassDetail(),
+      },
+    });
+    mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue({
+      ok: true,
+      result: {
+        state: "active",
+        session: {
+          id: "65f000000000000000000fff",
+          status: "active",
+          startedAt: "2026-09-16T10:00:00.000Z",
+          endedAt: null,
+          rosterCount: 3,
+        },
+      },
+    });
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree).not.toContain("FaceProfile");
+    expect(tree.toLowerCase()).not.toContain("embedding");
+    expect(tree.toLowerCase()).not.toContain("centroid");
+    expect(tree.toLowerCase()).not.toContain("biometric");
+  });
+
+  it("A11. attendance panel NEVER creates / displays attendance marks", async () => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "teacher" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        class: makeClassDetail(),
+      },
+    });
+    mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue({
+      ok: true,
+      result: {
+        state: "active",
+        session: {
+          id: "65f000000000000000000fff",
+          status: "active",
+          startedAt: "2026-09-16T10:00:00.000Z",
+          endedAt: null,
+          rosterCount: 3,
+        },
+      },
+    });
+    const tree = renderToStaticMarkup(
+      await ClassDetailPage({
+        params: Promise.resolve({ classId: "650000000000000000000099" }),
+      }),
+    );
+    expect(tree).not.toMatch(/present\s*:/i);
+    expect(tree).not.toMatch(/absent\s*:/i);
+    expect(tree).not.toMatch(/\blate\b/i);
+    expect(tree).not.toContain("recognizedAt");
+    expect(tree).not.toContain("confidence");
+  });
+
+  it("A12. attendance panel NEVER introduces a /api/attendance REST route", async () => {
+    const source = readFileSync(
+      resolve(
+        __dirname,
+        "..",
+        "..",
+        "..",
+        "app",
+        "classes",
+        "[classId]",
+        "page.tsx",
+      ),
+      "utf-8",
+    );
+    const body = stripComments(source);
+    expect(body).not.toMatch(/\/api\/attendance/);
+    expect(body).not.toMatch(/NextResponse/);
+    expect(body).not.toMatch(/route\.ts/);
+  });
+
+  it("A13. page calls getAttendanceSessionStatusForCurrentTeacher with classId ONLY", async () => {
+    mockGetSession.mockResolvedValue(makeSession("USER-1"));
+    mockGetProfileByUserId.mockResolvedValue(
+      makeProfile({ role: "teacher" }),
+    );
+    mockGetClassDetailForCurrentUser.mockResolvedValue({
+      ok: true,
+      result: {
+        role: "teacher",
+        class: makeClassDetail(),
+      },
+    });
+    mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue({
+      ok: true,
+      result: { state: "none", session: null },
+    });
+    await ClassDetailPage({
+      params: Promise.resolve({ classId: "650000000000000000000099" }),
+    });
+    const args =
+      mockGetAttendanceSessionStatusForCurrentTeacher.mock
+        .calls[0] ?? [];
+    expect(args.length).toBe(1);
+    expect(typeof args[0]).toBe("string");
+    expect(args[0]).toBe("650000000000000000000099");
   });
 });

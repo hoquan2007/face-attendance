@@ -389,9 +389,11 @@ Avoid horizontal overflow. All horizontal padding must be responsive.
 
 ## Future Attendance Layout (Guidance)
 
-Do NOT implement attendance in Phase 2.5. This section is for future reference.
+> **NOTE:** PHASE 6.2 implements the teacher attendance lifecycle UI
+> on `/classes/[classId]`. The camera workspace layout described
+> below is Phase 6.3+ territory and is still guidance only.
 
-Desktop attendance session layout:
+Desktop attendance session layout (Phase 6.3+):
 - **~70%** camera workspace (primary)
 - **~30%** live attendance panel (secondary)
 

@@ -1,5 +1,7 @@
 # Privacy & Security
 
+> Status: **Phase 6.2** — TEACHER ATTENDANCE CONTROL UI. PHASE 6.2 adds the teacher attendance lifecycle UI on `/classes/[classId]` using the existing `startAttendanceSessionAction` / `stopAttendanceSessionAction` Server Actions and a new server-only read boundary `getAttendanceSessionStatusForCurrentTeacher`. The browser-safe DTO exposes only `{ state, session: { id, status, startedAt, endedAt, rosterCount } }` — `rosterSnapshot`, `studentUserId`, `teacherUserId`, `startedByUserId`, biometric fields, FaceProfile, and Face Service calls are strictly absent. No face recognition, no camera UI, no attendance marks (present/absent/late/confidence/recognizedAt), and no `/api/attendance` REST API. See `## Phase 6.2 — Attendance UI Privacy`.
+
 > Status: **Phase 6.1** — ATTENDANCE SESSION FOUNDATION. PHASE 6.1 ships the teacher start / stop attendance session lifecycle with full server-only enforcement of authorization (teacher-owner of an ACTIVE class only), session uniqueness (database-level partial unique index — at most ONE active session per class), atomic stop semantics, and strict no-leak of the immutable roster snapshot. The browser NEVER receives `rosterSnapshot`, `studentUserId`, `teacherUserId`, `startedByUserId`, `passwordHash`, biometric fields, the Mongo URI, E11000, or any raw Mongoose stack. No attendance UI is added; no attendance REST API is added; no Face Service call is made; no per-student `present`/`absent`/`late`/`confidence`/`recognizedAt` record is created. See `## Phase 6.1 — Attendance Session Privacy` for the explicit phase statement.
 
 > Status: **Phase 5.1E4C** — Class UX MVP closed. The four Class routes (`/classes`, `/classes/new`, `/classes/join`, `/classes/[classId]`) and three Class components (`CreateClassForm`, `JoinClassForm`, `RosterPanel`) implement the full teacher + student flows (list, create, detail, roster, join) with no biometric coupling, no attendance coupling, and no public Class REST API. E4C adds the final regression layer (`apps/web/src/app/classes/__tests__/class-ux-regression-closure.test.tsx`) that scans every Class surface for the prohibited output (passwordHash, teacherUserId, studentUserId, membershipId, emailSnapshot, phone, FaceProfile, embedding, centroid, raw Mongo errors) and locks down the four Class routes against new public REST routes. See `## Phase 5.1E4C — Class UX Final Closure` for the explicit MVP-completion statement.
@@ -3489,3 +3491,82 @@ or biometric state, never surface raw Mongo errors, and
 never expose a public Class REST surface. The final
 regression layer locks these invariants in for any future
 change.
+
+## Phase 6.2 — Attendance UI Privacy
+
+PHASE 6.2 ships the teacher attendance lifecycle UI on
+`/classes/[classId]` using the existing PHASE 6.1 Server
+Actions and a new server-only read boundary. The attendance
+status read returns a strictly controlled browser-safe DTO.
+No face recognition, no camera UI, no biometric access.
+
+### What the browser receives
+
+`getAttendanceSessionStatusForCurrentTeacher` returns:
+
+```ts
+type AttendanceSessionStatusDto =
+  | { state: "none";   session: null }
+  | { state: "active"; session: {
+      id: string;
+      status: "active";
+      startedAt: string;   // ISO 8601
+      endedAt: null;
+      rosterCount: number; // snapshot size
+    }}
+  | { state: "closed"; session: {
+      id: string;
+      status: "closed";
+      startedAt: string;  // ISO 8601
+      endedAt: string;    // ISO 8601
+      rosterCount: number;
+    }};
+```
+
+The `AttendancePanel` Server Component renders only the safe
+fields above. The `AttendanceControlButton` Client Component
+calls the existing Server Actions with ONLY `classId` and
+performs no biometric access.
+
+### What the browser NEVER receives
+
+The following are **explicitly absent** from every
+attendance UI module and the read result:
+
+- `rosterSnapshot` — persistence-only. The browser receives
+  `rosterCount` (a number), never the array.
+- `studentUserId`, `fullNameSnapshot`,
+  `identificationCodeSnapshot` — internal per-student
+  fields of the snapshot array. Never serialized.
+- `teacherUserId`, `startedByUserId` — server-internal
+  Better Auth IDs. Never serialized.
+- `passwordHash`, biometric fields (`embedding`,
+  `centroid`, `faceEmbedding`, etc.), Mongoose internals.
+- The Mongo URI, the `E11000` token, the `attendance_sessions`
+  collection name, or any raw Mongoose error.
+- `present`, `absent`, `late`, `confidence`,
+  `recognizedAt` — attendance marks do not exist in this phase.
+- Face Service calls, `FaceProfile` access, webcam access.
+
+### Module surface
+
+| Module                                              | Boundary                        |
+| --------------------------------------------------- | ------------------------------- |
+| `attendance-session-status-types.ts`                   | shared types (no `server-only`)  |
+| `attendance-session-status-read-service.ts`              | `import "server-only"`           |
+| `components/classes/attendance-panel.tsx`              | Server Component                 |
+| `components/classes/attendance-control-button.tsx`      | `"use client"` Client Component  |
+
+### Domain isolation (PHASE 6.2 explicitly does NOT)
+
+- Call the Face Service (`@/lib/face-service-client`,
+  `@/lib/biometrics`).
+- Access `FaceProfile`, `face_profiles` collection, or any
+  biometric field.
+- Import `embedding`, `centroid`, or any face embedding vector.
+- Open a webcam (`getUserMedia`, `MediaDevices`,
+  `navigator.mediaDevices`).
+- Create or display `present`, `absent`, `late`, `confidence`,
+  or `recognizedAt` records.
+- Add a public `/api/attendance` REST route.
+- Import `AttendanceSessionModel` directly in a UI module.

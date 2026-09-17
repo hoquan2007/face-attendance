@@ -1,5 +1,7 @@
 # Architecture
 
+> Status: **Phase 6.2** — TEACHER ATTENDANCE CONTROL UI. PHASE 6.2 ships the teacher attendance lifecycle UI on the class detail page (`/classes/[classId]`), consisting of three new modules: (1) the server-only `getAttendanceSessionStatusForCurrentTeacher(classId)` read boundary (`attendance-session-status-read-service.ts`) that returns a browser-safe DTO `{ state, session }` for teachers only, with ACTIVE sessions preferred over CLOSED, and strict privacy guards; (2) the `AttendancePanel` Server Component that renders the three lifecycle states (NONE, ACTIVE, CLOSED) and the archived-class notice without any face recognition, attendance marks, or camera code; and (3) the `AttendanceControlButton` Client Component that calls `startAttendanceSessionAction` or `stopAttendanceSessionAction` with ONLY `classId` and uses a synchronous in-flight ref guard + `router.refresh()` for safe double-click protection and server-authoritative reconciliation. PHASE 6.2 does NOT add face recognition, does NOT create attendance marks, does NOT add camera UI, and does NOT introduce a public REST attendance API. See `## Phase 6.2 — Teacher Attendance Control UI` for the explicit phase statement.
+
 > Status: **Phase 6.1** — ATTENDANCE SESSION FOUNDATION. The Attendance Session domain is now in place: a server-only `AttendanceSession` Mongoose model (`attendance_sessions` collection), a roster-snapshot service that captures the active membership at start time, and two authenticated Teacher Server Actions — `startAttendanceSessionAction` and `stopAttendanceSessionAction`. The session lifecycle is fully database-enforced: a partial unique index on `{ classId, status }` where `status === "active"` guarantees at most ONE active session per class; closing the session uses an atomic `findOneAndUpdate` CAS. Teachers who are NOT the owner cannot start or stop a session; archived classes cannot start. The roster snapshot is immutable: it captures `studentUserId` + `fullNameSnapshot` + `identificationCodeSnapshot` for every active member at start time, and is never refreshed. PHASE 6.1 does NOT add an Attendance UI, does NOT call the Face Service, does NOT perform recognition, does NOT mark any student present / absent / late, and does NOT introduce a public REST attendance API. See `## Phase 6.1 — Attendance Session Foundation` for the explicit phase statement.
 
 > Status: **Phase 5.1E4C** — Class UX MVP closed. The four Class routes (`/classes`, `/classes/new`, `/classes/join`, `/classes/[classId]`) and three Class components (`CreateClassForm`, `JoinClassForm`, `RosterPanel`) implement the full teacher + student flows (list, create, detail, roster, join). No new Class domain features are introduced in E4C — this phase audits role-aware UX consistency, accessibility, empty / error / archived states, and navigation, and ships the final regression layer (`apps/web/src/app/classes/__tests__/class-ux-regression-closure.test.tsx`) proving the full teacher + student flows work together. See `## Phase 5.1E4C — Class UX Final Closure` for the explicit MVP-completion statement.
@@ -4098,6 +4100,169 @@ Phase 6.1 explicitly does NOT introduce:
 - Any automatic attendance-marking flow.
 
 Those belong to PHASE 6.2 and later.
+
+## Phase 6.2 — Teacher Attendance Control UI
+
+PHASE 6.2 ships the teacher attendance lifecycle UI on the class
+detail page (`/classes/[classId]`), consisting of three new
+modules plus the integration into the existing page.
+
+### Module surface
+
+| Module                                              | Boundary                        |
+| --------------------------------------------------- | ------------------------------- |
+| `attendance-session-status-types.ts`                 | shared types (no `server-only`)  |
+| `attendance-session-status-read-service.ts`            | `import "server-only"`           |
+| `components/classes/attendance-panel.tsx`            | Server Component                 |
+| `components/classes/attendance-control-button.tsx`    | `"use client"` Client Component  |
+| `app/classes/[classId]/page.tsx`                   | Server Component (integrated)    |
+
+### Session status read — `getAttendanceSessionStatusForCurrentTeacher(classId)`
+
+The canonical READ-ONLY server-only function (NOT a Server
+Action, NOT a REST route) called by the class detail page's
+teacher viewer branch. Accepts ONLY `classId`. Identity derives
+from `Better Auth session.user.id`; role derives from
+`Profile.role`.
+
+**Session selection logic:**
+
+1. ACTIVE session exists → return `{ state: "active", session: {...} }`.
+   ACTIVE always wins, even when a closed session also exists.
+2. Otherwise, LATEST CLOSED session (by `startedAt DESC`) →
+   return `{ state: "closed", session: {...} }`.
+3. Otherwise → return `{ state: "none", session: null }`.
+
+No N+1 queries. Two focused reads: one for active, one for
+latest closed. Uses the partial unique index.
+
+**Authorization:**
+
+- Authenticated? → `UNAUTHENTICATED`.
+- Profile complete? → `PROFILE_INCOMPLETE`.
+- `Profile.role === "teacher"`? → `TEACHER_REQUIRED` (NO class
+  or session query performed — a student must NOT be able to
+  probe whether attendance is running).
+- Class owned by teacher? → `ClassModel.findOne({ _id: classId,
+  teacherUserId: session.user.id })` encodes the authorization
+  in the query. A `null` result collapses to the same
+  `CLASS_NOT_ACCESSIBLE` boundary as malformed / missing class.
+  There is intentionally NO separate `NOT_CLASS_OWNER` code — a
+  non-owner teacher cannot probe whether another teacher has
+  attendance running.
+- Malformed `classId` → `CLASS_NOT_ACCESSIBLE` (no DB call).
+
+**Safe DTO returned to browser:**
+
+```ts
+type AttendanceSessionStatusDto =
+  | { state: "none";   session: null }
+  | { state: "active"; session: AttendanceSessionStatusSessionDto }
+  | { state: "closed"; session: AttendanceSessionStatusSessionDto };
+
+type AttendanceSessionStatusSessionDto = {
+  id: string;           // canonical Mongo _id.toString()
+  status: "active" | "closed";
+  startedAt: string;    // ISO 8601
+  endedAt: string | null;
+  rosterCount: number;  // snapshot size, NOT recomputed
+};
+```
+
+`rosterSnapshot`, `studentUserId`, `startedByUserId`,
+`teacherUserId`, `passwordHash`, biometric fields, profile
+ids, and membership internal ids are NEVER serialized.
+
+### Attendance Panel — `AttendancePanel` Server Component
+
+Rendered on `/classes/[classId]` for the TEACHER viewer ONLY.
+The student viewer path passes `{ status: "absent" }` and the
+component renders `null` — the student path performs ZERO
+attendance reads.
+
+**States:**
+
+- `NONE`: "Start attendance to capture who is present for this
+  class." + "Start attendance" button.
+- `ACTIVE`: "Attendance is currently in progress." + startedAt +
+  rosterCount + "Stop attendance" button. NO present / absent /
+  recognition / confidence counts.
+- `CLOSED`: "The most recent attendance session has ended." +
+  startedAt + endedAt + rosterCount + "Start new attendance"
+  button.
+- `ARCHIVED`: The historical closed session metadata (when
+  present) is still displayed. The Start button is replaced
+  with "Attendance cannot be started for an archived class."
+  notice. Stop is never rendered for archived.
+- `FAILURE`: Calm, hardcoded "Attendance status could not be
+  loaded. Please refresh the page in a moment." block. The
+  backend error message is NEVER forwarded to the DOM.
+
+### Attendance Control Button — `AttendanceControlButton` Client Component
+
+The ONLY browser-side trigger for
+`startAttendanceSessionAction` and `stopAttendanceSessionAction`.
+
+- Receives only `classId` (24-hex string), `mode` (`"start" |
+  "stop"`), and `label` (parent-supplied string).
+- Calls the action with ONLY `{ classId }`. Zero identity / role
+  / status fields forwarded.
+- Synchronous in-flight ref guard: second rapid click hits the
+  ref BEFORE any `await`, collapsing two clicks into one
+  invocation.
+- Visual disabled + aria-busy while pending.
+- On success (including `alreadyActive: true` / `alreadyStopped:
+  true`): calls `router.refresh()` inside
+  `startRefreshTransition()` so the Server Component re-reads
+  the canonical attendance status and transitions to the new
+  state. NO client-side state mutation.
+- On failure: maps the safe error code to restrained heading +
+  body copy. No Mongo detail, no stack trace, no automatic
+  retry.
+- Safe error codes map to constrained UI copy; the `result.message`
+  is used indirectly through the classifier.
+- On a throw (defensive): renders the generic safe failure.
+
+### Integration into `/classes/[classId]`
+
+The page's teacher viewer branch:
+
+1. Derives `role` from the existing `getClassDetailForCurrentUser`
+   result (server-authoritative).
+2. Conditionally calls `getAttendanceSessionStatusForCurrentTeacher`
+   ONLY when `role === "teacher"`. The student path performs
+   ZERO attendance lookups.
+3. Maps the read result to `AttendancePanelState`:
+   - `ok` → `{ status: "success", payload: result.result }`.
+   - `!ok` → `{ status: "failure" }`.
+4. Renders `<AttendancePanel state={attendanceState} classId={...}
+   classStatus={...} />` for teachers only.
+
+### PHASE 6.2 explicitly does NOT modify:
+
+- `AttendanceSession` schema or semantics.
+- `startAttendanceSessionAction` / `stopAttendanceSessionAction`
+  action semantics.
+- `Class` schema or authorization.
+- The existing Class UX flows.
+- Better Auth configuration.
+- The Face Service or FaceProfile.
+- Any face recognition, camera, biometric, or attendance-marking
+  flow.
+- Any automatic `present` / `absent` / `late` / `confidence` /
+  `recognizedAt` record creation.
+- Any `/api/attendance` REST route.
+
+### Domain isolation (PHASE 6.2 explicitly does NOT)
+
+- Call the Face Service or import `FaceServiceClient`.
+- Access `FaceProfile`, `face_profiles` collection, or any
+  biometric field.
+- Import `embedding`, `centroid`, or any face embedding vector.
+- Open a webcam (`getUserMedia`, `MediaStream`).
+- Create or display `present`, `absent`, `late`, `confidence`,
+  or `recognizedAt` records.
+- Add a public `/api/attendance` REST route.
 
 ## Non-goals (for now)
 
