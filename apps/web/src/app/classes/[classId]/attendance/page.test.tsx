@@ -1,6 +1,7 @@
 /**
  * Tests for `/classes/[classId]/attendance` — PHASE 6.4 live
  * face recognition + persisted present state.
+ * PHASE 6.6 — ATTENDANCE SESSION FINALIZATION (adds closed-session final summary).
  *
  * Tests call the async Server Component function directly to
  * bypass React 19's Suspense boundary constraints in
@@ -23,6 +24,14 @@
  *   40. repeated scans do not visually inflate persisted count
  *   41. no Absent label
  *   42. no Late label
+ *
+ * PHASE 6.6 additions:
+ *   27. closed session renders final summary (not active camera)
+ *   33. final summary appears after stop
+ *   — final summary read service covered in
+ *     attendance-final-summary-read-service.test.ts
+ *   — final summary panel covered in
+ *     attendance-final-summary-panel.test.tsx
  */
 
 import { beforeEach, describe as _describe, expect, it, vi } from "vitest";
@@ -37,6 +46,7 @@ const mockGetProfileByUserId = vi.fn();
 const mockGetClassDetailForCurrentUser = vi.fn();
 const mockGetAttendanceSessionStatusForCurrentTeacher = vi.fn();
 const mockGetAttendancePresentStateForCurrentTeacher = vi.fn();
+const mockGetAttendanceFinalSummaryForCurrentTeacher = vi.fn();
 
 beforeEach(() => {
   mockGetSession.mockReset();
@@ -44,6 +54,7 @@ beforeEach(() => {
   mockGetClassDetailForCurrentUser.mockReset();
   mockGetAttendanceSessionStatusForCurrentTeacher.mockReset();
   mockGetAttendancePresentStateForCurrentTeacher.mockReset();
+  mockGetAttendanceFinalSummaryForCurrentTeacher.mockReset();
   mockNotFound.mockClear();
   mockRedirect.mockClear();
 });
@@ -89,6 +100,24 @@ vi.mock(
   () => ({
     getAttendancePresentStateForCurrentTeacher: (...args: unknown[]) =>
       mockGetAttendancePresentStateForCurrentTeacher(...args),
+  }),
+);
+
+// PHASE 6.6 — final attendance summary read model mock
+vi.mock(
+  "@/lib/attendance/attendance-final-summary-read-service",
+  () => ({
+    getAttendanceFinalSummaryForCurrentTeacher: (...args: unknown[]) =>
+      mockGetAttendanceFinalSummaryForCurrentTeacher(...args),
+    ATTENDANCE_FINAL_SUMMARY_ERROR_CODES: {
+      UNAUTHENTICATED: "UNAUTHENTICATED",
+      PROFILE_INCOMPLETE: "PROFILE_INCOMPLETE",
+      TEACHER_REQUIRED: "TEACHER_REQUIRED",
+      CLASS_NOT_ACCESSIBLE: "CLASS_NOT_ACCESSIBLE",
+      ATTENDANCE_SESSION_NOT_FOUND: "ATTENDANCE_SESSION_NOT_FOUND",
+      ATTENDANCE_SESSION_NOT_CLOSED: "ATTENDANCE_SESSION_NOT_CLOSED",
+      ATTENDANCE_SUMMARY_READ_FAILED: "ATTENDANCE_SUMMARY_READ_FAILED",
+    },
   }),
 );
 
@@ -148,6 +177,55 @@ vi.mock("@/components/classes/attendance-present-state-panel", () => ({
       ))}
     </div>
   ),
+}));
+
+// PHASE 6.6 — Mock the FinalSummaryPanel as a visible stub.
+vi.mock("@/components/classes/attendance-final-summary-panel", () => ({
+  AttendanceFinalSummaryPanel: ({
+    summary,
+  }: {
+    summary: {
+      session: { id: string; rosterCount: number };
+      presentCount: number;
+      absentCount: number;
+      students: Array<{
+        fullName: string;
+        identificationCode: string;
+        status: "present" | "absent";
+        recognizedAt: string | null;
+      }>;
+    } | null;
+  }) => {
+    if (!summary) {
+      return (
+        <div
+          data-component="attendance-final-summary-panel"
+          data-summary-null="true"
+        >
+          Error Mock
+        </div>
+      );
+    }
+    return (
+      <div
+        data-component="attendance-final-summary-panel"
+        data-summary-rendered="true"
+        data-present-count={summary.presentCount}
+        data-absent-count={summary.absentCount}
+        data-roster-count={summary.session.rosterCount}
+      >
+        {summary.students.map((s, i: number) => (
+          <div
+            key={i}
+            data-attendance-final-row="true"
+            data-student-name={s.fullName}
+            data-student-id={s.identificationCode}
+            data-student-status={s.status}
+          />
+        ))}
+      </div>
+    );
+  },
 }));
 
 // =============================================================================
@@ -329,9 +407,9 @@ it("42. no-active-session redirects safely", async () => {
   expect(mockRedirect).toHaveBeenCalledWith("/classes/class-1");
 });
 
-// Test 42b: closed session redirects safely
+// Test 42b: closed session renders final attendance summary (PHASE 6.6)
 
-it("42b. closed session redirects safely", async () => {
+it("27/33. closed session renders final attendance summary", async () => {
   const { default: Page } = await import(
     "@/app/classes/[classId]/attendance/page"
   );
@@ -350,12 +428,97 @@ it("42b. closed session redirects safely", async () => {
   mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue(
     makeAttendanceStatus("closed"),
   );
+  mockGetAttendanceFinalSummaryForCurrentTeacher.mockResolvedValue({
+    ok: true,
+    result: {
+      session: {
+        id: "session-1",
+        startedAt: "2026-09-16T10:00:00.000Z",
+        endedAt: "2026-09-16T10:42:00.000Z",
+        rosterCount: 3,
+      },
+      presentCount: 2,
+      absentCount: 1,
+      students: [
+        {
+          fullName: "Alpha",
+          identificationCode: "SV001",
+          status: "present",
+          recognizedAt: "2026-09-16T10:05:00.000Z",
+        },
+        {
+          fullName: "Bravo",
+          identificationCode: "SV002",
+          status: "absent",
+          recognizedAt: "2026-09-16T10:42:00.000Z",
+        },
+        {
+          fullName: "Charlie",
+          identificationCode: "SV003",
+          status: "present",
+          recognizedAt: "2026-09-16T10:10:00.000Z",
+        },
+      ],
+    },
+  });
 
   const params = Promise.resolve({ classId: "class-1" });
+  const tree = await Page({ params });
 
-  await expect(Page({ params })).rejects.toThrow(
-    "NEXT_REDIRECT:/classes/class-1",
+  // PHASE 6.6: The final summary panel is rendered.
+  expect(mockRedirect).not.toHaveBeenCalled();
+  expect(mockGetAttendanceFinalSummaryForCurrentTeacher).toHaveBeenCalledWith(
+    "class-1",
+    "session-1",
   );
+
+  // The page renders the FinalSummaryPanel by including it as a
+  // child element with the correct summary prop. We check the
+  // serialized React element for the summary data.
+  const serialized = JSON.stringify(tree ?? null);
+  expect(serialized).toContain('"presentCount":2');
+  expect(serialized).toContain('"absentCount":1');
+  expect(serialized).toContain('"rosterCount":3');
+  expect(serialized).toContain("Alpha");
+  expect(serialized).toContain("Bravo");
+  expect(serialized).toContain("SV001");
+  expect(serialized).toContain("SV002");
+});
+
+// PHASE 6.6 — closed session with read failure renders null summary
+
+it("PHASE 6.6 — closed session with read failure renders null summary panel", async () => {
+  const { default: Page } = await import(
+    "@/app/classes/[classId]/attendance/page"
+  );
+
+  mockGetSession.mockResolvedValue(makeSession({ id: "teacher-1" }));
+  mockGetProfileByUserId.mockResolvedValue({
+    onboardingCompleted: true,
+    role: "teacher",
+    userId: "teacher-1",
+    fullName: "Teacher",
+    identificationCode: "TC001",
+  });
+  mockGetClassDetailForCurrentUser.mockResolvedValue(
+    makeClassDetail("teacher"),
+  );
+  mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue(
+    makeAttendanceStatus("closed"),
+  );
+  mockGetAttendanceFinalSummaryForCurrentTeacher.mockResolvedValue({
+    ok: false,
+    code: "ATTENDANCE_SUMMARY_READ_FAILED",
+    message: "boom",
+  });
+
+  const params = Promise.resolve({ classId: "class-1" });
+  const tree = await Page({ params });
+
+  expect(mockRedirect).not.toHaveBeenCalled();
+  const serialized = JSON.stringify(tree ?? null);
+  // The null summary is passed to the panel.
+  expect(serialized).toContain('"summary":null');
 });
 
 // Test 43: unauthenticated redirects to login

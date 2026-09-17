@@ -2,6 +2,7 @@
  * AttendanceMark Mongoose model.
  *
  * PHASE 6.4 — IDEMPOTENT PRESENT ATTENDANCE MARKS.
+ * PHASE 6.6 — ATTENDANCE SESSION FINALIZATION (adds absent + session_finalization).
  *
  * Collection: `attendance_marks`.
  *
@@ -78,23 +79,39 @@ import mongoose, {
 /**
  * AttendanceMark status enum.
  *
- * PHASE 6.4 introduces ONLY the `"present"` value. Absent / late /
- * excused / manual override are deliberate non-features in this
- * phase — they belong to a later phase.
+ * PHASE 6.6 extends the MVP Phase 6.4 "present" value with the
+ * "absent" value. Both values are now supported. Absent marks are
+ * created by the session-finalization flow when the teacher stops
+ * an active session — every roster student who does NOT have a
+ * present mark receives an absent mark sourced from
+ * "session_finalization". Late / excused / manual override are
+ * deliberate non-features in this phase — they belong to a later
+ * phase.
  */
-export const ATTENDANCE_MARK_STATUSES = ["present"] as const;
+export const ATTENDANCE_MARK_STATUSES = ["present", "absent"] as const;
 export type AttendanceMarkStatus =
   (typeof ATTENDANCE_MARK_STATUSES)[number];
 
 /**
  * AttendanceMark source enum.
  *
- * PHASE 6.4 introduces ONLY the `"face_recognition"` value. The
- * only path that creates marks is the authenticated, server-side
- * face recognition pipeline after `FACE_MATCH_THRESHOLD` has
- * been satisfied by the Face Service.
+ * PHASE 6.4 introduced the "face_recognition" value — the only
+ * path that creates marks is the authenticated, server-side face
+ * recognition pipeline after `FACE_MATCH_THRESHOLD` has been satisfied.
+ *
+ * PHASE 6.6 adds the "session_finalization" value — when the teacher
+ * stops an active attendance session, every roster student who does
+ * NOT have a present mark receives an absent mark sourced from
+ * "session_finalization". Absent marks are created by the
+ * session-finalization logic inside `stopAttendanceSessionAction`.
+ *
+ * Manual override / teacher mark / late are deliberate non-features
+ * in this phase.
  */
-export const ATTENDANCE_MARK_SOURCES = ["face_recognition"] as const;
+export const ATTENDANCE_MARK_SOURCES = [
+  "face_recognition",
+  "session_finalization",
+] as const;
 export type AttendanceMarkSource =
   (typeof ATTENDANCE_MARK_SOURCES)[number];
 
@@ -147,7 +164,7 @@ const AttendanceMarkSchema = new Schema<AttendanceMarkAttrs>(
       enum: {
         values: ATTENDANCE_MARK_STATUSES,
         message:
-          "status must be one of: present.",
+          "status must be one of: present, absent.",
       },
       required: true,
       default: "present",
@@ -162,7 +179,7 @@ const AttendanceMarkSchema = new Schema<AttendanceMarkAttrs>(
       enum: {
         values: ATTENDANCE_MARK_SOURCES,
         message:
-          "source must be one of: face_recognition.",
+          "source must be one of: face_recognition, session_finalization.",
       },
       required: true,
       default: "face_recognition",

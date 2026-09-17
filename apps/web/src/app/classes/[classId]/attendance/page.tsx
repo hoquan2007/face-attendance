@@ -1,28 +1,20 @@
 /**
  * `/classes/[classId]/attendance` — live face recognition +
- * persisted present state.
+ * persisted present state (active) OR final attendance summary (closed).
  *
- * PHASE 6.4 — IDEMPOTENT PRESENT ATTENDANCE MARKS +
- * LIVE PRESENT STATE.
+ * PHASE 6.4 — IDEMPOTENT PRESENT ATTENDANCE MARKS + LIVE PRESENT STATE.
+ * PHASE 6.6 — ATTENDANCE SESSION FINALIZATION (adds closed-session final summary).
  *
- * Server Component shell. Teacher-only. Requires an ACTIVE
- * attendance session. If no active session exists: redirects
- * safely back to `/classes/[classId]`.
- *
- * PHASE 6.4 extends the PHASE 6.3 live preview shell so the
- * Server Component reads the persisted PRESENT state via the
- * server-only `getAttendancePresentStateForCurrentTeacher`
- * boundary. The Client Component is unchanged on the camera
- * side — it continues to drive `/api/attendance/recognize` and
- * triggers `router.refresh()` on a successful scan so the
- * Server Component re-fetches the persisted state.
+ * Server Component shell. Teacher-only.
  *
  * Entry guard chain:
  *   - no session        → redirect /login
  *   - profile incomplete → redirect /onboarding
  *   - CLASS_NOT_ACCESSIBLE / malformed classId → notFound()
  *   - student viewer    → notFound() (teachers only)
- *   - no active session → redirect to /classes/[classId]
+ *   - no session / NONE state → redirect to /classes/[classId]
+ *   - ACTIVE session → render live camera + persisted present state
+ *   - CLOSED session → render final attendance summary
  *
  * This page does NOT:
  *   - Create attendance marks directly (the recognize route does)
@@ -31,6 +23,9 @@
  *   - Expose studentUserId, candidateKey, embedding, centroid,
  *     FaceProfile id, membershipId, teacherUserId, or biometric
  *     data to the browser
+ *   - Allow manual attendance editing
+ *   - Implement late marks
+ *   - Implement Excel export
  */
 
 import { notFound, redirect } from "next/navigation";
@@ -43,22 +38,31 @@ import {
 import {
   getAttendanceSessionStatusForCurrentTeacher,
 } from "@/lib/attendance/attendance-session-status-read-service";
-import { getAttendancePresentStateForCurrentTeacher } from "@/lib/attendance/attendance-present-state-read-service";
+import {
+  getAttendancePresentStateForCurrentTeacher,
+} from "@/lib/attendance/attendance-present-state-read-service";
+import {
+  getAttendanceFinalSummaryForCurrentTeacher,
+} from "@/lib/attendance/attendance-final-summary-read-service";
 import { AttendanceCameraClient } from "@/components/classes/attendance-camera-client";
 import { AttendancePresentStatePanel } from "@/components/classes/attendance-present-state-panel";
+import { AttendanceFinalSummaryPanel } from "@/components/classes/attendance-final-summary-panel";
 import { PageContainer } from "@/components/layout/PageContainer";
 import { PageHeader } from "@/components/layout/PageHeader";
 
 export const metadata = {
-  title: "Live Attendance — Face Recognition",
+  title: "Attendance — Face Recognition",
 };
 
 /**
- * Server Component that renders the live attendance camera page
- * with the persisted present state panel.
+ * Server Component that renders the attendance page.
  *
- * Authorization: teacher with ACTIVE attendance session.
- * Redirects to /classes/[classId] if no active session exists.
+ * Authorization: teacher.
+ *
+ * Behavior:
+ *   - ACTIVE session → live camera + persisted present state
+ *   - CLOSED session → final attendance summary
+ *   - NONE state → redirect to /classes/[classId]
  */
 export default async function AttendanceLivePage({
   params,
@@ -87,13 +91,11 @@ export default async function AttendanceLivePage({
     ) {
       notFound();
     }
-    // CLASS_READ_FAILED → notFound() for safety.
     notFound();
   }
 
   // ---- 4. Teacher-only gate ----
   if (classResult.result.role !== "teacher") {
-    // Students cannot access this page.
     notFound();
   }
 
@@ -101,27 +103,45 @@ export default async function AttendanceLivePage({
   const attendanceResult =
     await getAttendanceSessionStatusForCurrentTeacher(classId);
   if (!attendanceResult.ok) {
-    // Attendance read failed — redirect back to class detail.
     redirect(`/classes/${classId}`);
   }
 
-  // ---- 6. ACTIVE session required ----
-  if (attendanceResult.result.state !== "active" || !attendanceResult.result.session) {
-    // No active session — redirect back to class detail.
+  // ---- 6. Route based on session state ----
+  if (attendanceResult.result.state === "none" || !attendanceResult.result.session) {
+    // No session ever existed — redirect to class detail.
     redirect(`/classes/${classId}`);
   }
 
+  if (attendanceResult.result.state === "closed") {
+    // PHASE 6.6: CLOSED session → render final attendance summary.
+    const sessionId = attendanceResult.result.session.id;
+    const finalResult = await getAttendanceFinalSummaryForCurrentTeacher(
+      classId,
+      sessionId,
+    );
+
+    const summary = finalResult.ok
+      ? finalResult.result
+      : null;
+
+    return (
+      <PageContainer size="default">
+        <PageHeader
+          title="Attendance Summary"
+          description={`Final attendance for ${classResult.result.class.name}`}
+          as="h1"
+        />
+
+        <AttendanceFinalSummaryPanel summary={summary} />
+      </PageContainer>
+    );
+  }
+
+  // ACTIVE session — render live camera + present state
   // ---- 7. Read the persisted present state for the active session ----
-  // The read boundary is the source of truth for the persisted
-  // "recorded present" list. It NEVER falls back to the latest
-  // camera response and NEVER queries current Profiles for
-  // display identity.
   const presentStateResult =
     await getAttendancePresentStateForCurrentTeacher(classId);
 
-  // The read is expected to succeed because we just verified
-  // an active session exists. On any failure we render an
-  // empty present panel — the camera UI remains usable.
   const presentState = presentStateResult.ok
     ? presentStateResult.result
     : {

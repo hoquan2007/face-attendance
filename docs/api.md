@@ -1,5 +1,9 @@
 # API
 
+> Status: **Phase 6.6** — ATTENDANCE SESSION FINALIZATION + ABSENT FINALIZATION + FINAL SUMMARY. PHASE 6.6 EXTENDS the existing `stopAttendanceSessionAction(input)` Server Action so that, after the atomic CAS-closes the session (PHASE 6.1E invariant preserved), the action additionally invokes the server-only `finalizeAbsentMarksForClosedSession({ sessionId, classId })` primitive. That service compares the immutable `AttendanceSession.rosterSnapshot` against existing PRESENT marks and creates one ABSENT mark per unmatched snapshot student with `source: "session_finalization"` and a server-side `finalizedAt` timestamp. The `(sessionId, studentUserId)` compound unique index continues to be the authoritative idempotency guard — repeated finalization creates ZERO duplicate rows. PHASE 6.6 introduces a NEW server-only Teacher read boundary `getAttendanceFinalSummaryForCurrentTeacher(classId, sessionId)` that returns the immutable final summary (Present / Absent / Total counters and a rosterSnapshot-ordered student list) to the authenticated Teacher; the read boundary projects ONLY safe historical identity (fullName, identificationCode, status, recognizedAt) and never exposes internal IDs or biometric data. PHASE 6.6 does NOT introduce any new HTTP / REST route, any new Server Action endpoint, or any new Server-Component route (the existing `/classes/[classId]/attendance` Server Component renders the new `AttendanceFinalSummaryPanel` when the latest session is `closed`). PHASE 6.6 does NOT implement Late, manual editing, attendance history, or Excel / CSV / XLSX export.
+
+> Status: **Phase 6.5** — CONTROLLED CONTINUOUS FACE SCANNING + BACKPRESSURE + SESSION-AWARE AUTO STOP. PHASE 6.5 EXTENDS the browser-side `AttendanceCameraClient` with a teacher-STARTED auto-scan loop that REUSES the Phase 6.4 `POST /api/attendance/recognize` end-to-end — the route's request/response shape is unchanged. The loop is rate-limited by a single named constant `AUTO_SCAN_INTERVAL_MS` in the Client Component source (a conservative ~1.8 s cap on the gap between consecutive scans), and a synchronous in-flight ref guard ensures AT MOST ONE recognize request is in flight at any moment — manual and auto scans share one guard. Auto scanning is EXPLICITLY teacher-started (Start auto scan button), NEVER auto-begins after `Enable camera`. Auto scan STOPS automatically on session-closed (existing safe response), no-recognition-candidates (existing safe response), MediaStreamTrack ended, Stop camera, unmount, and explicit Stop auto scan. The existing privacy / Face Service boundaries are UNCHANGED. PHASE 6.5 does NOT add a new REST endpoint, does NOT modify the recognize route, does NOT modify the Face Service, and does NOT introduce `absent` / `late` / history / export.
+
 > Status: **Phase 6.4** — IDEMPOTENT PRESENT ATTENDANCE MARKS + LIVE PRESENT STATE. PHASE 6.4 EXTENDS `POST /api/attendance/recognize` so that a Face Service match above `FACE_MATCH_THRESHOLD` becomes a persisted `attendance_marks` document with `status: "present"` and `source: "face_recognition"`. After Face Service returns, the route: (1) records a server recognition decision timestamp, (2) defensively deduplicates matched student user ids, (3) **performs a final active-session recheck**, (4) if the session is still active, persists matched students idempotently using `$setOnInsert` against the `(sessionId, studentUserId)` compound unique index. The response now also includes `recordedCount` and `alreadyRecordedCount` so the browser can reconcile. The same student appearing in a second frame does NOT create a second mark and does NOT update `recognizedAt` — the FIRST accepted recognition time wins. PHASE 6.4 ALSO adds a new server-only Teacher read boundary `getAttendancePresentStateForCurrentTeacher(classId)` that loads `AttendanceSession.rosterSnapshot` and the session's `attendance_marks`, maps `mark.studentUserId` back through the snapshot, and returns a safe DTO `{ sessionId, rosterCount, presentCount, students: [{ fullName, identificationCode, recognizedAt }] }` sorted `recognizedAt` ASC. The `/classes/[classId]/attendance` Server Component consumes this read boundary. PHASE 6.4 does NOT add a public `POST /api/attendance/mark-present` endpoint, does NOT add `absent` / `late` / manual-override states, does NOT persist `embedding` / `centroid` / `candidateKey` / `studentUserId` into the browser-visible DTO, and does NOT add continuous recognition (no `setInterval` / `requestAnimationFrame`). See `## Phase 6.4 — Idempotent Present Attendance Marks` below for the explicit phase statement.
 
 > Status: **Phase 6.3** — LIVE FACE RECOGNITION PREVIEW. PHASE 6.3 added the camera workspace on `/classes/[classId]/attendance` and the authenticated Route Handler `POST /api/attendance/recognize`. The handler authenticates the teacher, validates class ownership, validates an ACTIVE AttendanceSession, builds a snapshot-scoped ephemeral recognition gallery (decrypting `FaceProfile` centroids server-side only), and calls the Face Service identify endpoint. The response carries ONLY safe display data (`fullNameSnapshot`, `identificationCodeSnapshot`). PHASE 6.3 does NOT create attendance marks, does NOT persist raw images / embeddings / centroids, and does NOT mutate the AttendanceSession roster snapshot.
@@ -99,7 +103,7 @@ Base URL: `${NEXT_PUBLIC_APP_URL}`
 | `/api/classes/join` | Join with `classCode` + `classPassword`. | 5 |
 | `/api/classes/:id/members` | Manage members (teacher only). | 5 |
 | `/api/classes/:id/attendance/sessions` | Create / list sessions. | 6 |
-| `/api/attendance/sessions/:id/recognize` | Teacher submits sampled frames; returns safe per-face preview + idempotent PRESENT mark counts (`recordedCount`, `alreadyRecordedCount`). Final pre-write active-session recheck enforced; closed sessions create NO new marks. **PHASE 6.4** extends this handler to persist `attendance_marks`. | 6.4 |
+| `/api/attendance/sessions/:id/recognize` | Teacher submits sampled frames; returns safe per-face preview + idempotent PRESENT mark counts (`recordedCount`, `alreadyRecordedCount`). Final pre-write active-session recheck enforced; closed sessions create NO new marks. **PHASE 6.4** extends this handler to persist `attendance_marks`. **PHASE 6.5** does NOT modify this endpoint — the auto-scan loop in `AttendanceCameraClient` reuses this route unchanged, with browser-side rate-limiting (`AUTO_SCAN_INTERVAL_MS`) and a synchronous in-flight guard (`scanInFlightRef`) shared by manual and auto scans. | 6.4 |
 | `/api/attendance/sessions/:id/end` | Stop a session. | 6 |
 | `/api/attendance/sessions/:id/export` | Stream `.xlsx` (ExcelJS). | 8 |
 | `/api/attendance/sessions/:id/history` | Session detail / history view. | 8 |
@@ -2423,3 +2427,204 @@ PHASE 6.4 explicitly does NOT introduce:
   collection (the roster snapshot remains immutable).
 - A mutation to `FaceProfile`.
 - A mutation to `Class` / `ClassMembership` / `Profile`.
+
+## Phase 6.6 — Attendance Session Finalization + Absent Finalization + Final Summary HTTP / REST / UI surface
+
+PHASE 6.6 EXTENDS the existing server-only Server Action and
+the existing Server Component route. There is NO new HTTP / REST
+endpoint, NO new Server Action endpoint, and NO new Server-
+Component route.
+
+### `stopAttendanceSessionAction(input)` *(Server Action — extended)*
+
+`stopAttendanceSessionAction(input)` is the existing
+`apps/web/src/lib/attendance/stop-attendance-session-action.ts`
+PHASE 6.1E Server Action. PHASE 6.6 extends it so the action:
+
+1. Authenticates the Teacher and gates on
+   `onboardingCompleted === true` and `role === "teacher"`
+   (PHASE 6.1E invariant preserved).
+2. Validates the browser-supplied `classId` (only ever 24-hex;
+   Zod `.strict()` strips any smuggled keys).
+3. Authorizes the requested class via
+   `ClassModel.findOne({ _id: classId, teacherUserId })` (teacher
+   owner only).
+4. Performs the atomic CAS via
+   `closeActiveAttendanceSessionForClass(classId)` — the single
+   `findOneAndUpdate({ _id, status: "active" }, { $set: {
+   status: "closed", endedAt: <server current time> } })` call.
+5. **PHASE 6.6 NEW** — calls
+   `finalizeAbsentMarksForClosedSession({ sessionId, classId })`
+   to materialize one ABSENT mark per roster student in the
+   immutable `rosterSnapshot` who lacks a PRESENT mark.
+   Finalization failure does NOT fail the stop action (the
+   session is already closed; finalization will be retried on the
+   next idempotent stop call).
+6. Returns the safe discriminated-union result. On success, the
+   `session` field now also carries `finalizedAt` (ISO 8601) and
+   `absentCount` (integer). On already-stopped retried calls the
+   same fields are surfaced so the browser can render the final
+   summary consistently.
+
+#### Action result (success — extended in PHASE 6.6)
+
+```json
+{
+  "ok": true,
+  "alreadyStopped": false,
+  "session": {
+    "id": "65f000000000000000000fff",
+    "classId": "65f000000000000000000abc",
+    "status": "closed",
+    "startedAt": "2026-09-16T10:00:00.000Z",
+    "endedAt":   "2026-09-16T10:42:00.000Z",
+    "rosterCount": 25,
+    "finalizedAt": "2026-09-16T10:42:01.000Z",
+    "absentCount": 7
+  }
+}
+```
+
+Idempotent retries surface `alreadyStopped: true` with the same
+`finalizedAt` and `absentCount` (or with `finalizedAt` /
+`absentCount` undefined when the read happened after a
+finalization failure).
+
+### Final attendance read boundary (NEW — not a Server Action)
+
+`getAttendanceFinalSummaryForCurrentTeacher(classId, sessionId)`
+lives in
+`apps/web/src/lib/attendance/attendance-final-summary-read-service.ts`.
+
+It is NOT a Server Action and NOT a Route Handler. It is a
+plain `async` server-only function imported by the Server
+Component `apps/web/src/app/classes/[classId]/attendance/page.tsx`.
+
+#### Function signature (PHASE 6.6)
+
+```ts
+export async function getAttendanceFinalSummaryForCurrentTeacher(
+  classId: string,
+  sessionId: string,
+): Promise<
+  | { ok: true; result: SafeAttendanceFinalSummaryDto }
+  | { ok: false; code: AttendanceFinalSummaryErrorCode; message: string }
+>;
+```
+
+#### Safe DTO (PHASE 6.6)
+
+```ts
+type SafeAttendanceFinalStudentDto = {
+  fullName: string;
+  identificationCode: string;
+  status: "present" | "absent";
+  recognizedAt: string | null;
+};
+
+type SafeAttendanceFinalSummaryDto = {
+  session: {
+    id: string;
+    startedAt: string;
+    endedAt: string | null;
+    rosterCount: number;
+  };
+  presentCount: number;
+  absentCount: number;
+  students: SafeAttendanceFinalStudentDto[];
+};
+```
+
+The DTO NEVER carries: `studentUserId`, `AttendanceMark._id`,
+`teacherUserId`, `membershipId`, `classId` (top-level),
+`sessionId` (raw ObjectId), `source`, biometric data, embeddings,
+centroids, raw images, `candidateKey`, `passwordHash`.
+
+#### Error codes (PHASE 6.6)
+
+| Code | Condition |
+| --- | --- |
+| `UNAUTHENTICATED` | No Better Auth session. |
+| `PROFILE_INCOMPLETE` | Profile missing or `onboardingCompleted !== true`. |
+| `TEACHER_REQUIRED` | `profile.role !== "teacher"`. |
+| `CLASS_NOT_ACCESSIBLE` | Malformed `classId`, missing class, or wrong teacher. |
+| `ATTENDANCE_SESSION_NOT_FOUND` | No AttendanceSession with the supplied `_id`. |
+| `ATTENDANCE_SESSION_NOT_CLOSED` | AttendanceSession exists but is still `active`. |
+| `ATTENDANCE_SUMMARY_READ_FAILED` | Any unexpected DB / read failure (folded safely). |
+
+### `/classes/[classId]/attendance` *(Server Component — extended)*
+
+The existing PHASE 6.5 Server Component at
+`apps/web/src/app/classes/[classId]/attendance/page.tsx`
+is extended so that:
+
+- if the latest session is `active`, the page renders the
+  existing `AttendanceCameraClient` + `AttendancePresentStatePanel`
+  (PHASE 6.4 / 6.5 behavior preserved verbatim);
+- if the latest session is `closed`, the page additionally
+  calls `getAttendanceFinalSummaryForCurrentTeacher(classId,
+  sessionId)` and renders the new
+  `AttendanceFinalSummaryPanel` (a Server Component) with the
+  safe DTO;
+- if the latest session is `none`, the page redirects back to
+  `/classes/[classId]` (existing PHASE 6.2 redirect).
+
+There is NO new route, NO new Server Action, and NO new HTTP
+endpoint.
+
+### Finalization write primitive (NEW — not an API surface)
+
+`finalizeAbsentMarksForClosedSession({ sessionId, classId })`
+lives in `apps/web/src/lib/attendance/attendance-mark-service.ts`.
+
+It is NOT a Server Action, NOT a Route Handler, and NOT a
+Client Component import. It is invoked only by
+`stopAttendanceSessionAction` after the atomic CAS-closes the
+session. It writes one ABSENT mark per
+`(sessionId, studentUserId)` pair from the session's immutable
+`rosterSnapshot` that does NOT already carry a mark. Writes are
+idempotent via the `$setOnInsert` upsert + unique
+`(sessionId, studentUserId)` index.
+
+| Failure | Action |
+| --- | --- |
+| session missing | throws `ATTENDANCE_SESSION_NOT_FOUND_FOR_FINALIZATION` |
+| session not closed | throws `SESSION_NOT_CLOSED` |
+| classId mismatch | throws `ATTENDANCE_SESSION_NOT_FOUND_FOR_FINALIZATION` |
+| malformed `sessionId` | throws `INVALID_SESSION_ID` |
+| `E11000` race | folded into idempotent success (no throw) |
+| unrecognized DB error | rethrown |
+
+### Mark-listing primitive (NEW — internal)
+
+`listAllAttendanceMarksForSession(sessionId)` lives in
+`apps/web/src/lib/attendance/attendance-mark-service.ts`. It is
+NOT an API surface. It is used by the final summary read
+boundary to enumerate present + absent marks sorted by the
+session's `rosterSnapshot` order.
+
+### PHASE 6.6 explicitly does NOT introduce
+
+- Any new HTTP / REST endpoint (the recognize route remains
+  the ONLY attendance REST endpoint).
+- Any new Server Action endpoint.
+- Any new `app/api/...` route segment.
+- Any new attendance UI sub-route (no
+  `/classes/[classId]/attendance/history`, no
+  `/classes/[classId]/attendance/export`).
+- A `late` / `excused` / `manual` / `teacher_override`
+  attendance state or `source` value.
+- A manual attendance editing UI (no Absent ↔ Present
+  controls, no checkboxes, no override actions).
+- An attendance history / multiple-session browser.
+- An Excel / CSV / XLSX export.
+- A Face Service call. PHASE 6.6 makes ZERO Face Service
+  calls.
+- Any biometric / embedding / raw image persistence.
+- Any mutation to `Class`, `ClassMembership`, `Profile`,
+  `FaceProfile`, `face_enrollment_sessions`.
+- A mutation to the existing recognize route body, the
+  existing Server Actions' authorization / class lookup, or
+  the existing `(sessionId, status: "active")` partial
+  unique index on `attendance_sessions`.
+- A mutation to Better Auth configuration.

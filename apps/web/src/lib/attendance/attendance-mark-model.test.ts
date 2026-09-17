@@ -2,6 +2,7 @@
  * Schema tests for the AttendanceMark Mongoose model.
  *
  * PHASE 6.4 — IDEMPOTENT PRESENT ATTENDANCE MARKS.
+ * PHASE 6.6 — ATTENDANCE SESSION FINALIZATION (absent + session_finalization).
  *
  * These tests inspect the Mongoose schema (collection name,
  * required fields, status enum, source enum, unique compound
@@ -12,10 +13,12 @@
  * Covers:
  *   1. attendance_marks model is server-only
  *   2. required sessionId / classId / studentUserId fields
- *   3. status only "present"
+ *   3. (PHASE 6.4 + 6.6) status supports "present" AND "absent"
  *   4. recognizedAt stored
- *   5. source face_recognition
+ *   5. (PHASE 6.4 + 6.6) source supports "face_recognition" AND "session_finalization"
  *   6. unique sessionId + studentUserId index
+ *   7. (PHASE 6.6) "late" status NOT supported
+ *   8. (PHASE 6.6) "manual" / "excused" sources NOT supported
  */
 
 import { describe, expect, it } from "vitest";
@@ -103,19 +106,34 @@ describe("AttendanceMark model / required fields", () => {
 });
 
 // =============================================================================
-// 3 — status enum
+// 3 — status enum (PHASE 6.4 + 6.6)
 // =============================================================================
 
 describe("AttendanceMark model / status enum", () => {
-  it("3. status only supports 'present' (no absent/late/excused)", () => {
-    expect(ATTENDANCE_MARK_STATUSES).toEqual(["present"]);
+  it("3a. status supports 'present' (PHASE 6.4)", () => {
+    expect(ATTENDANCE_MARK_STATUSES).toContain("present");
+  });
+
+  it("3b. status supports 'absent' (PHASE 6.6)", () => {
+    expect(ATTENDANCE_MARK_STATUSES).toContain("absent");
+  });
+
+  it("3c. status does NOT support 'late'", () => {
+    expect(ATTENDANCE_MARK_STATUSES).not.toContain("late");
+  });
+
+  it("3d. status does NOT support 'excused'", () => {
+    expect(ATTENDANCE_MARK_STATUSES).not.toContain("excused");
+  });
+
+  it("3e. status enum values match schema (present + absent)", () => {
     const statusPath = AttendanceMarkModel.schema.path("status");
     const enumOption = (statusPath as unknown as { options: { enum?: unknown } })
       .options.enum;
     const enumValues: readonly string[] = Array.isArray(enumOption)
       ? (enumOption as readonly string[])
       : ((enumOption as { values: readonly string[] }).values ?? []);
-    expect(enumValues).toEqual(["present"]);
+    expect(enumValues).toEqual(["present", "absent"]);
   });
 });
 
@@ -135,19 +153,34 @@ describe("AttendanceMark model / recognizedAt", () => {
 });
 
 // =============================================================================
-// 5 — source enum
+// 5 — source enum (PHASE 6.4 + 6.6)
 // =============================================================================
 
 describe("AttendanceMark model / source enum", () => {
-  it("5. source only supports 'face_recognition'", () => {
-    expect(ATTENDANCE_MARK_SOURCES).toEqual(["face_recognition"]);
+  it("5a. source supports 'face_recognition' (PHASE 6.4)", () => {
+    expect(ATTENDANCE_MARK_SOURCES).toContain("face_recognition");
+  });
+
+  it("5b. source supports 'session_finalization' (PHASE 6.6)", () => {
+    expect(ATTENDANCE_MARK_SOURCES).toContain("session_finalization");
+  });
+
+  it("5c. source does NOT support 'manual'", () => {
+    expect(ATTENDANCE_MARK_SOURCES).not.toContain("manual");
+  });
+
+  it("5d. source does NOT support 'teacher_override'", () => {
+    expect(ATTENDANCE_MARK_SOURCES).not.toContain("teacher_override");
+  });
+
+  it("5e. source enum values match schema (face_recognition + session_finalization)", () => {
     const sourcePath = AttendanceMarkModel.schema.path("source");
     const enumOption = (sourcePath as unknown as { options: { enum?: unknown } })
       .options.enum;
     const enumValues: readonly string[] = Array.isArray(enumOption)
       ? (enumOption as readonly string[])
       : ((enumOption as { values: readonly string[] }).values ?? []);
-    expect(enumValues).toEqual(["face_recognition"]);
+    expect(enumValues).toEqual(["face_recognition", "session_finalization"]);
   });
 });
 

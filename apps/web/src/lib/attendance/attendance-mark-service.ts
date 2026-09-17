@@ -2,6 +2,7 @@
  * AttendanceMark service layer.
  *
  * PHASE 6.4 — IDEMPOTENT PRESENT ATTENDANCE MARKS.
+ * PHASE 6.6 — ATTENDANCE SESSION FINALIZATION (adds absent marks + session_finalization).
  *
  * Server-only module. Encapsulates all reads and writes against
  * the `attendance_marks` collection. The route handler
@@ -95,6 +96,17 @@ export const ATTENDANCE_MARK_ERROR_CODES = {
    * no `E11000`, no collection name.
    */
   ATTENDANCE_MARK_WRITE_FAILED: "ATTENDANCE_MARK_WRITE_FAILED",
+  /**
+   * PHASE 6.6: Attempted to record an absent mark for a session
+   * that is still ACTIVE. Absent marks may only be created during
+   * session finalization (when the session is already closed).
+   */
+  SESSION_NOT_CLOSED: "SESSION_NOT_CLOSED",
+  /**
+   * PHASE 6.6: The session was not found for finalization.
+   */
+  ATTENDANCE_SESSION_NOT_FOUND_FOR_FINALIZATION:
+    "ATTENDANCE_SESSION_NOT_FOUND_FOR_FINALIZATION",
 } as const;
 
 export type AttendanceMarkErrorCode =
@@ -304,11 +316,109 @@ export interface RecordAttendanceMarksResult {
 }
 
 /**
+ * PHASE 6.6 — STOP / RECOGNITION RACE RECONCILIATION.
+ *
+ * Reads the session's `endedAt` value for the race-reconciliation
+ * check. The function loads the session document (which may be
+ * ACTIVE or CLOSED) and returns its `endedAt` or `null`.
+ *
+ * This is an INTERNAL helper used ONLY by the race-reconciliation
+ * path. It is NOT the authoritative "is session ACTIVE" check —
+ * `isAttendanceSessionStillActive` is the gate for the initial
+ * recognition acceptance.
+ */
+async function readSessionEndedAt(
+  sessionId: Types.ObjectId,
+): Promise<Date | null> {
+  const doc = await AttendanceSessionModel.findOne({ _id: sessionId })
+    .select({ endedAt: 1 })
+    .lean<{ endedAt: Date | null } | null>()
+    .exec();
+  return doc?.endedAt ?? null;
+}
+
+/**
+ * PHASE 6.6 — STOP / RECOGNITION RACE RECONCILIATION.
+ *
+ * Atomic conditional conversion of an Absent mark to Present.
+ *
+ * This function is the NARROW race-reconciliation path. It is
+ * called ONLY when:
+ *
+ *   1. The recognition passed the final ACTIVE-session pre-write check.
+ *   2. A `(sessionId, studentUserId)` duplicate-key collision was observed
+ *      during the initial upsert attempt.
+ *   3. The existing mark has status = "absent" AND source = "session_finalization".
+ *   4. The server-generated `recognitionDecisionAt` is not later than
+ *      the session's `endedAt` — meaning the recognition was accepted
+ *      before the session closed.
+ *
+ * If ALL conditions hold, the function performs a SINGLE atomic
+ * `findOneAndUpdate` that:
+ *   - Requires the existing mark's status = "absent" AND source = "session_finalization"
+ *   - Sets status = "present", source = "face_recognition",
+ *     recognizedAt = recognitionDecisionAt
+ *   - Returns the updated document (or null if the condition failed)
+ *
+ * If ANY condition fails, the function returns null and does NOT
+ * modify the document.
+ *
+ * The function is server-only and does NOT introduce a transaction.
+ * The unique `(sessionId, studentUserId)` index is the authoritative
+ * safety net.
+ */
+async function reconcileAbsentToPresentIfEligible(params: {
+  sessionId: Types.ObjectId;
+  studentUserId: string;
+  recognitionDecisionAt: Date;
+  endedAt: Date;
+}): Promise<boolean> {
+  const { sessionId, studentUserId, recognitionDecisionAt, endedAt } = params;
+
+  // Pre-flight check: recognitionDecisionAt must NOT be after endedAt.
+  // If the session closed before the recognition was accepted, do not reconcile.
+  if (recognitionDecisionAt > endedAt) {
+    return false;
+  }
+
+  try {
+    const result = await AttendanceMarkModel.findOneAndUpdate(
+      {
+        sessionId,
+        studentUserId,
+        status: "absent",
+        source: "session_finalization",
+      },
+      {
+        $set: {
+          status: "present" as AttendanceMarkStatus,
+          source: "face_recognition",
+          recognizedAt: recognitionDecisionAt,
+        },
+      },
+      {
+        new: true,
+        includeResultMetadata: true,
+      },
+    );
+    if (!result) {
+      // The existing mark no longer matches the conditions
+      // (concurrent modification, or was already converted).
+      return false;
+    }
+    return true;
+  } catch {
+    // Any error means the reconciliation failed — treat as no-op.
+    return false;
+  }
+}
+
+/**
  * Idempotently records PRESENT attendance marks for the supplied
  * `studentUserId` values within the active AttendanceSession
  * identified by `sessionId`.
  *
- * The function:
+ * ## Normal path (no race)
  *
  *   1. Reads the immutable `rosterSnapshot` for the active
  *      session. If the session is no longer active, throws
@@ -319,9 +429,10 @@ export interface RecordAttendanceMarksResult {
  *      because the caller may receive candidates from Face
  *      Service that we cannot reject at the route layer without
  *      leaking ids — the snapshot is the authoritative gate).
- *   3. Captures ONE server-side `recognizedAt` timestamp for the
- *      entire batch. This is the timestamp that wins for any
- *      newly created mark.
+ *   3. Uses the caller-supplied `recognitionDecisionAt` timestamp
+ *      as the batch's `recognizedAt`. This is a server-generated
+ *      value captured by the route handler after the Face Service
+ *      accepted the match.
  *   4. Iterates the filtered ids and uses `$setOnInsert` to
  *      attempt to create each mark. Existing marks are
  *      preserved verbatim — `recognizedAt` is NOT updated.
@@ -330,19 +441,50 @@ export interface RecordAttendanceMarksResult {
  *      `recognizedAt` is preserved.
  *   6. Any other Mongo error collapses to
  *      `AttendanceMarkServiceError(ATTENDANCE_MARK_WRITE_FAILED)`.
- *      The error message is intentionally generic — no stack,
- *      no `E11000`, no collection name.
  *
- * No transaction. No automatic retry. The route layer maps a
- * write failure to a controlled safe error response.
+ * ## PHASE 6.6 — Stop / Recognition race reconciliation
+ *
+ * The recognition may encounter a pre-existing Absent mark
+ * (source: "session_finalization") created by a concurrent
+ * `stopAttendanceSessionAction` that ran between the route's
+ * ACTIVE pre-write check and this write. In this case:
+ *
+ *   7. The duplicate-key collision is intercepted.
+ *   8. The existing mark is loaded and inspected:
+ *      - If status = "present" → idempotent success, preserve
+ *        existing recognizedAt.
+ *      - If status = "absent" AND source = "session_finalization":
+ *        → read the session's `endedAt`
+ *        → if `recognitionDecisionAt <= endedAt`:
+ *            atomically convert Absent → Present
+ *            recognizedAt = recognitionDecisionAt
+ *          → else: do NOT modify (recognition was after close)
+ *      - Any other status/source → idempotent no-op.
+ *
+ * This is the ONLY path that may modify a closed session's marks.
+ * It is strictly scoped to the in-flight race window. No
+ * transaction is introduced — the unique index and atomic
+ * conditional update together provide the correctness guarantee.
  *
  * The function is server-only.
  */
 export async function recordPresentAttendanceMarksForActiveSession(input: {
   sessionId: string;
   candidateStudentUserIds: string[];
+  /**
+   * PHASE 6.6: Server-generated timestamp captured by the
+   * recognition route AFTER the Face Service accepted the match
+   * and AFTER the final ACTIVE-session pre-write check.
+   * This is the "recognition decision time" used to determine
+   * whether an in-flight race can be reconciled.
+   *
+   * Must be a server-generated Date object. The caller (the
+   * recognize route) is the ONLY source — the browser NEVER
+   * supplies this value.
+   */
+  recognitionDecisionAt: Date;
 }): Promise<RecordAttendanceMarksResult> {
-  const { sessionId, candidateStudentUserIds } = input;
+  const { sessionId, candidateStudentUserIds, recognitionDecisionAt } = input;
 
   await ensureConnection();
 
@@ -356,8 +498,9 @@ export async function recordPresentAttendanceMarksForActiveSession(input: {
     rosterSnapshot,
   );
 
-  // 3. Single server-side timestamp for the batch.
-  const recognizedAtDate = new Date();
+  // 3. The batch's recognizedAt is the caller-supplied
+  //    recognitionDecisionAt (server-generated by the route).
+  const recognizedAtDate = recognitionDecisionAt;
 
   const persisted: string[] = [];
   const idempotent: string[] = [];
@@ -402,8 +545,68 @@ export async function recordPresentAttendanceMarksForActiveSession(input: {
       }
     } catch (err: unknown) {
       if (isAttendanceMarkDuplicateKeyError(err)) {
-        // Race: another concurrent path wrote the mark first.
-        // Idempotent success.
+        // ---- PHASE 6.6 RACE RECONCILIATION ----
+        // A duplicate-key collision means a mark already exists for
+        // (sessionId, studentUserId). We must inspect the existing
+        // mark to determine whether reconciliation is possible.
+        //
+        // Path A: existing is PRESENT → idempotent success.
+        // Path B: existing is ABSENT with source = session_finalization
+        //         AND recognitionDecisionAt <= endedAt → convert to Present.
+        // Path C: otherwise → idempotent no-op.
+        const existing = await AttendanceMarkModel.findOne({
+          sessionId: sessionDocId,
+          studentUserId,
+        })
+          .select({ status: 1, source: 1 })
+          .lean<{
+            status: string;
+            source: string;
+          } | null>()
+          .exec();
+
+        if (!existing) {
+          // Mark disappeared between the duplicate error and this read.
+          // Treat as idempotent — the mark either went through
+          // reconciliation in this batch or belongs to another path.
+          idempotent.push(studentUserId);
+          continue;
+        }
+
+        if (existing.status === "present") {
+          // Path A: already present — idempotent success.
+          idempotent.push(studentUserId);
+          continue;
+        }
+
+        if (
+          existing.status === "absent" &&
+          existing.source === "session_finalization"
+        ) {
+          // Path B: Absent mark created by session finalization.
+          // Read the session's endedAt to determine if reconciliation
+          // is eligible.
+          const endedAt = await readSessionEndedAt(sessionDocId);
+          if (endedAt !== null) {
+            const reconciled = await reconcileAbsentToPresentIfEligible({
+              sessionId: sessionDocId,
+              studentUserId,
+              recognitionDecisionAt: recognizedAtDate,
+              endedAt,
+            });
+            if (reconciled) {
+              // Successfully converted Absent → Present.
+              persisted.push(studentUserId);
+              continue;
+            }
+          }
+          // recognitionDecisionAt > endedAt, or endedAt is null
+          // (session still active or already converted), or
+          // reconciliation failed → do NOT modify.
+        }
+
+        // Path C: any other existing mark (arbitrary source, etc.)
+        // → idempotent no-op.
         idempotent.push(studentUserId);
         continue;
       }
@@ -559,4 +762,316 @@ export async function findAttendanceMarkById(
     .lean<AttendanceMarkAttrs | null>()
     .exec();
   return doc ?? null;
+}
+
+// =============================================================================
+// Public API — PHASE 6.6: absent mark finalization
+// =============================================================================
+
+/**
+ * Result of an idempotent batch absent-mark finalization.
+ *
+ * `createdAbsent` lists the ids whose absent mark was created in
+ * THIS call. `alreadyHadMark` lists the ids who already had a
+ * mark (present) — these are NOT overwritten.
+ */
+export interface FinalizeAbsentMarksResult {
+  /** IDs for whom an absent mark was created in this call. */
+  createdAbsent: string[];
+  /** IDs who already had a mark (present) — absent was NOT created. */
+  alreadyHadMark: string[];
+  /** The server-side timestamp used for `finalizedAt`. */
+  finalizedAt: string;
+}
+
+/**
+ * PHASE 6.6: Idempotently records ABSENT attendance marks for all
+ * roster students of a CLOSED AttendanceSession who do NOT have a
+ * present mark.
+ *
+ * ## Semantic contract
+ *
+ *   - The session MUST be CLOSED. An active session does NOT receive
+ *     absent marks — students are only marked absent when the teacher
+ *     explicitly closes the session.
+ *   - "Present wins" — a student who already has a present mark is
+ *     NEVER overwritten with absent.
+ *   - The ONLY source of students to finalize is the session's
+ *     immutable `rosterSnapshot`.
+ *   - Finalization is IDEMPOTENT — repeated calls produce the same
+ *     result without creating duplicate absent marks.
+ *
+ * ## Behavior
+ *
+ *   1. Reads the closed AttendanceSession and verifies it is CLOSED.
+ *      A session that is still ACTIVE throws
+ *      `AttendanceMarkServiceError(SESSION_NOT_CLOSED)`.
+ *   2. Loads existing PRESENT marks for the session.
+ *   3. Identifies roster students who do NOT have a present mark.
+ *   4. For each unmatched student, uses `$setOnInsert` to create
+ *      an absent mark with `status: "absent"` and
+ *      `source: "session_finalization"`.
+ *   5. Existing present marks are NEVER modified or overwritten.
+ *   6. An exact `(sessionId, studentUserId)` unique collision on an
+ *      absent mark is treated as idempotent success (no-op).
+ *   7. Any other Mongo error collapses to
+ *      `AttendanceMarkServiceError(ATTENDANCE_MARK_WRITE_FAILED)`.
+ *
+ * The function is server-only. No transaction. The unique compound
+ * index `(sessionId, studentUserId)` is the authoritative safety net.
+ *
+ * ## Inputs
+ *
+ *   - `sessionId`   — canonical ObjectId string of the closed
+ *                      AttendanceSession.
+ *   - `classId`     — canonical ObjectId string (verified against
+ *                      the session doc for safety).
+ */
+export async function finalizeAbsentMarksForClosedSession(input: {
+  sessionId: string;
+  classId: string;
+}): Promise<FinalizeAbsentMarksResult> {
+  const { sessionId, classId } = input;
+
+  await ensureConnection();
+
+  // 1. Read the closed session and verify status.
+  if (typeof sessionId !== "string" || sessionId.length !== 24) {
+    throw new AttendanceMarkServiceError({
+      code: ATTENDANCE_MARK_ERROR_CODES.INVALID_SESSION_ID,
+      message: "Invalid sessionId.",
+    });
+  }
+  if (!/^[0-9a-fA-F]{24}$/.test(sessionId)) {
+    throw new AttendanceMarkServiceError({
+      code: ATTENDANCE_MARK_ERROR_CODES.INVALID_SESSION_ID,
+      message: "Invalid sessionId.",
+    });
+  }
+
+  const sessionDoc = await AttendanceSessionModel.findOne({
+    _id: sessionId,
+  })
+    .select({
+      _id: 1,
+      classId: 1,
+      status: 1,
+      rosterSnapshot: 1,
+    })
+    .lean<{
+      _id: Types.ObjectId;
+      classId: Types.ObjectId;
+      status: string;
+      rosterSnapshot: AttendanceRosterSnapshotItemDoc[];
+    } | null>()
+    .exec();
+
+  if (!sessionDoc) {
+    throw new AttendanceMarkServiceError({
+      code: ATTENDANCE_MARK_ERROR_CODES.ATTENDANCE_SESSION_NOT_FOUND_FOR_FINALIZATION,
+      message: "Attendance session not found.",
+    });
+  }
+
+  if (sessionDoc.status !== "closed") {
+    throw new AttendanceMarkServiceError({
+      code: ATTENDANCE_MARK_ERROR_CODES.SESSION_NOT_CLOSED,
+      message: "Cannot finalize absent marks for an active session.",
+    });
+  }
+
+  // Verify classId matches (defense-in-depth).
+  if (sessionDoc.classId.toString() !== classId) {
+    throw new AttendanceMarkServiceError({
+      code: ATTENDANCE_MARK_ERROR_CODES.ATTENDANCE_SESSION_NOT_FOUND_FOR_FINALIZATION,
+      message: "Session does not belong to the specified class.",
+    });
+  }
+
+  // 2. Load existing PRESENT marks for the session.
+  const existingMarks = await AttendanceMarkModel.find({
+    sessionId,
+  })
+    .select({ studentUserId: 1, status: 1 })
+    .lean<
+      Array<{
+        studentUserId: string;
+        status: string;
+      }>
+    >()
+    .exec();
+
+  // Build a set of students who already have a mark.
+  const studentsWithMark = new Set<string>();
+  for (const mark of existingMarks) {
+    if (
+      mark.studentUserId &&
+      typeof mark.studentUserId === "string"
+    ) {
+      studentsWithMark.add(mark.studentUserId);
+    }
+  }
+
+  // 3. Identify roster students who do NOT have a present mark.
+  const rosterSnapshot = Array.isArray(sessionDoc.rosterSnapshot)
+    ? sessionDoc.rosterSnapshot
+    : [];
+
+  const studentsToMarkAbsent: AttendanceRosterSnapshotItemDoc[] = [];
+  for (const item of rosterSnapshot) {
+    if (
+      item &&
+      typeof item.studentUserId === "string" &&
+      item.studentUserId.length > 0 &&
+      !studentsWithMark.has(item.studentUserId)
+    ) {
+      studentsToMarkAbsent.push(item);
+    }
+  }
+
+  // 4. Batch-create absent marks idempotently.
+  const finalizedAtDate = new Date();
+  const created: string[] = [];
+  const alreadyHad: string[] = [];
+
+  for (const item of studentsToMarkAbsent) {
+    const studentUserId = item.studentUserId;
+    alreadyHad.push(studentUserId);
+
+    try {
+      const result = await AttendanceMarkModel.findOneAndUpdate(
+        { sessionId: sessionDoc._id, studentUserId },
+        {
+          $setOnInsert: {
+            sessionId: sessionDoc._id,
+            classId: sessionDoc.classId,
+            studentUserId,
+            status: "absent",
+            recognizedAt: finalizedAtDate,
+            source: "session_finalization",
+          },
+        },
+        {
+          upsert: true,
+          new: false,
+          includeResultMetadata: true,
+        },
+      );
+      const metadata = result as unknown as {
+        lastErrorObject?: { upserted?: unknown };
+        value?: AttendanceMarkDoc | null;
+      } | null;
+      const wasUpserted =
+        metadata?.lastErrorObject?.upserted !== undefined &&
+        metadata?.lastErrorObject?.upserted !== null;
+      if (wasUpserted) {
+        created.push(studentUserId);
+        // Remove from alreadyHad (they were newly created).
+        const idx = alreadyHad.indexOf(studentUserId);
+        if (idx !== -1) alreadyHad.splice(idx, 1);
+      }
+    } catch (err: unknown) {
+      if (isAttendanceMarkDuplicateKeyError(err)) {
+        // Race: another concurrent path wrote the mark first.
+        // Idempotent success — do not add to created.
+        continue;
+      }
+      if (err instanceof AttendanceMarkServiceError) throw err;
+      if (err instanceof mongoose.Error.ValidationError) {
+        throw new AttendanceMarkServiceError({
+          code: ATTENDANCE_MARK_ERROR_CODES.ATTENDANCE_MARK_WRITE_FAILED,
+          message: "Failed to record absent mark.",
+        });
+      }
+      throw new AttendanceMarkServiceError({
+        code: ATTENDANCE_MARK_ERROR_CODES.ATTENDANCE_MARK_WRITE_FAILED,
+        message: "Failed to record absent mark.",
+      });
+    }
+  }
+
+  return {
+    createdAbsent: created,
+    alreadyHadMark: alreadyHad,
+    finalizedAt: finalizedAtDate.toISOString(),
+  };
+}
+
+/**
+ * PHASE 6.6: Lists ALL attendance marks (present AND absent) for
+ * a given session.
+ *
+ * Used by the final summary read model to compose the complete
+ * attendance state. The function returns all marks regardless of
+ * status.
+ *
+ * Ordering: deterministic — sorted by the roster snapshot order
+ * (which is stable and set at session start). Marks are joined
+ * with the roster snapshot so absent students also appear.
+ *
+ * The function never throws on an empty result set.
+ */
+export async function listAllAttendanceMarksForSession(
+  sessionId: string | Types.ObjectId,
+): Promise<
+  Array<{
+    studentUserId: string;
+    status: string;
+    recognizedAt: string;
+  }>
+> {
+  await ensureConnection();
+
+  // Load session to get roster snapshot order.
+  const sessionDoc = await AttendanceSessionModel.findById(sessionId)
+    .select({ rosterSnapshot: 1 })
+    .lean<{
+      rosterSnapshot: AttendanceRosterSnapshotItemDoc[];
+    } | null>()
+    .exec();
+
+  if (!sessionDoc) {
+    return [];
+  }
+
+  const rosterSnapshot = Array.isArray(sessionDoc.rosterSnapshot)
+    ? sessionDoc.rosterSnapshot
+    : [];
+
+  // Build studentUserId → position map for stable ordering.
+  const positionMap = new Map<string, number>();
+  for (let i = 0; i < rosterSnapshot.length; i++) {
+    const item = rosterSnapshot[i];
+    if (item && typeof item.studentUserId === "string") {
+      positionMap.set(item.studentUserId, i);
+    }
+  }
+
+  // Load all marks.
+  const marks = await AttendanceMarkModel.find({ sessionId })
+    .select({ studentUserId: 1, status: 1, recognizedAt: 1 })
+    .lean<
+      Array<{
+        studentUserId: string;
+        status: string;
+        recognizedAt: Date;
+      }>
+    >()
+    .exec();
+
+  // Sort by roster snapshot position.
+  return [...marks]
+    .map((m) => ({
+      studentUserId: m.studentUserId,
+      status: m.status,
+      recognizedAt:
+        m.recognizedAt instanceof Date
+          ? m.recognizedAt.toISOString()
+          : new Date(m.recognizedAt as unknown as string).toISOString(),
+    }))
+    .sort((a, b) => {
+      const posA = positionMap.get(a.studentUserId) ?? Infinity;
+      const posB = positionMap.get(b.studentUserId) ?? Infinity;
+      return posA - posB;
+    });
 }

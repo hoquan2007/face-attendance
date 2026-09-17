@@ -1,5 +1,9 @@
 # Architecture
 
+> Status: **Phase 6.6** — ATTENDANCE SESSION FINALIZATION + ABSENT FINALIZATION + FINAL SUMMARY + STOP/RECOGNITION RACE RECONCILIATION. PHASE 6.6 extends the AttendanceMark model with a second `status` value `"absent"` (paired with a new `source: "session_finalization"`), so stopping an active attendance session now atomically closes the session AND finalizes the roster. Concretely: when `stopAttendanceSessionAction` is invoked, the action atomically CAS-transitions the active session to `closed` (PHASE 6.1E semantics preserved) and then calls `finalizeAbsentMarksForClosedSession(...)`. That service compares the immutable `rosterSnapshot` (the ONLY authority — current ClassMembership / Profile are never read here) against existing PRESENT marks, and creates one `absent` mark per unmatched snapshot student, using a server-side `finalizedAt` timestamp with `source: "session_finalization"`. The `(sessionId, studentUserId)` unique index is the authoritative idempotency guard — repeated stop / finalize calls are safe and produce no duplicate absent rows. A new server-only read boundary `getAttendanceFinalSummaryForCurrentTeacher(classId, sessionId)` exposes the immutable final summary (Present / Absent / Total counts and a rosterSnapshot-ordered student list) to the authenticated teacher; the read boundary projects ONLY safe historical identity (fullName, identificationCode, status, recognizedAt) and never exposes internal IDs, biometric fields, embeddings, or raw images. PHASE 6.6 also hardens the stop/recognition race: a `recognitionDecisionAt` timestamp is generated server-side by the recognize route AFTER the Face Service accepts a match and AFTER the final ACTIVE-session pre-write check. If a concurrent stop closes the session and finalizes an Absent mark for the same `(sessionId, studentUserId)`, the persistence path checks `recognitionDecisionAt <= AttendanceSession.endedAt`. If true, the Absent mark is atomically converted to Present with `source: "face_recognition"` and `recognizedAt: recognitionDecisionAt`. Recognition that arrives after `endedAt` cannot alter finalized attendance. No MongoDB transaction is introduced — the unique index and atomic conditional update together provide the correctness guarantee. PHASE 6.6 does NOT implement Late, manual editing, attendance history browsing, Excel / CSV export, or late/override/absent editing APIs.
+
+> Status: **Phase 6.5** — CONTROLLED CONTINUOUS FACE SCANNING + BACKPRESSURE + SESSION-AWARE AUTO STOP. PHASE 6.5 extends the `AttendanceCameraClient` with an EXPLICIT teacher-started auto-scan loop. Auto scan NEVER starts automatically after Enable camera; the teacher must press a dedicated Start auto scan button. The loop is self-scheduling: every scan is awaited to completion before the next scan is scheduled, with a fixed conservative `AUTO_SCAN_INTERVAL_MS` cooldown. At most ONE recognize request is in flight at any moment — manual and auto scans share a single synchronous in-flight ref guard. The loop honors `document.visibilityState` (hidden tabs pause; visible tabs resume ONLY if auto scan was active before the hide); explicit Stop auto scan, Stop camera, track-ended, session-closed, and no-recognition-candidates responses all stop the auto loop. Raw frames remain transient; no second attendance state is held in client memory; the existing Phase 6.4 recognize route is reused (no new endpoint, no Face Service changes). PHASE 6.5 does NOT add `absent` / `late` / history / export, does NOT introduce `setInterval` / `requestAnimationFrame` recognition loops, does NOT persist raw images / embeddings / centroids, and does NOT modify the Face Service threshold or matching algorithm.
+
 > Status: **Phase 6.4** — IDEMPOTENT PRESENT ATTENDANCE MARKS + LIVE PRESENT STATE. PHASE 6.4 introduces the FIRST per-student attendance persistence artifact — the `attendance_marks` collection — and the server-only Teacher read boundary that surfaces the live persisted PRESENT state on `/classes/[classId]/attendance`. The recognize route (`POST /api/attendance/recognize`) is extended so a Face Service match that has already passed `FACE_MATCH_THRESHOLD` becomes a persisted PRESENT mark; the `(sessionId, studentUserId)` compound unique index on `attendance_marks` enforces "one student = at most one mark per session" at the database layer, and a `$setOnInsert` write preserves the FIRST recognition's `recognizedAt` on subsequent recognition. A final pre-write active-session recheck is performed so a session closed mid-flight (teacher pressed Stop while the Face Service was processing) creates NO new marks. The `AttendanceCameraClient` invokes `router.refresh()` after a successful scan so the Server Component re-fetches the persisted state. PHASE 6.4 does NOT add `absent` / `late` / manual-override attendance states, does NOT add a public manual-mark API, does NOT add `setInterval` / `requestAnimationFrame` continuous recognition, and does NOT modify the Face Service matching algorithm. See `## Phase 6.4 — Idempotent Present Attendance Marks` below for the explicit phase statement.
 
 > Status: **Phase 6.3** — LIVE FACE RECOGNITION PREVIEW. PHASE 6.3 added the camera workspace on `/classes/[classId]/attendance`: the authenticated Route Handler `POST /api/attendance/recognize` authenticates the teacher, validates class ownership, validates an active AttendanceSession, builds a snapshot-scoped ephemeral recognition gallery (decrypting centroids server-side only), and calls the Face Service identify endpoint. The response carries ONLY safe display data (`fullNameSnapshot`, `identificationCodeSnapshot`). PHASE 6.3 does NOT create attendance marks, does NOT persist raw images / embeddings / centroids, does NOT mutate the AttendanceSession roster snapshot, and does NOT introduce `absent` / `late` / `confidence` / `recognizedAt`.
@@ -4267,6 +4271,474 @@ The page's teacher viewer branch:
 - Create or display `present`, `absent`, `late`, `confidence`,
   or `recognizedAt` records.
 - Add a public `/api/attendance` REST route.
+
+## Phase 6.5 — Controlled Continuous Face Scanning
+
+PHASE 6.5 extends the Phase 6.4 `AttendanceCameraClient` so the
+teacher can opt into a controlled, paced, rate-limited auto-scan
+loop on `/classes/[classId]/attendance`. Auto scanning is
+EXPLICITLY teacher-started — it NEVER begins automatically after
+the camera is enabled. The loop reuses the existing Phase 6.4
+recognize route end-to-end; no Face Service changes are
+introduced, no new REST endpoint is added, and no attendance mark
+semantics change.
+
+### User flow
+
+1. Teacher clicks **Enable camera** (`getUserMedia`).
+2. Teacher EXPLICITLY clicks **Start auto scan**.
+3. The loop fires one recognize request, awaits the response,
+   waits the cooldown, then fires the next request.
+4. Recognized students appear in the existing Phase 6.4
+   Preview; a successful new mark triggers the Phase 6.4
+   `router.refresh()` so the persisted Present list re-renders.
+5. Teacher may press **Stop auto scan** at any time. Stop camera,
+   unmount, session-closed, no-recognition-candidates, and a
+   track-ended event all also stop the loop.
+
+### Module surface (new in PHASE 6.5)
+
+| Module                                                      | Boundary                            |
+| ----------------------------------------------------------- | ----------------------------------- |
+| `components/classes/attendance-camera-client.tsx` (extended) | `"use client"` Client Component     |
+| `components/classes/attendance-camera-client.phase65.test.tsx` | Vitest test file (browser-side)     |
+
+The Client Component is the ONLY browser-side surface added. The
+phase does NOT introduce a new REST route, a new Server Action,
+a new Mongoose collection, a new environment variable, or a new
+Face Service call. The phase does NOT introduce a global state
+manager — React state + refs are sufficient.
+
+### Scan cadence
+
+- The loop is a self-scheduling async loop inside a single React
+  `useEffect`. Each iteration awaits the previous scan's
+  network round-trip, then waits the cooldown, then attempts
+  the next scan. The architecture is explicitly NOT a
+  `setInterval` and NOT a `requestAnimationFrame` loop.
+- `AUTO_SCAN_INTERVAL_MS` is a NAMED constant on the Client
+  Component source (`apps/web/src/components/classes/attendance-camera-client.tsx`)
+  with a conservative MVP value (~1.8 seconds). The constant
+  is the *minimum* gap between consecutive scans after the
+  previous network round-trip resolves.
+- Each scan's `await fetch(...)` is the actual cadence anchor;
+  the constant is consulted only AFTER the response resolves.
+
+### Backpressure (CRITICAL)
+
+- At most ONE recognize request may be in flight at any moment
+  from a single camera component. This is enforced by a single
+  synchronous `scanInFlightRef` (set BEFORE the first `await`)
+  that is shared by BOTH manual `Scan frame` clicks and the
+  auto-scan loop. Manual and auto scans therefore share one
+  in-flight guard. If the Face Service takes 3 seconds, no
+  second recognition request starts during those 3 seconds.
+- A scan attempt when `scanInFlightRef.current === true` is a
+  no-op (returns early without scheduling another request) —
+  the in-flight guard is defense-in-depth on top of the
+  loop's own self-scheduling semantics.
+- The recognize route's `AbortController` behavior is a separate
+  concern; the Client Component does NOT add its own
+  `AbortController` for cancellation of a request that was
+  already sent (we never cancel a request after dispatch; the
+  response is consumed regardless).
+
+### Manual and auto interaction
+
+- The existing `Scan frame` button remains available alongside
+  the new `Start auto scan` / `Stop auto scan` toggle. Each
+  manual click also respects the same in-flight guard — manual
+  and auto scans never overlap.
+- Both paths call the shared `performSingleScan` helper inside
+  the Client Component, which is the SINGLE place where the
+  in-flight guard is set / cleared and where `POST
+  /api/attendance/recognize` is invoked.
+
+### Result handling
+
+- Auto-scan success — the same response shape as Phase 6.4:
+  `{ facesDetected, matches, recordedCount, alreadyRecordedCount,
+  unmatchedCount }`. A `recordedCount > 0` result triggers
+  `router.refresh()` so the server-rendered Present panel
+  re-renders from the authoritative state. An idempotent-only
+  (`recordedCount === 0`) result does NOT refresh — the persisted
+  state has not changed. A no-face result (`facesDetected === 0`)
+  is normal — the loop continues after the cooldown. An
+  unmatched result is normal — the loop continues.
+- Transient safe failure (`FACE_SERVICE_ERROR`, 5xx, network
+  blip, etc.) does NOT create a rapid retry. The next scan is
+  scheduled only after the normal cooldown. No exponential
+  back-pressure hammering, no `attempt` counters.
+- Raw backend error messages are NEVER exposed. Only the safe
+  error codes returned by the existing classifier
+  (`classifyError`) reach the UI.
+
+### Session-aware auto stop
+
+The auto-scan loop unconditionally exits when ANY of these
+events fire:
+
+1. The teacher presses **Stop auto scan**.
+2. The teacher presses **Stop camera** (auto scan is implicitly
+   stopped because there is no stream to capture).
+3. The component unmounts (Next.js navigation, parent
+   re-render, …). The effect cleanup sets the cancellation
+   signal, clears any pending cooldown `setTimeout`, and stops
+   any active `MediaStream` tracks.
+4. The active `MediaStream` track emits a MediaStreamTrack
+   `ended` event. The loop exits, the camera state resets
+   safely, a restrained "camera disconnected" message is shown,
+   and the loop does NOT re-arm itself.
+5. The recognize route reports the attendance session is no
+   longer active (`SESSION_NOT_ACTIVE` /
+   `SESSION_CLASS_MISMATCH`). The existing Phase 6.4
+   `sessionClosed` state replaces the camera UI; no further
+   scans are scheduled from this page.
+6. The recognize route reports `NO_RECOGNITION_CANDIDATES`
+   (no students on the active roster have a face profile yet).
+   The loop stops and a restrained "No enrolled faces are
+   available for recognition in this session." message is
+   shown. The route is NOT polled repeatedly when recognition
+   is known to be impossible.
+
+The auto scan NEVER creates a new AttendanceSession. The
+session lifecycle is owned by `startAttendanceSessionAction` /
+`stopAttendanceSessionAction`; the auto-scan loop is a pure
+consumer.
+
+### Visibility (document hidden)
+
+- The loop reads `document.visibilityState` at the start of
+  every iteration. When the document is hidden, the loop
+  yields with a short polling delay and does NOT send
+  recognition frames — a background tab MUST NOT keep a
+  face-recognition round-trip active.
+- When the document becomes visible again, the loop resumes
+  ONLY IF the loop was active before the hide. If the teacher
+  explicitly pressed Stop auto scan during a hidden period,
+  the cancellation signal is set and the loop exits.
+- The visibility check reads `document.visibilityState`
+  directly each iteration; no cached ref is required.
+
+### Cleanup contract
+
+- On unmount: the effect cleanup sets the cancellation signal,
+  cancels any pending cooldown timer, stops all `MediaStream`
+  tracks, and prevents further state updates from the pending
+  scan. State-update calls after unmount are skipped implicitly
+  by React's "no setState after unmount" warning — the effect
+  cleanup runs BEFORE the test framework reports the test
+  complete.
+- The Client Component does NOT persist raw camera frames,
+  embeddings, centroids, or any biometric vector. The only
+  storage layer that observes recognition results is the
+  Phase 6.4 `attendance_marks` collection, populated via the
+  existing route.
+
+### Privacy / Domain isolation (PHASE 6.5 explicitly does NOT)
+
+- Persist `embedding` / `centroid` / raw image bytes.
+- Accept `studentUserId`, `teacherUserId`, `classId` /
+  `sessionId` from the browser (the recognize payload still
+  carries ONLY `classId`, `sessionId`, and the JPEG blob).
+- Talk to the Face Service directly from the browser.
+- Implement `absent` / `late` / `excused` / manual-override
+  attendance states.
+- Implement `AttendanceMark` history / export endpoints.
+- Persist a second permanent attendance state in client
+  memory. The persisted state is always the source of truth;
+  the auto-scan Preview is transient.
+- Introduce a new REST route. The recognize route is the
+  ONLY attendance REST endpoint and was added in PHASE 6.3
+  and extended in PHASE 6.4; PHASE 6.5 reuses it as-is.
+
+### Things PHASE 6.5 explicitly does NOT modify
+
+- `AttendanceMark` model or schema.
+- `AttendanceSession` model or schema.
+- The `startAttendanceSessionAction` / `stopAttendanceSessionAction`
+  Server Action semantics.
+- The recognize route authorization path.
+- Face Service threshold or matching algorithm.
+- Face enrollment, FaceProfile, or `face_profiles` collection.
+- Class authorization or Better Auth.
+
+## Phase 6.6 — Attendance Session Finalization + Absent Finalization + Final Summary
+
+PHASE 6.6 closes the attendance lifecycle. After a Teacher presses
+**Stop attendance**, the active session is atomically transitioned
+to `closed` (PHASE 6.1E CAS semantics preserved), every roster
+student in the immutable `rosterSnapshot` who does NOT have a
+PRESENT mark receives a single ABSENT mark with
+`source: "session_finalization"`, and an immutable final summary
+becomes viewable on `/classes/[classId]/attendance`.
+
+### Finalization flow
+
+1. The Teacher presses Stop attendance on the live attendance page.
+2. `stopAttendanceSessionAction` performs its single atomic
+   `findOneAndUpdate({ _id, status: "active" }, { $set: { status:
+   "closed", endedAt: <server current time> } })` CAS — phase 6.1E
+   semantics are preserved verbatim.
+3. After the CAS commits, the action calls
+   `finalizeAbsentMarksForClosedSession({ sessionId, classId })`.
+4. The service loads the closed session's `rosterSnapshot`, queries
+   all existing marks for that session (`AttendanceMarkModel.find({
+   sessionId }).lean(...)`), and computes the symmetric difference:
+   every roster student without an existing mark is added to the
+   `studentsToMarkAbsent` list.
+5. For each unmatched roster student the service performs
+   `AttendanceMarkModel.findOneAndUpdate({ sessionId, studentUserId
+   }, { $setOnInsert: { status: "absent", source:
+   "session_finalization", recognizedAt: <server current time>,
+   classId, studentUserId } }, { upsert: true, new: false,
+   includeResultMetadata: true })`. The `$setOnInsert` shape makes
+   the write idempotent: if a mark already exists (PRESENT is the
+   most defensive case), the existing mark's `recognizedAt` and
+   `status` are preserved — PRESENT always wins over ABSENT.
+6. The unique `(sessionId, studentUserId)` index on
+   `attendance_marks` is the authoritative idempotency guard. A
+   concurrent duplicate insert is folded into idempotent success
+   via the `isAttendanceMarkDuplicateKeyError(err)` classifier.
+7. The action returns `ok: true, alreadyStopped: false, session: {
+   ..., finalizedAt: <iso>, absentCount: <int> }`. Repeated stop
+   calls return `ok: true, alreadyStopped: true` with the same
+   `finalizedAt` and the count of already-existing absent marks.
+
+### Snapshot authority
+
+The ONLY source of `studentUserId` values used during
+finalization is `AttendanceSession.rosterSnapshot`. The service
+NEVER reads `ClassMembership` or `Profile`. This invariant is
+enforced both by the service (the `studentsWithMark` set is built
+purely from `rosterSnapshot`) and by the integration tests.
+
+Display identity (full name, identification code) also comes from
+the snapshot — even if a `Profile` has been updated since the
+session started, the historical snapshot values remain the
+authoritative display source.
+
+### "Present wins" semantics
+
+`finalizeAbsentMarksForClosedSession` builds a `studentsWithMark`
+set from `AttendanceMarkModel.find({ sessionId }).lean()` BEFORE
+the upsert loop. Only students NOT in this set are added to the
+`studentsToMarkAbsent` list. As a result, a PRESENT mark is
+NEVER overwritten by an ABSENT mark — the `$setOnInsert` upsert
+shape preserves any existing mark's `recognizedAt` and `status`.
+There is no scenario in which finalization can replace a PRESENT
+mark with an ABSENT mark.
+
+### Stop / Recognition race (preserved Phase 6.4 invariant)
+
+The recognize route (`POST /api/attendance/recognize`) performs a
+final active-session recheck (`isAttendanceSessionStillActive`)
+BEFORE writing. Once `stopAttendanceSessionAction` commits the
+CAS, the session is `closed` and any subsequent recognition
+attempts are rejected with `ATTENDANCE_SESSION_NOT_ACTIVE`. The
+finalization pass runs AFTER the CAS, so it operates on a closed
+session whose `rosterSnapshot` is stable. PHASE 6.6 does NOT
+weaken this cutoff.
+
+### Idempotency
+
+Stopping / finalizing the same session a second time is safe.
+The second invocation:
+
+- observes the already-closed session,
+- returns `ok: true, alreadyStopped: true`,
+- re-runs `finalizeAbsentMarksForClosedSession` (the unique index
+  prevents duplicate absent rows, and the existing-mark fast-path
+  reduces the work to a single `find()`),
+- does NOT alter `rosterSnapshot`,
+- does NOT alter `startedAt`,
+- does NOT alter the original `endedAt`.
+
+There is no time-bounded window during which a re-stop is unsafe.
+The action is keyed strictly by the immutable `(sessionId,
+studentUserId)` pair.
+
+### Final summary read model (`getAttendanceFinalSummaryForCurrentTeacher`)
+
+PHASE 6.6 introduces a server-only read boundary that surfaces
+the immutable final attendance summary for a CLOSED session to
+the authenticated Teacher of the class. The function:
+
+- Returns ONLY safe historical identity (fullName,
+  identificationCode, status, recognizedAt).
+- NEVER returns `studentUserId`, `AttendanceMark._id`,
+  `teacherUserId`, `membershipId`, `classId` (top-level),
+  `sessionId` (raw), `source`, biometric data, embeddings,
+  centroids, raw images, or `passwordHash`.
+- Requires `state === "closed"`. An ACTIVE session returns
+  `ATTENDANCE_SESSION_NOT_CLOSED`.
+- Orders results deterministically by `rosterSnapshot` order (not
+  by Mongo query order).
+- Returns `rosterCount = 0, presentCount = 0, absentCount = 0,
+  students = []` for an empty roster (defensive, non-failure).
+
+### Final summary UI (`AttendanceFinalSummaryPanel`)
+
+On `/classes/[classId]/attendance`:
+
+- if the latest session is `active`, the live camera +
+  `AttendancePresentStatePanel` is rendered (PHASE 6.4 behavior
+  preserved).
+- if the latest session is `closed`, the
+  `AttendanceFinalSummaryPanel` is rendered. The panel shows:
+  - `Present: X`, `Absent: Y`, `Total: Z` counters;
+  - a rosterSnapshot-ordered row list with `Student`,
+    `Student ID`, `Status` (visible text "Present" or "Absent"
+    — never color-only), and `Recognized at`;
+  - absent rows display `—` for `Recognized at` (no fake
+    timestamp);
+  - present rows display the formatted recognition timestamp;
+  - empty-state copy when `rosterCount = 0`.
+
+The component is a server-rendered React Server Component — no
+`"use client"`, no client hooks, no continuous scanning loop, no
+manual editing, no Excel / CSV export.
+
+### Things PHASE 6.6 explicitly does NOT modify
+
+- Face Service threshold or matching algorithm.
+- Face enrollment, FaceProfile, or `face_profiles` collection.
+- `AttendanceMark.collection` name (`attendance_marks`) or its
+  unique compound `(sessionId, studentUserId)` index.
+- The recognize route authorization path or the
+  Phase 6.4 active-session recheck invariant.
+- Class authorization or Better Auth.
+- The `FaceEngine` continuous scan cadence.
+- Vercel or any deployment platform configuration.
+
+### Things PHASE 6.6 explicitly does NOT introduce
+
+- `late` / `excused` / `manual` / `teacher_override` attendance
+  states.
+- Manual attendance editing UI (no change Absent ↔ Present
+  controls, no checkboxes, no override actions).
+- Attendance history / multiple-session browser / calendar /
+  reports pages.
+- Excel / CSV / XLSX / downloadable exports.
+- A new attendance REST route. The recognize route remains the
+  ONLY attendance REST endpoint.
+- A new client-side attendance Server Action endpoint.
+- Multi-document MongoDB transactions.
+- Browser-supplied recognition timestamps of any kind.
+
+### PHASE 6.6 Final Hardening — Stop / Recognition Race Reconciliation
+
+A concurrency race exists between the recognition flow and the
+stop / finalization flow:
+
+```
+Recognition                          Stop
+─────────────────────────            ─────────────────────────────
+1. match student A
+2. final active-session check
+   returns ACTIVE                     3. CAS ACTIVE → CLOSED
+                                      4. finalization sees no Present(A)
+                                      5. inserts Absent(A)
+6. attempts to persist Present(A)     ↑
+   ↓
+   E11000 duplicate key
+   ↓
+   inspect existing → Absent
+   ↓
+   race reconciliation
+```
+
+The original PHASE 6.4 invariant — "if the session is closed at
+the final pre-write check, no marks are created" — is preserved.
+PHASE 6.6 hardening adds a narrow reconciliation path for the
+window between the recognition's ACTIVE check and the persistence
+write.
+
+#### `recognitionDecisionAt` (server-generated)
+
+The recognize route generates a single server-side timestamp
+AFTER both:
+
+  - The Face Service has accepted the match, and
+  - The final ACTIVE-session pre-write check (`isAttendanceSessionStillActive`).
+
+This timestamp is NEVER accepted from the browser. It is passed
+to `recordPresentAttendanceMarksForActiveSession` as a parameter.
+
+#### The cutoff rule
+
+```
+if recognitionDecisionAt <= AttendanceSession.endedAt:
+    the recognition was accepted while the session was ACTIVE
+    → belongs to the session
+    → PRESENT wins over an ABSENT row created concurrently by finalization
+else:
+    the recognition arrived after session close
+    → MUST NOT alter finalized attendance
+```
+
+#### The reconciliation primitive
+
+When the persistence layer encounters an E11000 duplicate-key
+collision during `$setOnInsert`, the service inspects the existing
+mark:
+
+  - `status === "present"`: idempotent success; existing
+    `recognizedAt` preserved.
+  - `status === "absent" && source === "session_finalization"`:
+    the narrow race-reconciliation path. The service reads
+    `AttendanceSession.endedAt`. If
+    `recognitionDecisionAt <= endedAt`, a single atomic
+    `findOneAndUpdate` filters for
+    `{ status: "absent", source: "session_finalization" }` and
+    sets `{ status: "present", source: "face_recognition",
+    recognizedAt: recognitionDecisionAt }`.
+  - Any other mark shape: idempotent no-op.
+
+#### Security boundary
+
+The reconciliation path is ONLY reachable when ALL of:
+
+  - The candidate came from `AttendanceSession.rosterSnapshot`.
+  - The session passed the final ACTIVE pre-write check.
+  - `recognitionDecisionAt` is not after `endedAt`.
+  - The existing row is specifically `status: "absent" &&
+    source: "session_finalization"`.
+
+There is no public/student-selected mark path. There is no
+browser-controllable `recognitionDecisionAt`. The reconciliation
+atomic-update's filter encodes the precondition — if any
+condition fails, the update is a no-op.
+
+#### No transaction
+
+No multi-document MongoDB transaction is introduced. The
+unique `(sessionId, studentUserId)` index on `attendance_marks`
+plus the atomic conditional `findOneAndUpdate` together provide
+the correctness guarantee. The atomic CAS on the
+`(status, source)` pair is the safety net for the
+Absent→Present conversion.
+
+#### First-`recognizedAt`-wins is preserved
+
+  - Existing Present marks: `recognizedAt` is NEVER shifted.
+  - Absent converted to Present: `recognizedAt = recognitionDecisionAt`
+    for the accepted recognition.
+  - Repeated delayed recognition: `recognizedAt` stays at the
+    first reconciliation time.
+
+#### Final summary consistency
+
+The `attendance_marks` collection remains the source of truth for
+the final summary. After reconciliation, the next read via
+`getAttendanceFinalSummaryForCurrentTeacher` observes:
+
+  - `presentCount` incremented by 1 for each reconciled row.
+  - `absentCount` decremented by 1 for each reconciled row.
+
+The stop-action's original counts are NOT cached as permanent
+truth — they are recomputed from the persisted state on every
+read.
 
 ## Non-goals (for now)
 

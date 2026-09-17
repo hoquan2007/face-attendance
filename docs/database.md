@@ -1,5 +1,7 @@
 # Database
 
+> Status: **Phase 6.6** — ATTENDANCE SESSION FINALIZATION + ABSENT FINALIZATION + FINAL SUMMARY + STOP/RECOGNITION RACE RECONCILIATION. PHASE 6.6 extends the `attendance_marks` collection introduced in PHASE 6.4 with a SECOND enum value for `status` (`"absent"`) and a SECOND enum value for `source` (`"session_finalization"`). Stopping an active attendance session now atomically (a) CAS-closes the session to `closed` (PHASE 6.1E invariant preserved verbatim) and (b) finalizes the roster via `finalizeAbsentMarksForClosedSession(sessionId, classId)`: every student in the immutable `rosterSnapshot` who does NOT have a PRESENT mark receives a single ABSENT mark with `source: "session_finalization"` and a server-side `recognizedAt` timestamp. The `(sessionId, studentUserId)` compound unique index continues to be the authoritative idempotency guard — repeated finalization creates ZERO duplicate rows. The collection stores NO embeddings / centroids / biometric ciphertext / raw camera images / candidateKey / FaceProfile references. A new server-only read boundary `getAttendanceFinalSummaryForCurrentTeacher(classId, sessionId)` returns the immutable final summary (Present / Absent / Total counters and a rosterSnapshot-ordered student list) to the authenticated Teacher; the read boundary projects ONLY safe historical identity (fullName, identificationCode, status, recognizedAt) and never exposes internal IDs or biometric data. PHASE 6.6 Final Hardening introduces a server-generated `recognitionDecisionAt` timestamp in the recognize route. When a delayed-but-accepted recognition (one that already passed the final ACTIVE-session check) encounters a pre-existing Absent mark from concurrent session finalization, and `recognitionDecisionAt <= AttendanceSession.endedAt`, the Absent mark is atomically converted to Present with `source: "face_recognition"` and `recognizedAt: recognitionDecisionAt`. Recognition that arrives after `endedAt` cannot alter finalized attendance. No MongoDB transaction is introduced — the unique index and atomic conditional update together provide the correctness guarantee.
+
 > Status: **Phase 6.4** — IDEMPOTENT PRESENT ATTENDANCE MARKS + LIVE PRESENT STATE. PHASE 6.4 adds the `attendance_marks` collection (server-only Mongoose `AttendanceMark` model) — the first per-student attendance persistence artifact. A document records `sessionId`, `classId`, `studentUserId`, `status: "present"`, `recognizedAt`, `source: "face_recognition"`, and the standard `createdAt` / `updatedAt`. The `(sessionId, studentUserId)` compound unique index enforces "one student = at most one mark per session" at the database layer; `$setOnInsert` preserves the FIRST `recognizedAt` on subsequent recognition. The collection stores NO embeddings / centroids / biometric ciphertext / raw camera images / candidateKey / FaceProfile references. See `## Phase 6.4 — Idempotent Present Attendance Marks` for the explicit phase statement.
 
 > Status: **Phase 6.3** — LIVE FACE RECOGNITION PREVIEW. PHASE 6.3 added NO new database collections. The PHASE 6.3 camera workspace reads existing collections: `attendance_sessions` (for the active session + roster snapshot), `face_profiles` (for centroids decrypted server-side only, in memory, and discarded after the request), and `profiles` (for teacher authorization). No persistent artifact is added. The biometric pipeline remains ephemeral: centroids are decrypted, L2-normalized, mapped to ephemeral candidate keys, sent to the Face Service, and the plaintext vectors are discarded after the request returns. No `face_enrollment_sessions`, `face_profiles`, or `face_profiles` schemas are mutated by the recognition flow.
@@ -775,6 +777,242 @@ authoritative invariant.
 - No Better Auth collection mutation.
 - No multi-document MongoDB transaction.
 
+## Phase 6.6 — Attendance Session Finalization + Absent Finalization + Final Summary
+
+PHASE 6.6 extends the `attendance_marks` collection introduced in
+PHASE 6.4 with two new enum values and a new write primitive
+(`finalizeAbsentMarksForClosedSession`). It also introduces a
+new read boundary (`getAttendanceFinalSummaryForCurrentTeacher`)
+that surfaces the immutable final summary to the authenticated
+teacher. The underlying collection shape, the unique index, and
+the privacy posture of PHASE 6.4 are preserved verbatim.
+
+### Extended `attendance_marks` enum values
+
+The existing `status` enum is extended from `["present"]` to
+`["present", "absent"]`. The existing `source` enum is extended
+from `["face_recognition"]` to `["face_recognition",
+"session_finalization"]`. Every existing PHASE 6.4 document
+remains valid: its `status: "present"` and `source:
+"face_recognition"` are still the only recognized "present"
+shape, and a `"absent"` document is always paired with
+`source: "session_finalization"`.
+
+### `attendance_marks` collection (Phase 6.6 — updated shape)
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `_id` | ObjectId | Mongoose-managed. |
+| `sessionId` | ObjectId | Reference to `attendance_sessions._id`. **Indexed.** |
+| `classId` | ObjectId | Reference to `classes._id`. **Indexed.** |
+| `studentUserId` | string | Better Auth `user._id` from the AttendanceSession's immutable `rosterSnapshot`. **Required.** |
+| `status` | enum | `"present"` (PHASE 6.4) OR `"absent"` (PHASE 6.6). Required. |
+| `recognizedAt` | Date | Server-side wall-clock time of the FIRST accepted recognition for this `(sessionId, studentUserId)` when `status: "present"`, OR the server wall-clock time of the finalization call when `status: "absent"`. Required. |
+| `source` | enum | `"face_recognition"` (PHASE 6.4) OR `"session_finalization"` (PHASE 6.6). Required. |
+| `createdAt`, `updatedAt` | Date | Mongoose timestamps. |
+
+The `(sessionId, studentUserId)` compound unique index is the
+authoritative idempotency guard for the finalization pass as well
+as the active-session recognition pass.
+
+### Finalization write primitive — `finalizeAbsentMarksForClosedSession`
+
+The new service function:
+
+1. Validates `sessionId` syntax (24-hex).
+2. Loads the closed session by `_id` (no status filter — the
+   service internally enforces `status === "closed"`).
+3. Verifies that the session's `classId` matches the supplied
+   `classId`.
+4. Queries all existing marks for that session
+   (`AttendanceMarkModel.find({ sessionId })`) and builds a
+   `studentsWithMark: Set<string>` from them.
+5. Iterates over `sessionDoc.rosterSnapshot` and adds each item
+   whose `studentUserId` is NOT in `studentsWithMark` to a
+   `studentsToMarkAbsent` list.
+6. For each item in `studentsToMarkAbsent`, performs
+   `AttendanceMarkModel.findOneAndUpdate({ sessionId,
+   studentUserId }, { $setOnInsert: { ..., status: "absent",
+   source: "session_finalization", recognizedAt: <server current
+   time> } }, { upsert: true, new: false,
+   includeResultMetadata: true })`.
+7. Folds an `E11000` collision (concurrent duplicate insert) into
+   idempotent success via
+   `isAttendanceMarkDuplicateKeyError(err)`.
+8. Returns `{ createdAbsent: string[], alreadyHadMark: string[],
+   finalizedAt: string }`.
+
+The snapshot is the SOLE source of students to finalize. The
+service NEVER reads `ClassMembership` or `Profile`. The snapshot
+is never mutated.
+
+### "Present wins" finalization semantics
+
+`finalizeAbsentMarksForClosedSession` builds `studentsWithMark`
+from `AttendanceMarkModel.find({ sessionId })` BEFORE the upsert
+loop. Only students NOT in this set are added to
+`studentsToMarkAbsent`. As a result:
+
+- A PRESENT mark is NEVER overwritten by an ABSENT mark.
+- The `$setOnInsert` upsert shape preserves any existing mark's
+  `recognizedAt` and `status` — so even a race between the
+  finalization pass and a `recordedAt`/`source: "face_recognition"`
+  write collapses safely (the unique index makes that race
+  observable at exactly one row).
+- Repeated finalization is idempotent: the unique `(sessionId,
+  studentUserId)` index prevents duplicate rows; the
+  `studentsWithMark` set short-circuits the upsert loop on
+  subsequent calls.
+
+### Stop / Recognition race (preserved Phase 6.4 invariant)
+
+The recognize route (`POST /api/attendance/recognize`) performs a
+final active-session recheck (`isAttendanceSessionStillActive`)
+BEFORE writing. Once `stopAttendanceSessionAction` commits the
+CAS, the session is `closed` and any subsequent recognition
+attempts return a safe `sessionClosedDuringProcessing: true`
+result. The finalization pass runs AFTER the CAS, so it operates
+on a session that is GUARANTEED `closed` and whose
+`rosterSnapshot` is stable. PHASE 6.6 does NOT weaken this
+cutoff. There is no scenario in which a PRESENT mark written
+BEFORE the CAS is later mutated by an ABSENT mark written by the
+finalization pass.
+
+### Final summary read boundary — `getAttendanceFinalSummaryForCurrentTeacher`
+
+PHASE 6.6 introduces a server-only read primitive. The function:
+
+1. Authenticates via the Better Auth server session.
+2. Loads the application Profile and requires
+   `role === "teacher"`.
+3. Encodes the teacher-owner constraint directly in the
+   `ClassModel.findOne({ _id: classId, teacherUserId })` query.
+4. Validates `sessionId` syntax.
+5. Loads the closed session by `(_id, classId)`. If the session
+   is missing OR not yet closed, the function returns a typed
+   error (`ATTENDANCE_SESSION_NOT_FOUND` or
+   `ATTENDANCE_SESSION_NOT_CLOSED`).
+6. Lists ALL marks for the session (PRESENT + ABSENT) via
+   `listAllAttendanceMarksForSession(sessionId)` (roster-snapshot
+   ordered).
+7. Joins each mark's `studentUserId` through
+   `rosterSnapshot[].{fullNameSnapshot, identificationCodeSnapshot}`.
+8. Returns a safe DTO with `presentCount`, `absentCount`,
+   `rosterCount`, and per-row `{ fullName, identificationCode,
+   status, recognizedAt }`.
+
+The DTO NEVER projects:
+
+- `studentUserId`
+- `AttendanceMark._id`
+- `teacherUserId`, `membershipId`
+- `classId` (as a top-level DTO key) — only `session.id` is
+  surfaced
+- `source` (the browser sees status only)
+- `passwordHash`, `emailSnapshot`, biometric data, embeddings,
+  centroids, raw images, candidateKey, FaceProfile.
+
+Ordering is deterministic — by `rosterSnapshot` index, not by
+Mongo query order.
+
+### What PHASE 6.6 does NOT introduce
+
+- `late` / `excused` / `manual` / `teacher_override` attendance
+  states or `source` values.
+- Manual attendance editing UI or APIs.
+- Attendance history / multiple-session browser / calendar /
+  reports pages.
+- Excel / CSV / XLSX exports.
+- A new attendance REST route.
+- A second `attendance_marks` collection, second unique index,
+  or alternative schema layout.
+- New biometric / embedding / raw image persistence.
+- Multi-document MongoDB transactions.
+- Better Auth collection mutation.
+
+### Stop / Recognition race reconciliation (PHASE 6.6 Final Hardening)
+
+The recognize route and the stop / finalization flow can race.
+The `(sessionId, studentUserId)` unique index is the only
+authoritative guard against duplicate marks. PHASE 6.6 adds a
+narrow reconciliation path so that an in-flight accepted
+recognition is not silently converted into a permanent Absent
+mark by a concurrent stop.
+
+#### Cutoff rule
+
+```
+if recognitionDecisionAt <= AttendanceSession.endedAt:
+    → reconciliation ALLOWED (Absent → Present)
+else:
+    → reconciliation DENIED (Absent stays Absent)
+```
+
+`recognitionDecisionAt` is generated server-side by the recognize
+route AFTER the Face Service accepts the match and AFTER the
+final ACTIVE pre-write check. It is NEVER supplied by the
+browser. It is the batch's `recognizedAt` value for newly
+created marks.
+
+#### Reconciliation atomic update
+
+When the persistence layer hits an E11000 duplicate-key on
+`$setOnInsert` and the existing mark has
+`status === "absent" && source === "session_finalization"`,
+the service issues a single atomic conditional
+`findOneAndUpdate`:
+
+```
+filter = {
+  sessionId, studentUserId,
+  status: "absent",
+  source: "session_finalization"
+}
+update = {
+  $set: {
+    status: "present",
+    source: "face_recognition",
+    recognizedAt: recognitionDecisionAt
+  }
+}
+```
+
+If the filter conditions are no longer satisfied (concurrent
+modification), the update is a no-op. The atomic
+`(status, source)` filter is the safety net.
+
+#### First-`recognizedAt`-wins is preserved
+
+- Existing Present marks: `recognizedAt` is NEVER shifted
+  on subsequent recognition.
+- Absent converted to Present: `recognizedAt = recognitionDecisionAt`
+  for the accepted recognition.
+- Repeated delayed recognition: `recognizedAt` remains at the
+  first accepted time. The atomic conversion only fires when
+  the existing row is `status: "absent"`; once converted to
+  Present, subsequent duplicate-key collisions fold into
+  idempotent success without shifting `recognizedAt`.
+
+#### Final summary convergence
+
+The `attendance_marks` collection remains the source of truth.
+After reconciliation, the next read via
+`getAttendanceFinalSummaryForCurrentTeacher` recomputes:
+
+- `presentCount` = count of marks with `status: "present"`.
+- `absentCount` = count of marks with `status: "absent"`.
+
+The stop-action's original counts are NOT cached as permanent
+truth. The final summary converges correctly on the next read.
+
+#### No transaction required
+
+PHASE 6.6 Final Hardening does NOT introduce a MongoDB
+transaction. The unique `(sessionId, studentUserId)` index plus
+the atomic conditional update together provide the correctness
+guarantee. The architecture remains compatible with existing
+single-document atomic operations only.
+
 ## Privacy posture
 
 - Embeddings (Phase 4+) are stored, **not** raw images.
@@ -785,3 +1023,13 @@ authoritative invariant.
 - The Face Service has no database access. All biometric persistence
   happens server-side inside `apps/web` after a recognition result
   returns.
+- The PHASE 6.6 final summary read boundary projects ONLY the
+  historical `rosterSnapshot[].fullNameSnapshot` and
+  `.identificationCodeSnapshot` values. The boundary never reads
+  `Profile.fullName` / `Profile.identificationCode` for display —
+  even if a teacher's `Profile` has been updated since the session
+  started, the historical snapshot values are authoritative.
+- The PHASE 6.6 finalization pass writes `status: "absent"` /
+  `source: "session_finalization"` to `attendance_marks`. It does
+  NOT create FaceProfile rows, does NOT embed biometric data, and
+  does NOT mutate any other collection.

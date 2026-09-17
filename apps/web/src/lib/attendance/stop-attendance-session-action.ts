@@ -3,6 +3,7 @@
  * a class owned by the authenticated teacher.
  *
  * PHASE 6.1E — AUTHENTICATED TEACHER STOP ATTENDANCE SESSION.
+ * PHASE 6.6 — ATTENDANCE SESSION FINALIZATION (adds absent mark creation).
  *
  * This module is the ONLY entry point that lets a teacher stop an
  * attendance session. It is a `"use server"` Server Action —
@@ -110,10 +111,28 @@
  *   - Does NOT call the Face Service.
  *   - Does NOT query embeddings / centroids / biometrics.
  *   - Does NOT require camera access.
- *   - Does NOT mark any student as present / absent / late.
- *   - Does NOT create any `AttendanceRecord` / per-student record.
+ *   - Does NOT modify existing Present marks.
+ *   - Does NOT create per-student attendance records outside the
+ *     `AttendanceMark` collection.
  *   - Does NOT introduce an attendance UI.
  *   - Does NOT introduce a public attendance REST API.
+ *   - PHASE 6.6: Creates absent marks (source: session_finalization)
+ *     for every roster student without a present mark.
+ *
+ * ## PHASE 6.6 — Session finalization
+ *
+ * After atomically closing the session, the action:
+ *   1. Loads existing Present marks for that session.
+ *   2. Compares against the immutable rosterSnapshot.
+ *   3. Creates Absent marks (source: "session_finalization")
+ *      for every roster student without a Present mark.
+ *   4. Present marks are NEVER overwritten or removed.
+ *   5. Absent marks use a server timestamp (finalizedAt).
+ *   6. The unique (sessionId, studentUserId) index prevents
+ *      duplicate absent marks on repeated finalization.
+ *
+ * The action never queries current ClassMembership or Profile —
+ * the rosterSnapshot is the sole authoritative source.
  *
  * This module opens with `"use server"` so it can only be invoked
  * as a Server Action. The Client Component bundle can import the
@@ -141,6 +160,9 @@ import {
   findActiveAttendanceSessionByClassId,
   toSafeAttendanceSessionSummary,
 } from "@/lib/attendance/attendance-session-service";
+import {
+  finalizeAbsentMarksForClosedSession,
+} from "@/lib/attendance/attendance-mark-service";
 import {
   StopAttendanceInputSchema,
   type StopAttendanceActionResult,
@@ -220,11 +242,18 @@ async function findLatestClosedSessionForClass(
  * `alreadyStopped` is `true` when the atomic CAS missed (because
  * the session was already closed), or when the teacher called
  * stop a second time after a successful stop.
+ *
+ * `finalized` is present when finalization was performed
+ * (session was ACTIVE before the close).
  */
 function buildStopSuccess(
   doc: Parameters<typeof toSafeAttendanceSessionSummary>[0],
   classId: string,
   alreadyStopped: boolean,
+  finalized?: {
+    finalizedAt: string;
+    absentCount: number;
+  },
 ): Extract<StopAttendanceActionResult, { ok: true }> {
   const safe = toSafeAttendanceSessionSummary(doc);
   return {
@@ -237,6 +266,7 @@ function buildStopSuccess(
       startedAt: safe.startedAt,
       endedAt: safe.endedAt,
       rosterCount: safe.rosterCount,
+      ...(finalized ?? {}),
     },
   };
 }
@@ -278,15 +308,18 @@ function buildStopSuccess(
  *      read-then-update.
  *      - On hit, the service returns the now-closed document
  *        with `status: "closed"` and `endedAt: <server current
- *        time>`. The action returns
- *        `ok: true, alreadyStopped: false`.
+ *        time>`. The action then performs PHASE 6.6 finalization:
+ *        loads existing present marks, compares against the
+ *        rosterSnapshot, and creates absent marks (source:
+ *        "session_finalization") for unmarked students.
+ *        Returns `ok: true, alreadyStopped: false`.
  *      - On miss (typed
  *        `AttendanceSessionServiceError(ATTENDANCE_SESSION_NOT_ACTIVE)`),
  *        the action folds the failure into a safe idempotent
  *        success by reading the most recently closed session:
- *          * If a closed session exists → returns
- *            `ok: true, alreadyStopped: true` with that session's
- *            summary.
+ *          * If a closed session exists → re-finalizes absent
+ *            marks (idempotent) and returns
+ *            `ok: true, alreadyStopped: true`.
  *          * If no session has ever existed for the class →
  *            returns `ATTENDANCE_SESSION_STOP_FAILED`.
  *   6. Any other persistence failure → safe
@@ -360,17 +393,40 @@ export async function stopAttendanceSessionAction(
     return buildAttendanceError("CLASS_NOT_ACCESSIBLE");
   }
 
-  // 5. Atomic stop. The service performs a single CAS;
-  //    a typed NOT_ACTIVE error folds into a safe idempotent
-  //    success.
+  // 5. Atomic stop + PHASE 6.6 finalization.
+  //    The service performs a single CAS; a typed NOT_ACTIVE error
+  //    folds into a safe idempotent success.
   try {
     const closed = await closeActiveAttendanceSessionForClass(
       classIdObjectId,
     );
+
+    // PHASE 6.6: Finalize absent marks for the now-closed session.
+    // The rosterSnapshot is the sole authoritative source.
+    // Finalization is idempotent — the unique (sessionId, studentUserId)
+    // index prevents duplicate absent marks on repeated stop calls.
+    let finalized: { finalizedAt: string; absentCount: number } | undefined;
+    try {
+      const finalizeResult = await finalizeAbsentMarksForClosedSession({
+        sessionId: String((closed as unknown as { _id: { toString: () => string } })._id),
+        classId: browserInput.classId,
+      });
+      finalized = {
+        finalizedAt: finalizeResult.finalizedAt,
+        absentCount: finalizeResult.createdAbsent.length,
+      };
+    } catch {
+      // Finalization failure is logged but does not fail the stop action.
+      // The session is already closed; absent marks are not critical path.
+      // We intentionally do not surface this as a user-facing error.
+      finalized = undefined;
+    }
+
     return buildStopSuccess(
       closed,
       browserInput.classId,
       /* alreadyStopped */ false,
+      finalized,
     );
   } catch (err) {
     if (err instanceof AttendanceSessionServiceError) {
@@ -380,9 +436,12 @@ export async function stopAttendanceSessionAction(
       ) {
         // Idempotent stop: re-read the latest closed session for
         // the class. If a closed session exists, surface it as a
-        // safe idempotent success with `alreadyStopped: true`. If
-        // no session has ever existed, surface the safe generic
-        // failure.
+        // safe idempotent success with `alreadyStopped: true`.
+        // PHASE 6.6: Re-run finalization to handle the case where
+        // the first stop closed the session but failed during
+        // absent-mark creation (e.g. partial network error).
+        // The unique (sessionId, studentUserId) index prevents
+        // duplicate marks; repeated finalization is idempotent.
         try {
           const latest = await findLatestClosedSessionForClass(
             classIdObjectId,
@@ -392,10 +451,30 @@ export async function stopAttendanceSessionAction(
               "ATTENDANCE_SESSION_STOP_FAILED",
             );
           }
+
+          // PHASE 6.6: Finalize absent marks even on idempotent stop.
+          // Safe idempotent re-run.
+          let finalized: { finalizedAt: string; absentCount: number } | undefined;
+          try {
+            const finalizeResult = await finalizeAbsentMarksForClosedSession({
+              sessionId: String((latest as unknown as { _id: { toString: () => string } })._id),
+              classId: browserInput.classId,
+            });
+            finalized = {
+              finalizedAt: finalizeResult.finalizedAt,
+              absentCount: finalizeResult.createdAbsent.length,
+            };
+          } catch {
+            // Finalization failure on idempotent stop is safe — the
+            // session is already closed; absent marks are not critical path.
+            finalized = undefined;
+          }
+
           return buildStopSuccess(
             latest,
             browserInput.classId,
             /* alreadyStopped */ true,
+            finalized,
           );
         } catch {
           return buildAttendanceError(

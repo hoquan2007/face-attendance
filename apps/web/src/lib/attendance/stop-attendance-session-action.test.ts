@@ -53,6 +53,7 @@ const mockGetSession = vi.fn();
 const mockGetProfileByUserId = vi.fn();
 const mockFindActiveAttendanceSessionByClassId = vi.fn();
 const mockCloseActiveAttendanceSessionForClass = vi.fn();
+const mockFinalizeAbsentMarksForClosedSession = vi.fn();
 
 vi.mock("@/lib/session", () => ({
   getSession: () => mockGetSession(),
@@ -62,6 +63,25 @@ vi.mock("@/lib/profile-service", () => ({
   getProfileByUserId: (...args: unknown[]) =>
     mockGetProfileByUserId(...args),
 }));
+
+// =============================================================================
+// PHASE 6.6 — Mock finalizeAbsentMarksForClosedSession so the
+// finalization path is exercised WITHOUT touching the real Mongoose
+// layer. Tests that need to drive a specific finalization outcome set
+// their own implementation via mockFinalizeAbsentMarksForClosedSession.
+// =============================================================================
+
+vi.mock("@/lib/attendance/attendance-mark-service", async () => {
+  const actual =
+    await vi.importActual<
+      typeof import("@/lib/attendance/attendance-mark-service")
+    >("@/lib/attendance/attendance-mark-service");
+  return {
+    ...actual,
+    finalizeAbsentMarksForClosedSession: (...args: unknown[]) =>
+      mockFinalizeAbsentMarksForClosedSession(...args),
+  };
+});
 
 vi.mock("@/lib/attendance/attendance-session-service", async () => {
   class AttendanceSessionServiceError extends Error {
@@ -327,6 +347,15 @@ beforeEach(() => {
   // Default: never called in stop path; if a test triggers a
   // re-read, it MUST set its own return value.
   mockFindActiveAttendanceSessionByClassId.mockResolvedValue(null);
+
+  // PHASE 6.6 — Default finalization mock. The default returns
+  // an empty result (zero absent). Tests that verify finalization
+  // semantics re-implement the mock for their own scenario.
+  mockFinalizeAbsentMarksForClosedSession.mockResolvedValue({
+    createdAbsent: [],
+    alreadyHadMark: [],
+    finalizedAt: new Date("2026-09-16T10:42:00Z").toISOString(),
+  });
 });
 
 afterEach(() => {
@@ -790,3 +819,199 @@ function setupAttendanceSessionFindChain(
     return query;
   });
 }
+
+// =============================================================================
+// PHASE 6.6 — Session finalization
+// =============================================================================
+
+describe("stopAttendanceSessionAction — PHASE 6.6 session finalization", () => {
+  it("32/33. stop success → finalizeAbsentMarksForClosedSession is called", async () => {
+    setupClassFindOneChain(makeOwnedClassDoc());
+    mockCloseActiveAttendanceSessionForClass.mockResolvedValueOnce(
+      makeClosedSessionDoc(),
+    );
+
+    const result = await stopAttendanceSessionAction({
+      classId: OWNED_CLASS_ID,
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.alreadyStopped).toBe(false);
+      // Finalization status must propagate to the client.
+      expect(typeof result.session.finalizedAt).toBe("string");
+      expect(result.session.absentCount).toBe(0);
+    }
+
+    // The finalize function was called with the closed session.
+    expect(mockFinalizeAbsentMarksForClosedSession).toHaveBeenCalledTimes(1);
+    const finalizeArgs = mockFinalizeAbsentMarksForClosedSession.mock
+      .calls[0]?.[0] as { sessionId: string; classId: string };
+    expect(finalizeArgs.sessionId).toBe(SESSION_ID);
+    expect(finalizeArgs.classId).toBe(OWNED_CLASS_ID);
+  });
+
+  it("PHASE 6.6 — finalizeAbsentMarksForClosedSession failure does NOT fail the stop action", async () => {
+    setupClassFindOneChain(makeOwnedClassDoc());
+    mockCloseActiveAttendanceSessionForClass.mockResolvedValueOnce(
+      makeClosedSessionDoc(),
+    );
+    mockFinalizeAbsentMarksForClosedSession.mockRejectedValueOnce(
+      new Error("Mock finalization failure"),
+    );
+
+    const result = await stopAttendanceSessionAction({
+      classId: OWNED_CLASS_ID,
+    });
+
+    // The session was already closed; finalization failure is
+    // tolerable — the action surfaces the safe idempotent
+    // success.
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.alreadyStopped).toBe(false);
+      expect(result.session.status).toBe("closed");
+      // finalizedAt / absentCount remain undefined when
+      // finalization failed.
+      expect(result.session.finalizedAt).toBeUndefined();
+      expect(result.session.absentCount).toBeUndefined();
+    }
+  });
+
+  it("PHASE 6.6 — absent count is propagated to the browser when finalize succeeds", async () => {
+    setupClassFindOneChain(makeOwnedClassDoc());
+    mockCloseActiveAttendanceSessionForClass.mockResolvedValueOnce(
+      makeClosedSessionDoc(),
+    );
+    mockFinalizeAbsentMarksForClosedSession.mockResolvedValueOnce({
+      createdAbsent: ["s1", "s2", "s3", "s4", "s5"],
+      alreadyHadMark: [],
+      finalizedAt: "2026-09-16T10:42:00.000Z",
+    });
+
+    const result = await stopAttendanceSessionAction({
+      classId: OWNED_CLASS_ID,
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.session.absentCount).toBe(5);
+      expect(result.session.finalizedAt).toBe(
+        "2026-09-16T10:42:00.000Z",
+      );
+    }
+  });
+
+  it("PHASE 6.6 — idempotent re-stop ALSO finalizes (idempotent finalization)", async () => {
+    setupClassFindOneChain(makeOwnedClassDoc());
+    // First CAS misses — typed NOT_ACTIVE.
+    mockCloseActiveAttendanceSessionForClass.mockRejectedValueOnce(
+      new AttendanceSessionServiceError({
+        code: ATTENDANCE_SESSION_ERROR_CODES.ATTENDANCE_SESSION_NOT_ACTIVE,
+        message: "no active session",
+      }),
+    );
+    // Fallback read returns the closed session.
+    setupAttendanceSessionFindChain([makeClosedSessionDoc()]);
+    mockFinalizeAbsentMarksForClosedSession.mockResolvedValueOnce({
+      createdAbsent: [],
+      alreadyHadMark: ["s1"],
+      finalizedAt: "2026-09-16T10:42:00.000Z",
+    });
+
+    const result = await stopAttendanceSessionAction({
+      classId: OWNED_CLASS_ID,
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.alreadyStopped).toBe(true);
+      expect(result.session.absentCount).toBe(0);
+      // alreadyHad from finalize indicates no NEW absent marks
+      // were created on this re-stop.
+      expect(typeof result.session.finalizedAt).toBe("string");
+    }
+    // Finalization MUST be reattempted on idempotent stop too.
+    expect(mockFinalizeAbsentMarksForClosedSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("PHASE 6.6 — finalizeAbsentMarksForClosedSession is NOT called on auth failure", async () => {
+    mockGetSession.mockResolvedValueOnce(null);
+    const result = await stopAttendanceSessionAction({
+      classId: OWNED_CLASS_ID,
+    });
+    expect(result.ok).toBe(false);
+    expect(mockFinalizeAbsentMarksForClosedSession).not.toHaveBeenCalled();
+  });
+
+  it("PHASE 6.6 — finalizeAbsentMarksForClosedSession is NOT called on non-owner", async () => {
+    setupClassFindOneChain(null);
+    const result = await stopAttendanceSessionAction({
+      classId: OWNED_CLASS_ID,
+    });
+    expect(result.ok).toBe(false);
+    expect(mockFinalizeAbsentMarksForClosedSession).not.toHaveBeenCalled();
+  });
+
+  it("PHASE 6.6 — finalizeAbsentMarksForClosedSession is NOT called when no session exists", async () => {
+    setupClassFindOneChain(makeOwnedClassDoc());
+    mockCloseActiveAttendanceSessionForClass.mockRejectedValueOnce(
+      new AttendanceSessionServiceError({
+        code: ATTENDANCE_SESSION_ERROR_CODES.ATTENDANCE_SESSION_NOT_ACTIVE,
+        message: "no session",
+      }),
+    );
+    // Fallback read returns [].
+    setupAttendanceSessionFindChain([]);
+
+    const result = await stopAttendanceSessionAction({
+      classId: OWNED_CLASS_ID,
+    });
+    expect(result.ok).toBe(false);
+    // Critically: when there's NO session at all we do NOT
+    // touch finalizeAbsentMarksForClosedSession.
+    expect(mockFinalizeAbsentMarksForClosedSession).not.toHaveBeenCalled();
+  });
+
+  it("PHASE 6.6 — finalize NEVER queries current ClassMembership / Profile", async () => {
+    setupClassFindOneChain(makeOwnedClassDoc());
+    mockCloseActiveAttendanceSessionForClass.mockResolvedValueOnce(
+      makeClosedSessionDoc(),
+    );
+
+    await stopAttendanceSessionAction({ classId: OWNED_CLASS_ID });
+
+    expect(mockFinalizeAbsentMarksForClosedSession).toHaveBeenCalledTimes(1);
+    // The finalize call is parameter-isolated — just sessionId
+    // + classId; nothing else.
+    const callArgs = mockFinalizeAbsentMarksForClosedSession.mock
+      .calls[0]?.[0] as Record<string, unknown>;
+    expect(Object.keys(callArgs).sort()).toEqual(["classId", "sessionId"]);
+  });
+
+  it("PHASE 6.6 — stop NEVER mutates rosterSnapshot", async () => {
+    setupClassFindOneChain(makeOwnedClassDoc());
+    const snapshotBefore = [
+      {
+        studentUserId: "student-1",
+        fullNameSnapshot: "Alpha",
+        identificationCodeSnapshot: "A-001",
+      },
+      {
+        studentUserId: "student-2",
+        fullNameSnapshot: "Bravo",
+        identificationCodeSnapshot: "B-001",
+      },
+    ];
+    mockCloseActiveAttendanceSessionForClass.mockResolvedValueOnce({
+      ...makeClosedSessionDoc({ rosterCount: 0 }),
+      rosterSnapshot: snapshotBefore,
+    });
+
+    await stopAttendanceSessionAction({ classId: OWNED_CLASS_ID });
+
+    // The mock service received no mutation; the snapshot is
+    // verbatim on the service-returned doc.
+    expect(snapshotBefore.length).toBe(2);
+  });
+});

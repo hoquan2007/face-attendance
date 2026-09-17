@@ -3,6 +3,7 @@
  *
  * PHASE 6.4 — IDEMPOTENT PRESENT ATTENDANCE MARKS +
  * LIVE PRESENT STATE.
+ * PHASE 6.6 — STOP / RECOGNITION RACE RECONCILIATION.
  *
  * Authenticated Next.js Route Handler for teacher camera frame
  * recognition. PHASE 6.4 extends the PHASE 6.3 preview route so
@@ -43,6 +44,38 @@
  *     active. A session closed mid-flight (e.g. teacher pressed
  *     Stop while the Face Service was processing) creates NO new
  *     marks.
+ *
+ * PHASE 6.6 — STOP / RECOGNITION RACE RECONCILIATION
+ * (race-window-corrected):
+ *   - The server-side `recognitionDecisionAt` timestamp is
+ *     generated IMMEDIATELY AFTER the Face Service accepts a
+ *     match and BEFORE the final ACTIVE-session pre-write check.
+ *     It is NEVER accepted from the browser.
+ *   - Generating the timestamp BEFORE the active check guarantees
+ *     that for any recognition accepted by the Face Service and
+ *     that passes the final ACTIVE check, a concurrent stop's
+ *     `endedAt` will satisfy `recognitionDecisionAt <= endedAt`.
+ *   - The recognition may proceed to persist even when a
+ *     concurrent `stopAttendanceSessionAction` has already:
+ *       1. CAS-closed the session (ACTIVE → CLOSED), and
+ *       2. Run finalization to create Absent marks for unmarked
+ *          students.
+ *   - If an existing Absent mark (source: "session_finalization")
+ *     is found for the same `(sessionId, studentUserId)`, the
+ *     persistence path checks: `recognitionDecisionAt <=
+ *     AttendanceSession.endedAt`. If true, the Absent mark is
+ *     atomically converted to Present.
+ *   - This reconciliation is the ONLY path that may modify a
+ *     closed session's attendance marks. It is strictly scoped
+ *     to the in-flight race window where a recognition passed
+ *     the ACTIVE pre-write check immediately before the
+ *     concurrent stop.
+ *   - Recognition that observes a CLOSED session at the initial
+ *     check creates NO marks at all.
+ *   - Recognition whose final ACTIVE check fails (e.g. the stop
+ *     CAS landed BEFORE the recheck) creates NO marks and NO
+ *     reconciliation. The `recognitionDecisionAt` captured above
+ *     the check is discarded.
  *
  * Request (multipart/form-data):
  *   - classId: string (required)
@@ -420,6 +453,37 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     });
   }
 
+  // ---- 9b. PHASE 6.6 RACE-WINDOW CORRECTION ----
+  // The server-side `recognitionDecisionAt` timestamp is
+  // generated HERE — IMMEDIATELY after the Face Service has
+  // accepted the match and BEFORE the final ACTIVE-session
+  // pre-write check.
+  //
+  // Rationale (PHASE 6.6 final cutoff correction): a previous
+  // ordering captured `recognitionDecisionAt` AFTER the active
+  // check, which left a narrow race window in which the stop
+  // path could write `endedAt` BEFORE the route generated the
+  // decision timestamp. The reconciliation path would then
+  // observe `decisionAt > endedAt` and refuse to convert an
+  // Absent mark to Present, even though the recognition had
+  // genuinely passed the ACTIVE pre-write check.
+  //
+  // By generating the timestamp FIRST, we guarantee that for
+  // any recognition accepted by the Face Service:
+  //   - `recognitionDecisionAt` is captured the instant the
+  //     match is accepted.
+  //   - If the final ACTIVE check succeeds, the stop path
+  //     can only set `endedAt >= recognitionDecisionAt`, so
+  //     `decisionAt <= endedAt` always holds for the accepted
+  //     race path.
+  //   - The mark service can safely reconcile a concurrently
+  //     created `session_finalization` Absent mark to Present
+  //     using the original decision timestamp.
+  //
+  // The browser NEVER supplies this value — it is always a
+  // server-generated Date captured by the route handler.
+  const recognitionDecisionAt = new Date();
+
   // ---- 10. FINAL pre-write active-session recheck ----
   // The Teacher may have pressed Stop while the Face Service was
   // processing this frame. If the session is no longer ACTIVE at
@@ -427,6 +491,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   // indicating the session is closed. The preview matches that
   // we already computed are still returned for UX feedback, but
   // the persisted-state counters are zero.
+  //
+  // PHASE 6.6 RACE-WINDOW CORRECTION: the `recognitionDecisionAt`
+  // was already captured ABOVE (step 9b). This check is the FINAL
+  // gate: if the session is inactive, no marks are created and
+  // the timestamp is discarded (no Absent will be reconciled
+  // because no Present was written either).
   const stillActive = await isAttendanceSessionStillActive(sessionId);
   if (!stillActive) {
     return NextResponse.json(
@@ -445,6 +515,26 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   // ---- 11. Persist matched students idempotently as PRESENT ----
   // No transaction. The compound `(sessionId, studentUserId)`
   // unique index is the authoritative safety net.
+  //
+  // PHASE 6.6 RACE-WINDOW CORRECTION: `recognitionDecisionAt`
+  // was captured BEFORE the final ACTIVE check. If a concurrent
+  // stop has already:
+  //   1. CAS-closed the session (ACTIVE → CLOSED) AFTER the
+  //      recheck above, and
+  //   2. Run finalization to create an Absent mark (source:
+  //      "session_finalization"),
+  // then the persistence path here will:
+  //   - Hit the (sessionId, studentUserId) duplicate-key
+  //     collision on the Absent mark.
+  //   - Inspect the existing mark → status = absent,
+  //     source = session_finalization.
+  //   - Read the session's `endedAt`.
+  //   - Verify `recognitionDecisionAt <= endedAt` (guaranteed
+  //     because the decision timestamp was captured BEFORE
+  //     the active check that just succeeded).
+  //   - Atomically convert the Absent mark to Present with
+  //     `recognizedAt = recognitionDecisionAt` and
+  //     `source = "face_recognition"`.
   let recordedCount = 0;
   let alreadyRecordedCount = 0;
 
@@ -453,6 +543,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       const persistResult = await recordPresentAttendanceMarksForActiveSession({
         sessionId,
         candidateStudentUserIds: acceptedStudentUserIds,
+        recognitionDecisionAt,
       });
       recordedCount = persistResult.persistedStudentUserIds.length;
       alreadyRecordedCount =

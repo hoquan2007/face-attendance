@@ -1,6 +1,8 @@
 # Frontend Design — Quiet Precision
 
-> Status: **Phase 6.4** — IDEMPOTENT PRESENT ATTENDANCE MARKS + LIVE PRESENT STATE. PHASE 6.4 introduces the live persisted PRESENT state on `/classes/[classId]/attendance`. The Server Component now reads `getAttendancePresentStateForCurrentTeacher(classId)` and renders an `AttendancePresentStatePanel` Server Component with `Recorded present {presentCount} / {rosterCount}` and a list of `{fullName, identificationCode, recognizedAt}` sorted `recognizedAt` ASC. The `AttendanceCameraClient` calls `router.refresh()` after a successful scan whose `recordedCount > 0` so the Server Component re-fetches the persisted state. The persisted state is the SINGLE SOURCE OF TRUTH for the present list — the camera client's local preview is allowed to remain visible but is explicitly NOT authoritative. PHASE 6.4 does NOT add `absent` / `late` labels, does NOT add a manual mark UI, does NOT add continuous scanning controls, and does NOT introduce a second permanent attendance state in client memory.
+> Status: **Phase 6.6** — ATTENDANCE SESSION FINALIZATION + ABSENT FINALIZATION + FINAL SUMMARY. PHASE 6.6 extends `/classes/[classId]/attendance` with a new `Final Attendance` summary panel that becomes the SOLE rendered attendance state once a session has been closed. The final summary card surfaces a counter row (`Present: X`, `Absent: Y`, `Total: Z`) and a rosterSnapshot-ordered list of students with visible-text status (`Present` / `Absent`), full name, identification code, and a `Recognized at` column — `—` placeholder for absent rows (no fake timestamp). The auto-scan camera workspace is no longer rendered on the closed-session page (it cleanly transitions to the summary). There is NO new chrome / banner / modal; the page transitions from live active session → closed summary via the existing `router.refresh()` discipline. PHASE 6.6 does NOT introduce `Late`, manual-editing controls, Absent ↔ Present toggles, attendance-history browsing, or an Excel / CSV export affordance.
+
+> Status: **Phase 6.5** — CONTROLLED CONTINUOUS FACE SCANNING + BACKPRESSURE + SESSION-AWARE AUTO STOP. PHASE 6.5 extends the live attendance camera UI on `/classes/[classId]/attendance` with an EXPLICIT teacher-started auto-scan toggle. Auto scan NEVER begins automatically after the camera is enabled — the teacher must press `Start auto scan`. Auto scan is rate-limited to a conservative cadence (~1.8 s) and never creates overlapping recognition requests. The auto-scan state is conveyed through text only ("Auto scanning"); a restrained "Scanning…" overlay appears only while a recognition request is in flight (no flashing, no neon, no scanner overlay). Auto scan stops automatically on session-close, no-candidates, track-ended, Stop camera, explicit Stop auto scan, component unmount, and document-hidden. The Phase 6.4 persisted Present panel remains the source of truth. PHASE 6.5 does NOT introduce a manual mark UI, does NOT introduce `Absent` / `Late` labels, does NOT add continuous-recognition settings, and does NOT modify the dark/light theme tokens.
 
 This document is the **visual constitution** for the Face Attendance application. All UI work — present and future — must read and follow this document before implementation.
 
@@ -392,14 +394,36 @@ Avoid horizontal overflow. All horizontal padding must be responsive.
 > **NOTE:** PHASE 6.2 implemented the teacher attendance lifecycle UI
 > on `/classes/[classId]`. PHASE 6.3 added the live recognition preview
 > + camera workspace. PHASE 6.4 introduces the live persisted PRESENT
-> state panel and `router.refresh()` after scan. PHASE 6.5+ territory
-> (finalization, absence, history) is still guidance only.
+> state panel and `router.refresh()` after scan. PHASE 6.5 ships the
+> controlled continuous scanning toggle, backpressure, and
+> session-aware auto stop.
 
-Desktop attendance session layout (Phase 6.4):
+Desktop attendance session layout (Phase 6.5):
 - **~70%** camera workspace (primary)
 - **~30%** live attendance panel (secondary)
 
 Camera is the primary workspace. Live list is secondary.
+
+Auto-scan toggle (Phase 6.5):
+- An EXPLICIT `Start auto scan` button appears next to the
+  manual `Scan frame` button. Pressing it flips the toggle to
+  `Stop auto scan` and shows a text-only `Auto scanning` badge
+  in the panel header — no flashing, no neon, no scanner overlay.
+- The teacher must explicitly press `Start auto scan`; the
+  button never appears in the "already on" state, and the
+  loop never begins automatically after `Enable camera`.
+- While a recognition request is in flight, a restrained
+  `Scanning…` overlay appears on the video frame. The same
+  overlay is used by manual scan so the visual feedback is
+  consistent.
+- `Stop camera` and `Stop auto scan` are independent buttons
+  with different visual variants. The teacher can stop the
+  camera without disabling the auto-scan preference, and can
+  stop the auto scan without turning the camera off.
+- Hide-tab behavior: the auto-scan loop yields without sending
+  frames when `document.visibilityState === "hidden"`. A visible
+  tab resumes the loop only if auto scan was active before the
+  hide.
 
 Recognition overlay must remain minimal:
 - Name
@@ -417,6 +441,82 @@ Persisted PRESENT state panel (Phase 6.4):
 - The camera client invokes `router.refresh()` after a successful scan whose
   `recordedCount > 0`; the persisted state is the source of truth, and the
   recognition preview can remain visible underneath
+
+---
+
+## Final Attendance Summary (Phase 6.6)
+
+Once the Teacher presses **Stop attendance** and the session
+becomes `closed`, `/classes/[classId]/attendance` swaps the
+live camera + persisted-present layout for the
+**Final Attendance Summary** card. The transition is driven
+entirely by server state (`attendance_state === "closed"`) and
+reuses the existing `router.refresh()` discipline; the URL does
+NOT change.
+
+### Card header (final summary)
+
+- Title: `Final Attendance` — `lucide-circle-check-big` icon.
+- Subtitle: `This attendance session has been closed. The final
+  attendance record is shown below.`
+- No banner. No modal. No chrome. No animations on mount.
+
+### Counter row (final summary)
+
+- Three pill-shaped counters aligned horizontally:
+  `Present: X`, `Absent: Y`, `Total: Z`.
+- Counters use visible text (`Present`, `Absent`), NEVER color-only.
+- Counters carry stable `data-attendance-final-{present,
+  absent,roster}-count` attributes for tests + downstream
+  analytics.
+- Counter colors: `success-soft` for `Present`,
+  `destructive-soft` for `Absent`, neutral foreground for
+  `Total`. Borders use `border-success/30` and
+  `border-destructive/30` respectively.
+
+### Student list (final summary)
+
+- One row per roster student, ordered by `rosterSnapshot`
+  position (deterministic — not by Mongo query order).
+- Each row surfaces:
+  - `fullName` (historical `rosterSnapshot.fullNameSnapshot`)
+  - `identificationCode` (historical
+    `rosterSnapshot.identificationCodeSnapshot`, monospaced)
+  - `status` (`Present` or `Absent`, visible text — never
+    color-only)
+  - `Recognized at`
+    - For Present: the formatted recognition timestamp.
+    - For Absent: a single em-dash `—` placeholder. **NEVER**
+      fabricate a recognition time for an absent student.
+- Rows carry stable `data-attendance-final-status` (`present`
+  or `absent`) attributes.
+
+### Empty / defensive states
+
+- `rosterCount === 0`: a restrained card with copy
+  `No students on the roster.` (NOT a teardown error).
+- Read service failed: a restrained error-state card
+  `Could not load attendance summary` / `Please stop and
+  restart the attendance session.` (the failed read is
+  non-blocking — the page still renders without redirecting).
+
+### Phase 6.6 hard constraints
+
+- DO NOT introduce a manual mark UI (no Absent ↔ Present
+  toggle, no checkbox, no override button).
+- DO NOT introduce `Late` / `Excused` / `Manual` / `Override`
+  attendance states.
+- DO NOT introduce attendance history browsing (no calendar,
+  no multiple-session browser, no reports page).
+- DO NOT introduce Excel / CSV / XLSX export affordances.
+- DO NOT introduce client-side attendance mutation
+  (no `useState` / `useEffect` / `useTransition` /
+  `useRef`).
+- DO NOT use `setInterval` / `setTimeout` /
+  `requestAnimationFrame` / `navigator.mediaDevices`.
+- DO NOT call the Face Service from the summary panel.
+- DO NOT alter the camera workspace during the transition —
+  Phase 6.5's stop-on-session-closed discipline is preserved.
 
 ---
 

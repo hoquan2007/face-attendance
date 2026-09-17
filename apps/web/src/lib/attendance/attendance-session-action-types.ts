@@ -197,8 +197,12 @@ export type StartAttendanceActionResult =
  *                        the session was already CLOSED. The browser
  *                        receives the same safe success shape either
  *                        way.
- *   - `session`        — the safe summary projection of the
+ *   - `session`       — the safe summary projection of the
  *                        now-closed session.
+ *
+ * PHASE 6.6 adds optional `finalizedAt` when session was closed
+ * during this call (finalization was performed). The field is
+ * absent when the session was already stopped.
  */
 export interface StopAttendanceActionSuccess {
   ok: true;
@@ -210,6 +214,10 @@ export interface StopAttendanceActionSuccess {
     startedAt: string;
     endedAt: string | null;
     rosterCount: number;
+    /** PHASE 6.6: ISO 8601 timestamp when absent marks were finalized. */
+    finalizedAt?: string;
+    /** PHASE 6.6: Count of absent marks created. Present on alreadyStopped too. */
+    absentCount?: number;
   };
 }
 
