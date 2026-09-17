@@ -31,6 +31,18 @@ import { render, fireEvent, act, cleanup, screen } from "@testing-library/react"
 
 const mockGetUserMedia = vi.fn();
 const mockStop = vi.fn();
+const mockRefresh = vi.fn();
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({
+    refresh: mockRefresh,
+    push: vi.fn(),
+    replace: vi.fn(),
+    back: vi.fn(),
+    forward: vi.fn(),
+    prefetch: vi.fn(),
+  }),
+}));
 
 beforeEach(() => {
   mockGetUserMedia.mockReset();
@@ -525,4 +537,123 @@ it("59. session-closed state stops further scanning", async () => {
   });
 
   expect(screen.getByText(/attendance session is no longer active/i)).toBeTruthy();
+});
+
+// =============================================================================
+// PHASE 6.4 — router.refresh + persisted state contract
+// =============================================================================
+
+it("PHASE 6.4 / 39. successful scan calls router.refresh when recordedCount > 0", async () => {
+  mockRefresh.mockReset();
+  const mockFetch = vi.fn().mockResolvedValue({
+    status: 200,
+    ok: true,
+    headers: new Headers(),
+    json: vi.fn().mockResolvedValue({
+      facesDetected: 1,
+      matches: [{ fullName: "Alice", identificationCode: "SV001" }],
+      unmatchedCount: 0,
+      recordedCount: 1,
+      alreadyRecordedCount: 0,
+    }),
+  } as unknown as Response);
+  global.fetch = mockFetch as unknown as typeof fetch;
+
+  const result = await renderCamera();
+  const enableButton = result.getByRole("button", {
+    name: /enable camera/i,
+  });
+  await act(async () => {
+    fireEvent.click(enableButton);
+  });
+
+  const video = document.querySelector("video");
+  if (video) {
+    Object.defineProperty(video, "videoWidth", {
+      value: 640,
+      configurable: true,
+    });
+    Object.defineProperty(video, "videoHeight", {
+      value: 480,
+      configurable: true,
+    });
+    Object.defineProperty(video, "readyState", {
+      value: 4,
+      configurable: true,
+    });
+  }
+
+  const scanButton = result.getByRole("button", { name: /scan frame/i });
+  await act(async () => {
+    fireEvent.click(scanButton);
+  });
+
+  expect(mockRefresh).toHaveBeenCalledTimes(1);
+});
+
+it("PHASE 6.4 / 39b. successful scan does NOT refresh when recordedCount === 0", async () => {
+  mockRefresh.mockReset();
+  const mockFetch = vi.fn().mockResolvedValue({
+    status: 200,
+    ok: true,
+    headers: new Headers(),
+    json: vi.fn().mockResolvedValue({
+      facesDetected: 1,
+      matches: [{ fullName: "Alice", identificationCode: "SV001" }],
+      unmatchedCount: 0,
+      recordedCount: 0,
+      alreadyRecordedCount: 1,
+    }),
+  } as unknown as Response);
+  global.fetch = mockFetch as unknown as typeof fetch;
+
+  const result = await renderCamera();
+  const enableButton = result.getByRole("button", {
+    name: /enable camera/i,
+  });
+  await act(async () => {
+    fireEvent.click(enableButton);
+  });
+
+  const video = document.querySelector("video");
+  if (video) {
+    Object.defineProperty(video, "videoWidth", {
+      value: 640,
+      configurable: true,
+    });
+    Object.defineProperty(video, "videoHeight", {
+      value: 480,
+      configurable: true,
+    });
+    Object.defineProperty(video, "readyState", {
+      value: 4,
+      configurable: true,
+    });
+  }
+
+  const scanButton = result.getByRole("button", { name: /scan frame/i });
+  await act(async () => {
+    fireEvent.click(scanButton);
+  });
+
+  // Idempotent repeat — no fresh mark was created; no
+  // refresh needed.
+  expect(mockRefresh).not.toHaveBeenCalled();
+});
+
+it("PHASE 6.4 / 40. no setInterval / no automatic recognition loop", async () => {
+  const setIntervalSpy = vi.spyOn(global, "setInterval");
+  const rafSpy = vi.spyOn(global, "requestAnimationFrame");
+  const result = await renderCamera();
+
+  // The component must NOT install a continuous recognition
+  // loop. We assert by checking that no setInterval / RAF
+  // callbacks have been registered in the first second after
+  // render.
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+  expect(setIntervalSpy).not.toHaveBeenCalled();
+  expect(rafSpy).not.toHaveBeenCalled();
+  void result;
 });

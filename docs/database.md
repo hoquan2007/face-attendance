@@ -1,5 +1,11 @@
 # Database
 
+> Status: **Phase 6.4** — IDEMPOTENT PRESENT ATTENDANCE MARKS + LIVE PRESENT STATE. PHASE 6.4 adds the `attendance_marks` collection (server-only Mongoose `AttendanceMark` model) — the first per-student attendance persistence artifact. A document records `sessionId`, `classId`, `studentUserId`, `status: "present"`, `recognizedAt`, `source: "face_recognition"`, and the standard `createdAt` / `updatedAt`. The `(sessionId, studentUserId)` compound unique index enforces "one student = at most one mark per session" at the database layer; `$setOnInsert` preserves the FIRST `recognizedAt` on subsequent recognition. The collection stores NO embeddings / centroids / biometric ciphertext / raw camera images / candidateKey / FaceProfile references. See `## Phase 6.4 — Idempotent Present Attendance Marks` for the explicit phase statement.
+
+> Status: **Phase 6.3** — LIVE FACE RECOGNITION PREVIEW. PHASE 6.3 added NO new database collections. The PHASE 6.3 camera workspace reads existing collections: `attendance_sessions` (for the active session + roster snapshot), `face_profiles` (for centroids decrypted server-side only, in memory, and discarded after the request), and `profiles` (for teacher authorization). No persistent artifact is added. The biometric pipeline remains ephemeral: centroids are decrypted, L2-normalized, mapped to ephemeral candidate keys, sent to the Face Service, and the plaintext vectors are discarded after the request returns. No `face_enrollment_sessions`, `face_profiles`, or `face_profiles` schemas are mutated by the recognition flow.
+
+> Status: **Phase 6.2** — TEACHER ATTENDANCE CONTROL UI. PHASE 6.2 adds NO new collections. The attendance UI consumes the existing `attendance_sessions` collection via the new server-only `getAttendanceSessionStatusForCurrentTeacher(classId)` read boundary and calls the existing `startAttendanceSessionAction` / `stopAttendanceSessionAction` Server Actions.
+
 > Status: **Phase 6.1** — ATTENDANCE SESSION FOUNDATION. PHASE 6.1 adds the `attendance_sessions` collection (Mongoose `AttendanceSession` model) — server-only persistence for attendance session lifecycle. The collection captures one teacher's attendance window per class. An `AttendanceSession` document records `classId`, `status` (`"active"` | `"closed"`), `startedAt`, `endedAt` (nullable while active), `startedByUserId`, and an immutable `rosterSnapshot` array captured at start time. A partial unique index on `{ classId, status }` where `status === "active"` enforces "at most ONE active session per class" at the database level. NO additional collections are introduced for `AttendanceRecord`, per-student present / absent / late records, embeddings, or centroids — those are deliberate non-features in PHASE 6.1.
 
 > Status: **Phase 4.6B2C** — Better Auth collections are live in MongoDB
@@ -661,6 +667,113 @@ The stop transition is performed by a SINGLE atomic
   belongs to a later phase).
 - No TTL index on `attendance_sessions`.
 - No text / search index on `attendance_sessions`.
+
+## Phase 6.4 — Idempotent Present Attendance Marks
+
+PHASE 6.4 introduces the FIRST per-student attendance
+persistence artifact — the `attendance_marks` collection.
+PHASE 6.4 also ships a server-only Teacher read boundary that
+returns the live persisted PRESENT state for the active session
+on `/classes/[classId]/attendance`.
+
+### `attendance_marks` collection (Phase 6.4)
+
+A `AttendanceMark` document records a single PRESENT mark for
+one `(sessionId, studentUserId)` pair. There is at most one
+mark per student per AttendanceSession — enforced by the
+`(sessionId, studentUserId)` compound unique index.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `_id` | ObjectId | Mongoose-managed. |
+| `sessionId` | ObjectId | Reference to `attendance_sessions._id`. **Indexed.** |
+| `classId` | ObjectId | Reference to `classes._id`. **Indexed.** |
+| `studentUserId` | string | Better Auth `user._id` from the AttendanceSession's immutable `rosterSnapshot`. **Required.** |
+| `status` | enum | `"present"` only. Required. |
+| `recognizedAt` | Date | Server-side wall-clock time of the FIRST accepted recognition for this `(sessionId, studentUserId)`. Required. Preserved on subsequent recognition. |
+| `source` | enum | `"face_recognition"` only. Required. |
+| `createdAt`, `updatedAt` | Date | Mongoose timestamps. |
+
+**Indexes**
+
+- `sessionId` — supports per-session listing.
+- `classId` — supports per-class aggregation queries.
+- **(unique)** `(sessionId, studentUserId)` — enforces "one
+  student = max one mark per session" at the database
+  layer. Named `sessionId_studentUserId_unique`.
+
+**Idempotency**
+
+- The first recognition for `(sessionId, studentUserId)` creates
+  the mark via `$setOnInsert`. The `recognizedAt` field is set
+  from a server-side timestamp captured at the start of the
+  batch.
+- A repeated recognition of the same student surfaces as a
+  Mongo `E11000` collision on the `(sessionId, studentUserId)`
+  unique index. The service classifies the collision precisely
+  via `isAttendanceMarkDuplicateKeyError(err)` and folds it into
+  a safe idempotent success — the existing mark is preserved
+  verbatim (`recognizedAt` is NOT shifted).
+- Concurrent races on the same `(sessionId, studentUserId)`
+  collapse to ONE persisted mark. The unique index is the
+  authoritative safety net.
+
+**Snapshot authority**
+
+The `studentUserId` value persisted on a mark is sourced
+EXCLUSIVELY from the active AttendanceSession's immutable
+`rosterSnapshot`. Current `ClassMembership` rows are NEVER
+consulted to determine mark eligibility. A student who leaves
+the class AFTER the session started still owns the captured
+roster entry; the snapshot is the authoritative identity gate.
+
+**Privacy posture**
+
+- `studentUserId` is INTERNAL persistence data. It is NEVER
+  exposed through any browser-facing DTO.
+- No `passwordHash`, no `embedding`, no `centroid`, no raw
+  image, no FaceProfile id, no biometric ciphertext is stored
+  on this collection.
+- No teacherUserId is stored on the mark — the mark is
+  intentionally agnostic of the teacher record.
+- The browser NEVER receives `AttendanceMark._id`, `classId`
+  (as a top-level DTO key), `sessionId` (as an internal
+  ObjectId), `status`, or `source`.
+
+### First-`recognizedAt`-wins cutoff
+
+`recognizedAt` is captured ONCE per batch by the persistence
+service. The value is injected via `$setOnInsert`; if a
+document already exists for the `(sessionId, studentUserId)`
+pair, `$setOnInsert` is a no-op and the original
+`recognizedAt` is preserved. The FIRST accepted recognition
+for a given `(sessionId, studentUserId)` always wins.
+
+### Stop-race semantics
+
+Before the persistence service writes any marks, the recognize
+route performs a final pre-write active-session recheck via
+`isAttendanceSessionStillActive(sessionId)`. If the session
+has been closed mid-flight (teacher pressed Stop while the
+Face Service was processing), the route creates NO new marks
+and returns a safe `sessionClosedDuringProcessing: true`
+result. No transaction is introduced for this phase — the
+`(sessionId, status: "active")` partial unique index on
+`attendance_sessions` and the `(sessionId, studentUserId)`
+unique index on `attendance_marks` together form the
+authoritative invariant.
+
+### What PHASE 6.4 does NOT introduce
+
+- No `absent` / `late` / `excused` attendance states.
+- No manual / teacher-driven mark API.
+- No `setInterval` / `requestAnimationFrame` continuous
+  recognition loop on the browser.
+- No public `POST /api/attendance/mark-present` route.
+- No embedding / centroid / biometric ciphertext persistence.
+- No FaceProfile / FaceEnrollmentSession mutation.
+- No Better Auth collection mutation.
+- No multi-document MongoDB transaction.
 
 ## Privacy posture
 

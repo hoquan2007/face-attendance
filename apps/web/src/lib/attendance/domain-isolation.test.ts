@@ -289,6 +289,9 @@ function listAttendanceModules(): string[] {
     "attendance-session-action-testing.ts",
     "start-attendance-session-action.ts",
     "stop-attendance-session-action.ts",
+    "attendance-mark-model.ts",
+    "attendance-mark-service.ts",
+    "attendance-present-state-read-service.ts",
   ];
 }
 
@@ -344,14 +347,24 @@ describe("attendance domain isolation — no Face Service / biometrics", () => {
       // phase explicitly NEGATES the call. We permit these
       // tokens ONLY inside JSDoc / line-comments with the
       // shapes `NOT `, `// `, ` * `, or `does NOT`.
+      //
+      // PHASE 6.4 EXCEPTION: the legitimate field
+      // `recognizedAt` is permitted in the AttendanceMark
+      // model + service files because it is a server-only
+      // server-side timestamp — NOT a face-recognition call.
+      // The pattern below matches the forbidden biometrics
+      // tokens but excludes `recognizedAt`.
       const lines = source.split(/\r?\n/);
       for (const line of lines) {
         const trimmed = line.trim();
         const isComment = trimmed.startsWith("//") ||
           trimmed.startsWith("*") ||
           trimmed.startsWith("/*");
+        const sanitized = line.replace(/recognizedAt/g, "");
         const containsForbidden =
-          /embedding|centroid|InsightFace|recogni[zs]e/i.test(line);
+          /embedding|centroid|InsightFace|recogni[zs]e/i.test(
+            sanitized,
+          );
         if (containsForbidden && !isComment) {
           throw new Error(
             `forbidden biometric token in code (non-comment) line of ${name}: ${line}`,
@@ -398,10 +411,22 @@ describe("attendance domain isolation — no per-student records", () => {
       expect(stripped).not.toMatch(/markPresent/);
       expect(stripped).not.toMatch(/markAbsent/);
       expect(stripped).not.toMatch(/markLate/);
-      // No `confidence`/`recognizedAt` style per-student record
-      // identifiers.
+      // No `confidence` style per-student record identifiers.
       expect(stripped).not.toMatch(/\bconfidence\b/);
-      expect(stripped).not.toMatch(/\brecognizedAt\b/);
+      // PHASE 6.4 EXCEPTION: `recognizedAt` is a legitimate
+      // server-side timestamp on the AttendanceMark model +
+      // service. The per-student "recognizedAt" identifier
+      // is server-only and NEVER reaches the browser. It is
+      // permitted ONLY in attendance-mark-* files.
+      if (
+        name === "attendance-mark-model.ts" ||
+        name === "attendance-mark-service.ts" ||
+        name === "attendance-present-state-read-service.ts"
+      ) {
+        expect(stripped).toMatch(/recognizedAt/);
+      } else {
+        expect(stripped).not.toMatch(/\brecognizedAt\b/);
+      }
       void name;
     }
   });

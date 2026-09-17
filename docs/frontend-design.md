@@ -1,6 +1,6 @@
 # Frontend Design — Quiet Precision
 
-> Status: **Phase 2.5** — Professional design system and UX foundation.
+> Status: **Phase 6.4** — IDEMPOTENT PRESENT ATTENDANCE MARKS + LIVE PRESENT STATE. PHASE 6.4 introduces the live persisted PRESENT state on `/classes/[classId]/attendance`. The Server Component now reads `getAttendancePresentStateForCurrentTeacher(classId)` and renders an `AttendancePresentStatePanel` Server Component with `Recorded present {presentCount} / {rosterCount}` and a list of `{fullName, identificationCode, recognizedAt}` sorted `recognizedAt` ASC. The `AttendanceCameraClient` calls `router.refresh()` after a successful scan whose `recordedCount > 0` so the Server Component re-fetches the persisted state. The persisted state is the SINGLE SOURCE OF TRUTH for the present list — the camera client's local preview is allowed to remain visible but is explicitly NOT authoritative. PHASE 6.4 does NOT add `absent` / `late` labels, does NOT add a manual mark UI, does NOT add continuous scanning controls, and does NOT introduce a second permanent attendance state in client memory.
 
 This document is the **visual constitution** for the Face Attendance application. All UI work — present and future — must read and follow this document before implementation.
 
@@ -389,11 +389,13 @@ Avoid horizontal overflow. All horizontal padding must be responsive.
 
 ## Future Attendance Layout (Guidance)
 
-> **NOTE:** PHASE 6.2 implements the teacher attendance lifecycle UI
-> on `/classes/[classId]`. The camera workspace layout described
-> below is Phase 6.3+ territory and is still guidance only.
+> **NOTE:** PHASE 6.2 implemented the teacher attendance lifecycle UI
+> on `/classes/[classId]`. PHASE 6.3 added the live recognition preview
+> + camera workspace. PHASE 6.4 introduces the live persisted PRESENT
+> state panel and `router.refresh()` after scan. PHASE 6.5+ territory
+> (finalization, absence, history) is still guidance only.
 
-Desktop attendance session layout (Phase 6.3+):
+Desktop attendance session layout (Phase 6.4):
 - **~70%** camera workspace (primary)
 - **~30%** live attendance panel (secondary)
 
@@ -404,6 +406,17 @@ Recognition overlay must remain minimal:
 - Confirmed / Unknown
 
 Do not display raw AI confidence scores prominently. Use semantic status colors.
+
+Persisted PRESENT state panel (Phase 6.4):
+- Heading: `Recorded present {presentCount} / {rosterCount}`
+- One row per recorded student: `fullName`, `identificationCode`, `recognizedAt`
+- Empty state must be restrained (e.g. `No students recorded yet`)
+- DO NOT label any roster member as `Absent` or `Late` during an active session
+- DO NOT show internal IDs, mark identifiers, teacher ids, or any biometric field
+- DO NOT derive the present list from the latest camera response alone
+- The camera client invokes `router.refresh()` after a successful scan whose
+  `recordedCount > 0`; the persisted state is the source of truth, and the
+  recognition preview can remain visible underneath
 
 ---
 

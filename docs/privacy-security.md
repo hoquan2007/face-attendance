@@ -1,5 +1,9 @@
 # Privacy & Security
 
+> Status: **Phase 6.4** — IDEMPOTENT PRESENT ATTENDANCE MARKS + LIVE PRESENT STATE. PHASE 6.4 introduces the FIRST per-student attendance persistence artifact — the `attendance_marks` collection — and the server-only Teacher read boundary that surfaces the live persisted PRESENT state on `/classes/[classId]/attendance`. The recognize route (`POST /api/attendance/recognize`) is EXTENDED so a Face Service match that has already passed `FACE_MATCH_THRESHOLD` becomes a persisted PRESENT mark with `status: "present"` and `source: "face_recognition"`. The `(sessionId, studentUserId)` compound unique index enforces "one student = at most one mark per session" at the database layer; `$setOnInsert` preserves the FIRST recognition's `recognizedAt` on subsequent recognition. A final pre-write active-session recheck is performed so a session closed mid-flight (teacher pressed Stop while the Face Service was processing) creates NO new marks. The browser-visible recognize response carries ONLY `{ ok, matches: [{ fullName, identificationCode }], recordedCount, alreadyRecordedCount, sessionClosedDuringProcessing }`; `AttendanceMark._id`, `studentUserId`, `candidateKey`, `teacherUserId`, `membershipId`, `embedding`, and `centroid` are NEVER serialized. The new Teacher read boundary `getAttendancePresentStateForCurrentTeacher(classId)` returns ONLY `{ sessionId, rosterCount, presentCount, students: [{ fullName, identificationCode, recognizedAt }] }`; display identity is read from `AttendanceSession.rosterSnapshot` (immutable historical identity), NEVER from current `Profile` rows. PHASE 6.4 does NOT add `absent` / `late` / `excused` states, does NOT add a public `POST /api/attendance/mark-present` manual mark endpoint, does NOT mutate the existing roster snapshot, does NOT mutate `FaceProfile`, does NOT persist raw camera images, does NOT persist embeddings / centroids / biometric ciphertext, and does NOT add `setInterval` / `requestAnimationFrame` continuous recognition. See `## Phase 6.4 — Idempotent Present Attendance Marks Privacy`.
+
+> Status: **Phase 6.3** — LIVE FACE RECOGNITION PREVIEW. PHASE 6.3 added the camera workspace on `/classes/[classId]/attendance` and the authenticated Route Handler `POST /api/attendance/recognize`. The handler authenticates the teacher, validates class ownership, validates an ACTIVE AttendanceSession, builds a snapshot-scoped ephemeral recognition gallery (decrypting `FaceProfile` centroids server-side only, building an in-memory candidate-key → snapshot-student map, and sending ONLY opaque candidate keys + L2-normalized vectors to the Face Service). The browser-visible response carries ONLY safe display data (`fullNameSnapshot`, `identificationCodeSnapshot`). PHASE 6.3 does NOT create attendance marks, does NOT persist raw images / embeddings / centroids, does NOT mutate the AttendanceSession roster snapshot, and does NOT introduce `absent` / `late` / `confidence` / `recognizedAt`.
+
 > Status: **Phase 6.2** — TEACHER ATTENDANCE CONTROL UI. PHASE 6.2 adds the teacher attendance lifecycle UI on `/classes/[classId]` using the existing `startAttendanceSessionAction` / `stopAttendanceSessionAction` Server Actions and a new server-only read boundary `getAttendanceSessionStatusForCurrentTeacher`. The browser-safe DTO exposes only `{ state, session: { id, status, startedAt, endedAt, rosterCount } }` — `rosterSnapshot`, `studentUserId`, `teacherUserId`, `startedByUserId`, biometric fields, FaceProfile, and Face Service calls are strictly absent. No face recognition, no camera UI, no attendance marks (present/absent/late/confidence/recognizedAt), and no `/api/attendance` REST API. See `## Phase 6.2 — Attendance UI Privacy`.
 
 > Status: **Phase 6.1** — ATTENDANCE SESSION FOUNDATION. PHASE 6.1 ships the teacher start / stop attendance session lifecycle with full server-only enforcement of authorization (teacher-owner of an ACTIVE class only), session uniqueness (database-level partial unique index — at most ONE active session per class), atomic stop semantics, and strict no-leak of the immutable roster snapshot. The browser NEVER receives `rosterSnapshot`, `studentUserId`, `teacherUserId`, `startedByUserId`, `passwordHash`, biometric fields, the Mongo URI, E11000, or any raw Mongoose stack. No attendance UI is added; no attendance REST API is added; no Face Service call is made; no per-student `present`/`absent`/`late`/`confidence`/`recognizedAt` record is created. See `## Phase 6.1 — Attendance Session Privacy` for the explicit phase statement.
@@ -3570,3 +3574,220 @@ attendance UI module and the read result:
   or `recognizedAt` records.
 - Add a public `/api/attendance` REST route.
 - Import `AttendanceSessionModel` directly in a UI module.
+
+## Phase 6.4 — Idempotent Present Attendance Marks Privacy
+
+PHASE 6.4 introduces the first per-student attendance
+persistence artifact — the `attendance_marks` collection —
+and the server-only Teacher read boundary that surfaces the
+live persisted PRESENT state on `/classes/[classId]/attendance`.
+Privacy posture is a strict extension of PHASE 6.1 / 6.2 / 6.3:
+every new artifact, route, service, and component is
+server-only or a Server Component, and every new browser-visible
+DTO is a closed discriminated union over a small set of safe
+fields.
+
+### What the browser receives
+
+`POST /api/attendance/recognize` (extended) returns on success:
+
+```ts
+type AttendanceRecognizeOkDto = {
+  ok: true;
+  matches: Array<{
+    fullName: string;             // from AttendanceSession.rosterSnapshot
+    identificationCode: string;   // from AttendanceSession.rosterSnapshot
+  }>;
+  recordedCount: number;          // NEW marks created in this request
+  alreadyRecordedCount: number;   // matched students already PRESENT
+  sessionClosedDuringProcessing: false;
+};
+```
+
+If the session was closed mid-flight (after Face Service
+returned but BEFORE persistence), the handler returns:
+
+```ts
+type AttendanceRecognizeSessionClosedDuringProcessingDto = {
+  ok: true;
+  matches: [];                    // safe preview may still be empty
+  recordedCount: 0;
+  alreadyRecordedCount: 0;
+  sessionClosedDuringProcessing: true;
+};
+```
+
+The new Teacher read boundary
+`getAttendancePresentStateForCurrentTeacher(classId)` returns:
+
+```ts
+type AttendancePresentStateDto = {
+  sessionId: string;
+  rosterCount: number;
+  presentCount: number;
+  students: Array<{
+    fullName: string;             // ALWAYS from rosterSnapshot, never Profile
+    identificationCode: string;   // ALWAYS from rosterSnapshot, never Profile
+    recognizedAt: string;         // ISO 8601, server-supplied
+  }>;
+};
+```
+
+Students are sorted `recognizedAt` ASC (oldest first) so the
+UI is deterministic across re-renders.
+
+### What the browser NEVER receives
+
+The following are **explicitly absent** from every new
+PHASE 6.4 module, DTO, and DOM render:
+
+- `studentUserId` — internal per-student persistence key.
+  The browser sees ONLY display fields from
+  `AttendanceSession.rosterSnapshot`. The mark's
+  `studentUserId` is NEVER serialized to the response.
+- `AttendanceMark._id`, `createdAt`, `updatedAt`,
+  `__v`, Mongoose internals — server-only.
+- `teacherUserId`, `startedByUserId`,
+  `membershipId`, `ClassMembership._id` — server-internal.
+- `candidateKey`, `candidateKeyMapping`,
+  request-local gallery identity, raw Face Service keys.
+- `embedding`, `centroid`, `faceEmbedding`,
+  `faceEmbeddingCiphertext`, `faceEmbeddingIv`,
+  `faceEmbeddingTag`, biometric ciphertext, plaintext vectors,
+  AES key bytes.
+- `passwordHash`, `emailSnapshot`, `phone`, `email`.
+- The Mongo URI, the `E11000` token, the
+  `attendance_marks` / `attendance_sessions` collection name,
+  any raw Mongoose error / stack trace / driver message.
+- `confidence`, `similarity`, raw Face Service response
+  fields beyond the safe DTO subset.
+- The raw camera image — it remains transient and is NEVER
+  persisted server-side.
+- A second permanent attendance state held in client memory.
+  The persisted state is the single source of truth; the
+  recognize response only indicates that accepted matches
+  were recorded.
+
+### Snapshot authority
+
+Display identity is ALWAYS resolved from
+`AttendanceSession.rosterSnapshot`, never from the current
+`Profile` collection:
+
+- A student who changes their `fullName` or
+  `identificationCode` AFTER a session is started keeps
+  their original `fullNameSnapshot` /
+  `identificationCodeSnapshot` on the PRESENT list.
+- If a mark's `studentUserId` cannot be found in the
+  session's `rosterSnapshot` (orphaned mark), the mark is
+  skipped silently during present-state read. The browser
+  never sees it and an error is never raised.
+- Eligibility for creating a mark is also gated by
+  membership in `rosterSnapshot`. A current
+  `ClassMembership` that was added AFTER session start
+  cannot be marked. A current `ClassMembership` that left
+  the class but was captured at session start can still be
+  marked (the snapshot is the authority).
+
+### Stop-race cutoff
+
+A second pre-write `isAttendanceSessionStillActive(sessionId)`
+check is performed AFTER the Face Service returns and BEFORE
+the mark is written:
+
+- If the session is no longer ACTIVE → no new mark is
+  created; response carries
+  `sessionClosedDuringProcessing: true` so the UI can show
+  the closed state.
+- If the session is still ACTIVE → accepted matches may be
+  persisted.
+- No transaction is introduced for this phase. Idempotency
+  is provided by the `(sessionId, studentUserId)` compound
+  unique index and the `$setOnInsert` write.
+
+### First-recognizedAt-wins
+
+`recognizedAt` is set ONCE on the FIRST accepted recognition
+of a given `(sessionId, studentUserId)`. Subsequent
+recognitions of the same student:
+
+- DO NOT create a new mark (the unique index refuses the
+  insert).
+- DO NOT update `recognizedAt` (the `$setOnInsert` operator
+  preserves the original timestamp).
+- ARE counted in `alreadyRecordedCount` only.
+
+### Idempotency under duplicate-key race
+
+The persistence layer distinguishes the EXACT compound
+`(sessionId, studentUserId)` duplicate-key collision from
+unrelated database failures:
+
+- The EXACT collision is treated as idempotent success — the
+  existing mark is treated as the authoritative record, and
+  the request is counted in `alreadyRecordedCount`.
+- An UNRELATED database error / write failure is NOT
+  swallowed; the handler returns a controlled safe error
+  (`ATTENDANCE_MARK_WRITE_FAILED`) and does NOT claim
+  attendance was recorded. The route response NEVER exposes
+  the Mongo URI, the `E11000` token, the collection name, or
+  any internal ID.
+
+### Failure safety
+
+If attendance mark persistence fails:
+
+- The route does NOT claim attendance was fully recorded.
+- The route returns a discriminated-union safe error
+  (`{ ok: false, code, message, retryable }`).
+- Because writes are idempotent, a later explicit scan can
+  safely reconcile already-written students without
+  introducing duplicates. NO automatic retry is performed
+  in this phase.
+
+### Module surface (new in PHASE 6.4)
+
+| Module                                                       | Boundary                            |
+| ------------------------------------------------------------ | ----------------------------------- |
+| `attendance-mark-model.ts`                                   | `import "server-only"` (Mongoose model) |
+| `attendance-mark-service.ts`                                 | `import "server-only"` (service)    |
+| `attendance-present-state-read-service.ts`                   | `import "server-only"` (service)    |
+| `app/api/attendance/recognize/route.ts` (extended)           | Route Handler (`runtime: "nodejs"`) |
+| `app/classes/[classId]/attendance/page.tsx` (extended)       | Server Component                    |
+| `components/classes/attendance-present-state-panel.tsx`     | Server Component (`import "server-only"` boundary) |
+| `components/classes/attendance-camera-client.tsx` (extended) | `"use client"` Client Component     |
+
+### Domain isolation (PHASE 6.4 explicitly does NOT)
+
+- Accept `studentUserId` from the browser. The request body
+  carries only the camera frame + gallery mapping; the route
+  never reads `studentId` / `mark.studentUserId` from the
+  request.
+- Accept `studentUserId` from the Face Service. The Face
+  Service only sees opaque candidate keys; the request-local
+  gallery mapping translates them back to snapshot students.
+- Persist raw camera images. They are decoded transiently
+  and discarded server-side after Face Service returns.
+- Persist `embedding`, `centroid`, `candidateKey`,
+  similarity, or any biometric vector in
+  `attendance_marks`.
+- Mutate `FaceProfile`, `face_profiles`, or
+  `face_enrollment_sessions`.
+- Mutate `AttendanceSession.rosterSnapshot`. The snapshot
+  remains immutable; new members / removed members from
+  `ClassMembership` after session start have NO effect.
+- Mutate `Class`, `ClassMembership`, or `Profile` from the
+  attendance mark write path.
+- Create or expose a public
+  `POST /api/attendance/mark-present` endpoint that
+  accepts `{ studentId } → present`.
+- Implement continuous recognition (`setInterval`,
+  `requestAnimationFrame`, automatic repeated scans).
+- Hold a second permanent attendance state in client memory.
+- Implement `absent` / `late` / `excused` /
+  manual-override / remove / edit mark actions.
+- Add a public `AttendanceMark._id`, `studentUserId`,
+  `teacherUserId`, `membership_id`, `candidateKey`, or
+  raw Face Service response field to any browser DTO.
+- Add `embedding`, `centroid`, biometric ciphertext, or
+  any raw face vector to any browser DTO.

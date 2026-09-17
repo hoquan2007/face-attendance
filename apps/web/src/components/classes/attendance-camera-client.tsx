@@ -29,6 +29,7 @@
 "use client";
 
 import * as React from "react";
+import { useRouter } from "next/navigation";
 import { Camera, CameraOff, RefreshCw, AlertCircle, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardSection } from "@/components/ui/card";
@@ -47,6 +48,16 @@ interface RecognitionResult {
   facesDetected: number;
   unmatchedCount: number;
   matches: RecognizedMatch[];
+  /** Number of PRESENT marks recorded by THIS request. */
+  recordedCount: number;
+  /** Number of PRESENT marks already recorded (idempotent repeat). */
+  alreadyRecordedCount: number;
+  /**
+   * Set when the route reports the session was closed at the
+   * final pre-write recheck — the preview matches are still
+   * returned for UX, but no marks were written.
+   */
+  sessionClosedDuringProcessing?: boolean;
 }
 
 interface AttendanceCameraClientProps {
@@ -200,6 +211,9 @@ export function AttendanceCameraClient({
   // ---- Video ref ----
   const videoRef = React.useRef<HTMLVideoElement>(null);
 
+  // ---- Router for refreshing the Server Component on persisted updates ----
+  const router = useRouter();
+
   // ---- Double-click guard (synchronous, before first await) ----
   const scanInFlightRef = React.useRef(false);
 
@@ -327,8 +341,24 @@ export function AttendanceCameraClient({
       }
 
       // Success — show recognition preview.
+      // PHASE 6.4: a successful scan may have persisted PRESENT
+      // marks server-side. We refresh the Server Component so
+      // the persisted present list is re-rendered authoritatively.
+      // We do NOT maintain a second permanent attendance state in
+      // client memory — the preview above is intentionally
+      // transient.
       setResult(data as RecognitionResult);
       setError(null);
+
+      // Trigger a Server Component refresh only when at least
+      // one mark was newly recorded. Repeated scans where every
+      // matched student was already marked do not need a refresh
+      // (the persisted state has not changed), and no-face
+      // responses obviously do not need one either.
+      const recorded = (data as RecognitionResult).recordedCount ?? 0;
+      if (recorded > 0) {
+        router.refresh();
+      }
     } catch {
       const mapped = classifyError("ATTENDANCE_RECOGNIZE_FAILED");
       setError({ ...mapped, code: "ATTENDANCE_RECOGNIZE_FAILED" });
@@ -336,7 +366,7 @@ export function AttendanceCameraClient({
       scanInFlightRef.current = false;
       setScanning(false);
     }
-  }, [classId, sessionId]);
+  }, [classId, sessionId, router]);
 
   // ---- Session closed state — stop further scans ----
   if (sessionClosed) {

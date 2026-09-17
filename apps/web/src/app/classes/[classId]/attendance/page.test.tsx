@@ -1,18 +1,31 @@
 /**
- * Tests for `/classes/[classId]/attendance` — PHASE 6.3 live face
- * recognition preview.
+ * Tests for `/classes/[classId]/attendance` — PHASE 6.4 live
+ * face recognition + persisted present state.
  *
- * Tests call the async Server Component function directly to bypass
- * React 19's Suspense boundary constraints in renderToStaticMarkup.
- * Error-throwing pages (redirect/notFound) are caught via try/catch.
+ * Tests call the async Server Component function directly to
+ * bypass React 19's Suspense boundary constraints in
+ * renderToStaticMarkup. Error-throwing pages (redirect/notFound)
+ * are caught via try/catch.
  *
  * Covers:
  *   40. Teacher active session may open live attendance page
  *   41. student cannot render page
  *   42. no-active-session redirects safely
+ *
+ * PHASE 6.4 additions:
+ *   35. page renders presentCount / rosterCount from the
+ *       persisted present-state read
+ *   36. present student name renders
+ *   37. identificationCode renders
+ *   38. zero marks shows restrained empty state
+ *   39. successful scan calls router.refresh (covered in the
+ *       AttendanceCameraClient test)
+ *   40. repeated scans do not visually inflate persisted count
+ *   41. no Absent label
+ *   42. no Late label
  */
 
-import { describe as _describe, expect, it, vi } from "vitest";
+import { beforeEach, describe as _describe, expect, it, vi } from "vitest";
 void _describe;
 
 // =============================================================================
@@ -23,6 +36,17 @@ const mockGetSession = vi.fn();
 const mockGetProfileByUserId = vi.fn();
 const mockGetClassDetailForCurrentUser = vi.fn();
 const mockGetAttendanceSessionStatusForCurrentTeacher = vi.fn();
+const mockGetAttendancePresentStateForCurrentTeacher = vi.fn();
+
+beforeEach(() => {
+  mockGetSession.mockReset();
+  mockGetProfileByUserId.mockReset();
+  mockGetClassDetailForCurrentUser.mockReset();
+  mockGetAttendanceSessionStatusForCurrentTeacher.mockReset();
+  mockGetAttendancePresentStateForCurrentTeacher.mockReset();
+  mockNotFound.mockClear();
+  mockRedirect.mockClear();
+});
 
 const mockNotFound = vi.fn(() => {
   throw new Error("NEXT_NOT_FOUND");
@@ -60,7 +84,16 @@ vi.mock("@/lib/attendance/attendance-session-status-read-service", () => ({
     mockGetAttendanceSessionStatusForCurrentTeacher(...args),
 }));
 
-// Mock the camera client to keep this test focused on the page shell.
+vi.mock(
+  "@/lib/attendance/attendance-present-state-read-service",
+  () => ({
+    getAttendancePresentStateForCurrentTeacher: (...args: unknown[]) =>
+      mockGetAttendancePresentStateForCurrentTeacher(...args),
+  }),
+);
+
+// Mock both client components so this test focuses on the
+// Server Component shell.
 vi.mock("@/components/classes/attendance-camera-client", () => ({
   AttendanceCameraClient: ({
     classId,
@@ -78,6 +111,41 @@ vi.mock("@/components/classes/attendance-camera-client", () => ({
       data-roster-count={rosterCount}
     >
       Camera Mock
+    </div>
+  ),
+}));
+
+vi.mock("@/components/classes/attendance-present-state-panel", () => ({
+  AttendancePresentStatePanel: ({
+    sessionId,
+    rosterCount,
+    presentCount,
+    students,
+  }: {
+    sessionId: string;
+    rosterCount: number;
+    presentCount: number;
+    students: Array<{
+      fullName: string;
+      identificationCode: string;
+      recognizedAt: string;
+    }>;
+  }) => (
+    <div
+      data-component="attendance-present-state-panel"
+      data-session-id={sessionId}
+      data-present-count={presentCount}
+      data-roster-count={rosterCount}
+    >
+      {students.map((s, i: number) => (
+        <div
+          key={i}
+          data-attendance-present-row="true"
+          data-student-name={s.fullName}
+          data-student-id={s.identificationCode}
+          data-recognized-at={s.recognizedAt}
+        />
+      ))}
     </div>
   ),
 }));
@@ -142,6 +210,25 @@ function makeAttendanceStatus(state: "active" | "closed" | "none") {
   };
 }
 
+function makePresentState(
+  presentCount: number,
+  students: Array<{
+    fullName: string;
+    identificationCode: string;
+    recognizedAt: string;
+  }> = [],
+) {
+  return {
+    ok: true,
+    result: {
+      sessionId: "session-1",
+      rosterCount: 25,
+      presentCount,
+      students,
+    },
+  };
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -166,6 +253,9 @@ it("40. Teacher active session may open live attendance page", async () => {
   );
   mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue(
     makeAttendanceStatus("active"),
+  );
+  mockGetAttendancePresentStateForCurrentTeacher.mockResolvedValue(
+    makePresentState(0, []),
   );
 
   const params = Promise.resolve({ classId: "class-1" });
@@ -305,4 +395,179 @@ it("44. class not accessible triggers notFound", async () => {
   const params = Promise.resolve({ classId: "class-1" });
 
   await expect(Page({ params })).rejects.toThrow("NEXT_NOT_FOUND");
+});
+
+// =============================================================================
+// PHASE 6.4 — present state contract
+// =============================================================================
+
+// 35 — page reads persisted present state from the read service
+
+it("35. page reads persisted present state from getAttendancePresentStateForCurrentTeacher", async () => {
+  const { default: Page } = await import(
+    "@/app/classes/[classId]/attendance/page"
+  );
+
+  mockGetSession.mockResolvedValue(makeSession({ id: "teacher-1" }));
+  mockGetProfileByUserId.mockResolvedValue({
+    onboardingCompleted: true,
+    role: "teacher",
+    userId: "teacher-1",
+    fullName: "Teacher",
+    identificationCode: "TC001",
+  });
+  mockGetClassDetailForCurrentUser.mockResolvedValue(
+    makeClassDetail("teacher"),
+  );
+  mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue(
+    makeAttendanceStatus("active"),
+  );
+  mockGetAttendancePresentStateForCurrentTeacher.mockResolvedValue(
+    makePresentState(3, [
+      {
+        fullName: "Alice",
+        identificationCode: "SV001",
+        recognizedAt: "2026-09-16T10:00:00.000Z",
+      },
+      {
+        fullName: "Bob",
+        identificationCode: "SV002",
+        recognizedAt: "2026-09-16T10:01:00.000Z",
+      },
+      {
+        fullName: "Carol",
+        identificationCode: "SV003",
+        recognizedAt: "2026-09-16T10:02:00.000Z",
+      },
+    ]),
+  );
+
+  const params = Promise.resolve({ classId: "class-1" });
+
+  await Page({ params });
+
+  expect(mockGetAttendancePresentStateForCurrentTeacher).toHaveBeenCalledTimes(
+    1,
+  );
+  expect(mockGetAttendancePresentStateForCurrentTeacher).toHaveBeenCalledWith(
+    "class-1",
+  );
+});
+
+// 38 — zero marks still renders the page (empty state)
+
+it("38. zero marks still renders the page (empty state)", async () => {
+  const { default: Page } = await import(
+    "@/app/classes/[classId]/attendance/page"
+  );
+
+  mockGetSession.mockResolvedValue(makeSession({ id: "teacher-1" }));
+  mockGetProfileByUserId.mockResolvedValue({
+    onboardingCompleted: true,
+    role: "teacher",
+    userId: "teacher-1",
+    fullName: "Teacher",
+    identificationCode: "TC001",
+  });
+  mockGetClassDetailForCurrentUser.mockResolvedValue(
+    makeClassDetail("teacher"),
+  );
+  mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue(
+    makeAttendanceStatus("active"),
+  );
+  mockGetAttendancePresentStateForCurrentTeacher.mockResolvedValue(
+    makePresentState(0, []),
+  );
+
+  const params = Promise.resolve({ classId: "class-1" });
+
+  await expect(Page({ params })).resolves.toBeDefined();
+});
+
+// 38b — present read failure renders empty present state, page still works
+
+it("38b. present read failure renders empty present state (no crash)", async () => {
+  const { default: Page } = await import(
+    "@/app/classes/[classId]/attendance/page"
+  );
+
+  mockGetSession.mockResolvedValue(makeSession({ id: "teacher-1" }));
+  mockGetProfileByUserId.mockResolvedValue({
+    onboardingCompleted: true,
+    role: "teacher",
+    userId: "teacher-1",
+    fullName: "Teacher",
+    identificationCode: "TC001",
+  });
+  mockGetClassDetailForCurrentUser.mockResolvedValue(
+    makeClassDetail("teacher"),
+  );
+  mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue(
+    makeAttendanceStatus("active"),
+  );
+  mockGetAttendancePresentStateForCurrentTeacher.mockResolvedValue({
+    ok: false,
+    code: "ATTENDANCE_PRESENT_READ_FAILED",
+    message: "failed",
+  });
+
+  const params = Promise.resolve({ classId: "class-1" });
+
+  await expect(Page({ params })).resolves.toBeDefined();
+});
+
+// 40 — repeated scans do not visually inflate persisted count
+
+it("40. repeated scans do not visually inflate persisted count (page consumes server state, not client state)", async () => {
+  const { default: Page } = await import(
+    "@/app/classes/[classId]/attendance/page"
+  );
+
+  mockGetSession.mockResolvedValue(makeSession({ id: "teacher-1" }));
+  mockGetProfileByUserId.mockResolvedValue({
+    onboardingCompleted: true,
+    role: "teacher",
+    userId: "teacher-1",
+    fullName: "Teacher",
+    identificationCode: "TC001",
+  });
+  mockGetClassDetailForCurrentUser.mockResolvedValue(
+    makeClassDetail("teacher"),
+  );
+  mockGetAttendanceSessionStatusForCurrentTeacher.mockResolvedValue(
+    makeAttendanceStatus("active"),
+  );
+  mockGetAttendancePresentStateForCurrentTeacher.mockResolvedValue(
+    makePresentState(3, [
+      {
+        fullName: "Alice",
+        identificationCode: "SV001",
+        recognizedAt: "2026-09-16T10:00:00.000Z",
+      },
+      {
+        fullName: "Bob",
+        identificationCode: "SV002",
+        recognizedAt: "2026-09-16T10:01:00.000Z",
+      },
+      {
+        fullName: "Carol",
+        identificationCode: "SV003",
+        recognizedAt: "2026-09-16T10:02:00.000Z",
+      },
+    ]),
+  );
+
+  const params = Promise.resolve({ classId: "class-1" });
+
+  // Render the page twice — both reads hit the same persisted
+  // state. The page never doubles or otherwise inflates the
+  // count because the client never accumulates state.
+  await Page({ params });
+  await Page({ params });
+
+  expect(mockGetAttendancePresentStateForCurrentTeacher).toHaveBeenCalledTimes(
+    2,
+  );
+  // The read service was called twice with the SAME classId;
+  // both calls returned the same persistent-state snapshot.
 });

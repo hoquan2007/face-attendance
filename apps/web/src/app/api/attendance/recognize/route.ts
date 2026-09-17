@@ -1,9 +1,14 @@
 /**
  * POST /api/attendance/recognize
  *
- * PHASE 6.3 — LIVE FACE RECOGNITION PREVIEW.
+ * PHASE 6.4 — IDEMPOTENT PRESENT ATTENDANCE MARKS +
+ * LIVE PRESENT STATE.
  *
- * Authenticated Next.js Route Handler for teacher camera frame recognition.
+ * Authenticated Next.js Route Handler for teacher camera frame
+ * recognition. PHASE 6.4 extends the PHASE 6.3 preview route so
+ * that a Face Service match that already passed the server-side
+ * `FACE_MATCH_THRESHOLD` becomes a persisted PRESENT attendance
+ * mark in the active AttendanceSession.
  *
  * Security contract:
  *   - Requires valid Better Auth session (UNAUTHENTICATED otherwise).
@@ -14,22 +19,44 @@
  *
  * Privacy contract:
  *   - Camera frame is NEVER persisted (not logged, not stored in MongoDB).
- *   - FaceService receives ONLY ephemeral candidate keys + embeddings.
+ *   - Face Service receives ONLY ephemeral candidate keys + embeddings.
  *   - Real student identities (studentUserId, fullName, identificationCode) are NEVER sent.
  *   - Browser receives ONLY safe display data: fullNameSnapshot, identificationCode.
- *   - NO attendance marks are created (preview only).
+ *   - NO `studentUserId`, `AttendanceMark._id`, `candidateKey`,
+ *     `embedding`, `centroid`, `FaceProfile id`, `membershipId`,
+ *     `teacherUserId`, `passwordHash`, or biometric data is exposed.
+ *
+ * Persistence contract (PHASE 6.4):
+ *   - One Face Service match that has already passed the server
+ *     FACE_MATCH_THRESHOLD is sufficient to create a PRESENT mark.
+ *   - Each `(sessionId, studentUserId)` is written ONCE — the
+ *     compound unique index `(sessionId, studentUserId)` enforces
+ *     this at the database layer.
+ *   - The FIRST accepted recognition's `recognizedAt` is preserved
+ *     on subsequent recognition of the same student. Later
+ *     recognition does NOT shift `recognizedAt`.
+ *   - The browser does NOT supply any identity-bearing field; the
+ *     Face Service's `candidate_key` is mapped through the
+ *     request-local gallery mapping back to the
+ *     `AttendanceSession.rosterSnapshot` student.
+ *   - The final pre-write check re-confirms the session is STILL
+ *     active. A session closed mid-flight (e.g. teacher pressed
+ *     Stop while the Face Service was processing) creates NO new
+ *     marks.
  *
  * Request (multipart/form-data):
  *   - classId: string (required)
  *   - sessionId: string (required)
  *   - image: binary JPEG image (required)
  *
- * Response:
+ * Response (200):
  *   - facesDetected: number
  *   - unmatchedCount: number
  *   - matches: Array<{ fullName: string, identificationCode: string }>
- *
- * This route does NOT create attendance marks. It is preview-only.
+ *   - recordedCount: number — count of accepted matches that were
+ *     recorded as PRESENT in this call.
+ *   - alreadyRecordedCount: number — count of accepted matches
+ *     whose PRESENT mark already existed (idempotent repeat).
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -47,6 +74,12 @@ import {
   FACE_SERVICE_ERROR_CODES,
   FaceServiceClientError,
 } from "@/lib/biometrics/face-service-client";
+import {
+  isAttendanceSessionStillActive,
+  recordPresentAttendanceMarksForActiveSession,
+  AttendanceMarkServiceError,
+  ATTENDANCE_MARK_ERROR_CODES,
+} from "@/lib/attendance/attendance-mark-service";
 
 // =============================================================================
 // Stable error codes
@@ -65,6 +98,7 @@ export const ATTENDANCE_RECOGNIZE_ERROR_CODES = {
   IMAGE_TOO_LARGE: "IMAGE_TOO_LARGE",
   FACE_SERVICE_ERROR: "FACE_SERVICE_ERROR",
   ATTENDANCE_RECOGNIZE_FAILED: "ATTENDANCE_RECOGNIZE_FAILED",
+  ATTENDANCE_MARK_WRITE_FAILED: "ATTENDANCE_MARK_WRITE_FAILED",
 } as const;
 
 export type AttendanceRecognizeErrorCode =
@@ -298,11 +332,14 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
       // Map Face Service domain errors to safe HTTP responses.
       if (domainCode === "NO_FACE") {
+        // No faces → no marks; return a safe preview result.
         return NextResponse.json(
           {
             facesDetected: 0,
             unmatchedCount: 0,
             matches: [],
+            recordedCount: 0,
+            alreadyRecordedCount: 0,
           },
           { status: 200 },
         );
@@ -351,24 +388,123 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   }
 
   // ---- 9. Map ephemeral candidate keys back to safe snapshot identity ----
-  const matches = identifyResult.matches.map((match) => {
+  // Build a DEDUPLICATED list of accepted-match studentUserIds from
+  // the request-local candidateKeyMapping. This list is the ONLY
+  // identity-bearing input we forward to the persistence path —
+  // it never contains the browser-supplied candidateKey and never
+  // contains the Face Service's `candidate_key`.
+  const acceptedStudentUserIds: string[] = [];
+  const matches: Array<{
+    fullName: string;
+    identificationCode: string;
+  }> = [];
+  const seenIds = new Set<string>();
+
+  for (const match of identifyResult.matches) {
     const keyMapping = galleryResult!.candidateKeyMapping[match.candidate_key];
     if (!keyMapping) {
-      // Safety: if the key isn't in our mapping, skip this match.
-      return null;
+      // Unknown candidateKey — skip. NEVER surface the raw key.
+      continue;
     }
-    return {
+    if (typeof keyMapping.studentUserId !== "string") continue;
+    if (keyMapping.studentUserId.length === 0) continue;
+
+    if (!seenIds.has(keyMapping.studentUserId)) {
+      seenIds.add(keyMapping.studentUserId);
+      acceptedStudentUserIds.push(keyMapping.studentUserId);
+    }
+
+    matches.push({
       fullName: keyMapping.fullNameSnapshot,
       identificationCode: keyMapping.identificationCodeSnapshot,
-    };
-  }).filter((m): m is { fullName: string; identificationCode: string } => m !== null);
+    });
+  }
 
-  // ---- 10. Return safe browser DTO ----
+  // ---- 10. FINAL pre-write active-session recheck ----
+  // The Teacher may have pressed Stop while the Face Service was
+  // processing this frame. If the session is no longer ACTIVE at
+  // this final check, create NO marks and return a safe result
+  // indicating the session is closed. The preview matches that
+  // we already computed are still returned for UX feedback, but
+  // the persisted-state counters are zero.
+  const stillActive = await isAttendanceSessionStillActive(sessionId);
+  if (!stillActive) {
+    return NextResponse.json(
+      {
+        facesDetected: identifyResult.faces_detected,
+        unmatchedCount: identifyResult.unmatched_count,
+        matches,
+        recordedCount: 0,
+        alreadyRecordedCount: 0,
+        sessionClosedDuringProcessing: true,
+      },
+      { status: 200 },
+    );
+  }
+
+  // ---- 11. Persist matched students idempotently as PRESENT ----
+  // No transaction. The compound `(sessionId, studentUserId)`
+  // unique index is the authoritative safety net.
+  let recordedCount = 0;
+  let alreadyRecordedCount = 0;
+
+  if (acceptedStudentUserIds.length > 0) {
+    try {
+      const persistResult = await recordPresentAttendanceMarksForActiveSession({
+        sessionId,
+        candidateStudentUserIds: acceptedStudentUserIds,
+      });
+      recordedCount = persistResult.persistedStudentUserIds.length;
+      alreadyRecordedCount =
+        persistResult.idempotentStudentUserIds.length;
+    } catch (err) {
+      if (err instanceof AttendanceMarkServiceError) {
+        if (
+          err.code ===
+          ATTENDANCE_MARK_ERROR_CODES.ATTENDANCE_SESSION_NOT_ACTIVE
+        ) {
+          // Session closed between the recheck and the write.
+          return NextResponse.json(
+            {
+              facesDetected: identifyResult.faces_detected,
+              unmatchedCount: identifyResult.unmatched_count,
+              matches,
+              recordedCount: 0,
+              alreadyRecordedCount: 0,
+              sessionClosedDuringProcessing: true,
+            },
+            { status: 200 },
+          );
+        }
+        if (
+          err.code === ATTENDANCE_MARK_ERROR_CODES.INVALID_SESSION_ID
+        ) {
+          return errorResponse(
+            ATTENDANCE_RECOGNIZE_ERROR_CODES.SESSION_CLASS_MISMATCH,
+            "Session does not belong to this class.",
+            400,
+          );
+        }
+      }
+      // Generic write failure — return a controlled safe error.
+      // NO Mongo URI, NO E11000, NO collection name, NO
+      // studentUserId, NO stack trace.
+      return errorResponse(
+        ATTENDANCE_RECOGNIZE_ERROR_CODES.ATTENDANCE_MARK_WRITE_FAILED,
+        "Failed to record attendance. Please try again.",
+        500,
+      );
+    }
+  }
+
+  // ---- 12. Return safe browser DTO ----
   // NEVER expose: studentUserId, candidateKey, embedding, centroid,
-  // FaceProfile id, membershipId, or rosterSnapshot.
+  // FaceProfile id, membershipId, AttendanceMark._id, teacherUserId.
   return NextResponse.json({
     facesDetected: identifyResult.faces_detected,
     unmatchedCount: identifyResult.unmatched_count,
     matches,
+    recordedCount,
+    alreadyRecordedCount,
   });
 }
