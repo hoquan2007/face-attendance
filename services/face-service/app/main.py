@@ -24,6 +24,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.api import compare as compare_api
 from app.api import enrollment as enrollment_api
 from app.api import faces as faces_api
+from app.api import identify as identify_api
 from app.api.health import router as health_router
 from app.core.config import get_settings
 from app.core.lifespan import lifespan
@@ -55,6 +56,7 @@ app.include_router(health_router)
 app.include_router(faces_api.router)
 app.include_router(compare_api.router)
 app.include_router(enrollment_api.router)
+app.include_router(identify_api.router)
 
 
 def _error_payload(code: str, message: str) -> dict[str, dict[str, str]]:

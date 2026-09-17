@@ -60,6 +60,8 @@
  */
 
 import * as React from "react";
+import Link from "next/link";
+import { Video } from "lucide-react";
 
 import {
   Card,
@@ -332,11 +334,23 @@ export function AttendancePanel({
               </p>
             </div>
           ) : canStop ? (
-            <AttendanceControlButton
-              classId={classId}
-              mode="stop"
-              label={controlLabel(payload.state)}
-            />
+            <>
+              <div className="flex flex-col gap-3">
+                <AttendanceControlButton
+                  classId={classId}
+                  mode="stop"
+                  label={controlLabel(payload.state)}
+                />
+                <Link
+                  href={`/classes/${classId}/attendance`}
+                  className="inline-flex items-center gap-2 text-sm font-medium text-primary transition-colors hover:text-primary/80 focus-visible:text-primary/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background rounded-sm"
+                  data-attendance-live-link="true"
+                >
+                  <Video className="h-4 w-4" aria-hidden="true" />
+                  Open live attendance
+                </Link>
+              </div>
+            </>
           ) : canStart ? (
             <AttendanceControlButton
               classId={classId}

@@ -877,3 +877,134 @@ export async function finalizeFaceEnrollment(
     },
   };
 }
+
+// =============================================================================
+// Attendance Recognition — PHASE 6.3
+// =============================================================================
+
+/** Gallery candidate for attendance recognition. Uses ephemeral candidate keys. */
+export interface IdentifyGalleryCandidate {
+  candidateKey: string;
+  embedding: Float32Array;
+  embeddingDimension: number;
+  normalization: "l2";
+}
+
+/** Response schema for identify endpoint. */
+const IdentifyMatchResponseSchema = z.object({
+  face_index: z.number().int().nonnegative(),
+  candidate_key: z.string().min(1),
+});
+
+const IdentifyResponseSchema = z.object({
+  faces_detected: z.number().int().nonnegative(),
+  matches: z.array(IdentifyMatchResponseSchema),
+  unmatched_count: z.number().int().nonnegative(),
+  processing_ms: z.number().nonnegative(),
+});
+
+export type IdentifyMatchResult = z.infer<typeof IdentifyMatchResponseSchema>;
+export type IdentifyResult = z.infer<typeof IdentifyResponseSchema>;
+
+/**
+ * Identifies multiple faces in one camera frame against a session-scoped gallery.
+ *
+ * Sends binary image + gallery JSON to the Face Service's `POST /attendance/identify`.
+ * The gallery uses ephemeral candidate keys — no real student identities are sent.
+ *
+ * @param image - Binary JPEG/PNG image data.
+ * @param gallery - Session-scoped recognition gallery with ephemeral candidate keys.
+ * @param maxFaces - Maximum faces to process (default 5, max 10).
+ * @returns Face Service identification result with ephemeral candidate keys.
+ * @throws {FaceServiceClientError} On network, validation, or domain failure.
+ *
+ * @example
+ * ```typescript
+ * const result = await identifyFaces(imageBuffer, gallery.candidates, 5);
+ * console.log(result.faces_detected);
+ * for (const match of result.matches) {
+ *   const student = galleryMapping[match.candidate_key];
+ *   console.log("Recognized:", student.fullNameSnapshot);
+ * }
+ * ```
+ */
+export async function identifyFaces(
+  image: BodyInit,
+  gallery: IdentifyGalleryCandidate[],
+  maxFaces: number = 5,
+): Promise<IdentifyResult> {
+  if (gallery.length === 0) {
+    throw new FaceServiceClientError({
+      code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+      message: "Gallery must contain at least one candidate.",
+    });
+  }
+
+  // Validate embeddings locally before sending.
+  for (const candidate of gallery) {
+    if (!candidate.embedding || candidate.embedding.length === 0) {
+      throw new FaceServiceClientError({
+        code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+        message: `Candidate ${candidate.candidateKey} has empty embedding.`,
+      });
+    }
+    if (candidate.embedding.length !== candidate.embeddingDimension) {
+      throw new FaceServiceClientError({
+        code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+        message: `Candidate ${candidate.candidateKey} embedding dimension mismatch.`,
+      });
+    }
+    if (candidate.normalization !== "l2") {
+      throw new FaceServiceClientError({
+        code: FACE_SERVICE_ERROR_CODES.FACE_SERVICE_INVALID_RESPONSE,
+        message: `Candidate ${candidate.candidateKey} uses unsupported normalization.`,
+      });
+    }
+  }
+
+  // Build gallery JSON payload — ephemeral keys only, no real identities.
+  const galleryPayload = gallery.map((c) => ({
+    candidate_key: c.candidateKey,
+    embedding: Array.from(c.embedding),
+    embedding_dimension: c.embeddingDimension,
+    normalization: c.normalization,
+  }));
+
+  // Build multipart form: binary image + JSON gallery.
+  const formData = new FormData();
+
+  // Normalize the image input to a Blob.
+  // Accept: ArrayBuffer, Blob, Uint8Array, etc.
+  let imageBlob: Blob;
+  if (image instanceof Blob) {
+    imageBlob = image;
+  } else if (image instanceof ArrayBuffer) {
+    imageBlob = new Blob([image], { type: "image/jpeg" });
+  } else {
+    // Treat as Uint8Array / typed array view.
+    const view = image as ArrayBufferView;
+    imageBlob = new Blob([view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength)], {
+      type: "image/jpeg",
+    });
+  }
+
+  formData.append("image", imageBlob, "frame.jpg");
+  formData.append(
+    "gallery_json",
+    JSON.stringify({ gallery: galleryPayload, max_faces: maxFaces }),
+  );
+
+  const response = await faceServiceRequest<{
+    faces_detected: number;
+    matches: { face_index: number; candidate_key: string }[];
+    unmatched_count: number;
+    processing_ms: number;
+  }>("/attendance/identify", {
+    method: "POST",
+    body: formData,
+    requireAuth: true,
+    schema: IdentifyResponseSchema,
+  });
+
+  return response;
+}

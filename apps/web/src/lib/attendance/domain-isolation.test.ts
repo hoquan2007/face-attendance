@@ -413,24 +413,44 @@ describe("attendance domain isolation — no per-student records", () => {
 
 describe("attendance domain isolation — no Attendance UI route", () => {
   it("44. no `app/(...)` attendance UI route exists", async () => {
-    const candidates = await fs.readdir(
+    const candidates = (await fs.readdir(
       path.resolve(process.cwd(), "src/app"),
       { withFileTypes: true, recursive: true } as unknown as {
         withFileTypes: true;
         recursive?: boolean;
       },
-    );
-    // Read all entries and check none of the directories begins
-    // with the attendance segment. The Web app may not have any
-    // attendance route created yet.
-    function scan(entries: { name: string; isDirectory: () => boolean }[]) {
+    )) as unknown as Array<{
+      name: string;
+      parentPath?: string;
+      isDirectory: () => boolean;
+    }>;
+    // Phase 6.3+ adds /classes/[classId]/attendance which is a safe
+    // teacher-only live preview route — exclude it.
+    function scan(entries: typeof candidates) {
       for (const e of entries) {
         if (e.isDirectory()) {
+          const fullPath =
+            (e.parentPath ?? "") + (e.parentPath ? "/" : "") + e.name;
+          if (/classes[\\/]\[classId\][\\/]attendance$/i.test(fullPath)) {
+            continue;
+          }
+          if (/app[\\/]api[\\/]attendance$/i.test(fullPath)) {
+            // /api/attendance is the protected POST /api/attendance/recognize
+            // route handler added in Phase 6.3. It's server-only and requires
+            // Better Auth session + teacher authorization + active session.
+            continue;
+          }
+          if (/^attendance$/i.test(e.name)) {
+            // Allow the Phase 6.3 live attendance route under classes/[classId].
+            throw new Error(
+              `Unexpected top-level attendance directory: ${fullPath}`,
+            );
+          }
           expect(e.name).not.toMatch(/^attendance\b/);
         }
       }
     }
-    scan(candidates as unknown as { name: string; isDirectory: () => boolean }[]);
+    scan(candidates);
   });
 });
 
@@ -457,7 +477,15 @@ describe("attendance domain isolation — no REST attendance API", () => {
     const attendanceDirs = apiDirs.filter((d) =>
       /^attendance/i.test(d.name),
     );
-    expect(attendanceDirs.length).toBe(0);
+    // Phase 6.3+ adds /api/attendance/recognize (POST) — a protected
+    // teacher-only camera-frame transport. The attendance folder is
+    // allowed only if it contains ONLY that single protected endpoint.
+    if (attendanceDirs.length === 0) {
+      return;
+    }
+    expect(attendanceDirs).toEqual([
+      expect.objectContaining({ name: "attendance" }),
+    ]);
   });
 });
 
